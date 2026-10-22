@@ -1,0 +1,7 @@
+# The Telegram bridge pack: one private bridge per city, configured by that
+# city's settings file outside the repository (README.md, settings.example.toml),
+# plus the shared Telegram skills.
+[pack]
+name = "telegram"
+version = "0.1.0"
+schema = 2

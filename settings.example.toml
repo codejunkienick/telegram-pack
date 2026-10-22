@@ -1,0 +1,65 @@
+# EXAMPLE settings for one city's Telegram bridge. Copy it to
+# ~/.config/<workspace_name>/telegram-bridge.toml (workspace_name is in the
+# city's .gc/site.toml), chmod 600, and replace every value: the names, ids
+# and paths below are examples, not defaults. The bridge refuses to start on
+# a missing file, a file readable by others, an unknown key or a bad value,
+# and says which. Nothing here is a credential: the token and the callback
+# secret stay in their own owner-only files.
+
+city = "example-city"                       # gc's city name (the extmsg scope)
+state_dir = "/home/alex/example-city/telegram-state"   # ledger, offset, inbound files, heartbeat
+port = 8930                                 # loopback callback port, unique per city on the host
+token_file = "~/.config/example-city/telegram-bot-token"
+callback_secret_file = "~/.config/example-city/telegram-callback-secret"
+# lock_dir = "~/.config/example-city"       # default: the token file's directory
+# unit = "example-city-telegram.service"    # default: <city>-telegram.service
+# python = "/usr/bin/python3"
+user_display_name = "Alex"                  # how inbound messages name the paired user
+timezone = "Europe/Berlin"                  # times in notices; default UTC
+# gc_base_url = "http://127.0.0.1:8372"     # loopback only
+# gc_api_token_file = "~/.config/example-city/gc-api-token"
+# health_file = "/home/alex/example-city/health.json"  # quota-exhausted notice
+# pairing_update_id = 0                     # the update_id of the /start update (README step 3): the bridge starts after it; read only for a new ledger
+# agent = "mayor"                           # the gc agent this bridge serves; default mayor
+# handler_write_paths = ["/home/alex/example-city/var/deploy"]  # dirs [[command]] handlers may write
+
+[bot]
+bot_id = 1000000001                         # numeric: getMe's id
+user_id = 1000000002                        # the paired user's id: the /start message's from.id
+chat_id = 1000000002                        # its chat.id; a private chat, so equal to user_id
+account_id = "example_city_bot"             # getMe's username, the GC adapter account
+
+# The paired chat's "/" menu, in order (`bridge.py set-commands` registers it).
+[[menu]]
+command = "status"
+description = "Show the agent's status"
+
+# A command the city's own handler answers instead of the agent (OPERATIONS.md,
+# "City commands"): /deploy, and button presses whose data starts with "deploy:".
+# An add-on is one such table; adding and removing one: README.md, "Add-ons".
+# [[command]]
+# name = "deploy"
+# description = "Deploy a branch"
+# handler = "/home/alex/example-city/bin/telegram-deploy"   # or url = "http://127.0.0.1:8095/deploy"
+# menu = true                               # in the "/" menu; default true
+# callback_prefix = "deploy:"               # default "<name>:"
+# timeout = 10                              # seconds, 1-3600
+
+[transcribe]
+enabled = true                              # voice and audio notes get a transcript in the configured language
+# whisper_cli and models_dir default to ~/work/whisper.cpp, the build every city on the host shares; set both to place it elsewhere.
+# whisper_cli = "~/work/whisper.cpp/build/bin/whisper-cli"
+# models_dir = "~/work/whisper.cpp/models"
+# model = "large-v3-turbo-q5_0"
+# language = "en"                           # whisper language code (en, ru, de, ...) or "auto" to detect; default "en"
+# vad_model = "silero-v6.2.0"
+# cpus = "0-3"                              # CPUs the transcriber may use; default every CPU
+# threads = 4                               # 1-64
+# timeout = 120                             # base seconds, 1-3600
+# timeout_per_minute = 120                  # added per minute of audio; killed when the total runs out
+# method = "cpu"                            # auto, cpu or gpu (default cpu); set method instead of gpu below
+# gpu_check = "/home/alex/example-city/bin/gpu-check"  # method auto only; default the pack's transcriber/gpu_check.py
+# gpu = false                               # legacy form without method: true behaves as method = "auto", false as method = "cpu"
+# gpu_min_free_mb = 2048                    # free video memory a GPU run needs, MiB
+# Every city on the host waits in one transcription queue,
+# ~/.local/state/voice-transcribe; it is deliberately not a setting.

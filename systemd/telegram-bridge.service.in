@@ -1,0 +1,33 @@
+# Rendered per city by `bridge.py --settings <file> render-unit` (install.sh);
+# the placeholders (upper-case names between at signs) come from that
+# city's settings file.
+[Unit]
+Description=Private Telegram transport for the @CITY@ @AGENT@
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=@STATE_DIR@
+ExecStart=@PYTHON@ @BRIDGE@ --settings @SETTINGS@ run
+Restart=on-failure
+RestartPreventExitStatus=2
+RestartSec=15
+TimeoutStopSec=45
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=@STATE_DIR@ @LOCK_DIR@@TRANSCRIBE_QUEUE@@HANDLER_WRITE_PATHS@
+ReadOnlyPaths=@READ_ONLY_PATHS@
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=default.target
