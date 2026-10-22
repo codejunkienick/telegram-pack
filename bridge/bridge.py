@@ -29,6 +29,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from urllib.parse import quote, urlsplit
@@ -2993,6 +2994,18 @@ def gpu_probe_argv(settings, properties):
             + ['--', str(settings.python), str(GPU_PROBE), settings.model])
 
 
+def darwin_gpu_probe_argv_env(settings, tmp_dir):
+    """(argv, env) of one macOS probe: the pack's probe run directly with
+    the launchd agent's environment, the settings' transcriber environment
+    plus VOICE_TRANSCRIBE_GPU=1, and TMPDIR in a fresh private directory.
+    There is no systemd-run and no sandbox to reproduce on macOS."""
+    env = {'PATH': LAUNCHD_PATH, 'HOME': str(Path.home()),
+           'LANG': os.environ.get('LANG') or 'C.UTF-8', 'TMPDIR': str(tmp_dir)}
+    env.update(settings.transcribe['env'])
+    env['VOICE_TRANSCRIBE_GPU'] = '1'
+    return [str(settings.python), str(GPU_PROBE), settings.model], env
+
+
 def default_probe_clip(settings):
     """samples/jfk.wav of the whisper.cpp checkout whisper_cli is built in
     (<checkout>/build/bin/whisper-cli), or None when it has no such layout."""
@@ -3024,12 +3037,16 @@ def _probe_result(stdout):
     return result
 
 
-def gpu_probe(settings, clip=None, run=subprocess.run, which=shutil.which):
+def gpu_probe(settings, clip=None, run=subprocess.run, which=shutil.which,
+              platform=None, tmp_factory=tempfile.mkdtemp):
     """(status, line) of one GPU probe, status 'ok', 'FAIL' or 'skip': the clip
-    transcribed by the pack's transcriber with VOICE_TRANSCRIBE_GPU=1 inside
-    a transient unit carrying the bridge unit's sandbox. Waits in the
-    host-wide transcription queue like any note. Never prints or returns the
-    transcript, the unit's stderr or anything else the probe printed."""
+    transcribed by the pack's transcriber with VOICE_TRANSCRIBE_GPU=1. On
+    Linux and WSL that is inside a transient unit carrying the bridge unit's
+    sandbox; on macOS, where there is no systemd-run and no sandbox to
+    reproduce, the probe runs directly with the launchd agent's
+    environment. Waits in the host-wide transcription queue like any note.
+    Never prints or returns the transcript, the unit's stderr or anything
+    else the probe printed."""
     if settings.transcribe is None:
         return 'skip', 'gpu probe: transcription off ([transcribe] enabled = false)'
     if settings.transcribe.get('method') == 'cpu':
@@ -3042,24 +3059,41 @@ def gpu_probe(settings, clip=None, run=subprocess.run, which=shutil.which):
             return 'FAIL', f'gpu probe: no clip: {clip or "samples/jfk.wav of the whisper.cpp checkout"} is missing; pass --clip'
     elif not Path(clip).is_file():
         return 'FAIL', f'gpu probe: clip {clip} is not a file'
-    if which('systemd-run') is None:
-        return 'FAIL', 'gpu probe: systemd-run not on PATH'
-    try:
-        properties = unit_sandbox_properties(settings)
-    except (OSError, SettingsError):
-        return 'FAIL', 'gpu probe: the bridge unit could not be rendered'
-    for prop in properties:
-        if prop.startswith('ReadWritePaths='):
-            for path in prop.split('=', 1)[1].split():
-                if not os.path.isdir(path):
-                    return 'FAIL', f'gpu probe: {path} is missing (the bridge unit writes it; run install.sh)'
-    try:
-        with open(clip, 'rb') as stream:
-            done = run(gpu_probe_argv(settings, properties), stdin=stream, capture_output=True)
-    except OSError:
-        return 'FAIL', 'gpu probe: the clip or systemd-run could not be opened'
-    if done.returncode != 0:
-        return 'FAIL', f'gpu probe: the probe unit failed (exit {done.returncode})'
+    plat = voice_transcribe.host_platform() if platform is None else platform
+    if plat == 'darwin':
+        if not os.path.isdir(settings.queue_dir):
+            return 'FAIL', f'gpu probe: {settings.queue_dir} is missing (the bridge writes it; run install.sh)'
+        tmp_dir = tmp_factory(prefix='gpu-probe.')
+        try:
+            argv, env = darwin_gpu_probe_argv_env(settings, tmp_dir)
+            try:
+                with open(clip, 'rb') as stream:
+                    done = run(argv, stdin=stream, capture_output=True, env=env)
+            except OSError:
+                return 'FAIL', 'gpu probe: the clip or the probe could not be opened'
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        if done.returncode != 0:
+            return 'FAIL', f'gpu probe: the probe failed (exit {done.returncode})'
+    else:
+        if which('systemd-run') is None:
+            return 'FAIL', 'gpu probe: systemd-run not on PATH'
+        try:
+            properties = unit_sandbox_properties(settings)
+        except (OSError, SettingsError):
+            return 'FAIL', 'gpu probe: the bridge unit could not be rendered'
+        for prop in properties:
+            if prop.startswith('ReadWritePaths='):
+                for path in prop.split('=', 1)[1].split():
+                    if not os.path.isdir(path):
+                        return 'FAIL', f'gpu probe: {path} is missing (the bridge unit writes it; run install.sh)'
+        try:
+            with open(clip, 'rb') as stream:
+                done = run(gpu_probe_argv(settings, properties), stdin=stream, capture_output=True)
+        except OSError:
+            return 'FAIL', 'gpu probe: the clip or systemd-run could not be opened'
+        if done.returncode != 0:
+            return 'FAIL', f'gpu probe: the probe unit failed (exit {done.returncode})'
     result = _probe_result(done.stdout)
     device = (result or {}).get('device')
     if result is None:

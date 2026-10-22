@@ -50,7 +50,10 @@ class ProbeFixture(unittest.TestCase):
         fake.chmod(0o755)
         # HOME is the temp home too: main() loads its settings with the real
         # Path.home(), so the transcription queue the probe checks is ours.
-        self.enterContext(patch.dict(os.environ, PATH=f'{self.bin}:{os.environ["PATH"]}', HOME=str(self.home)))
+        # The platform is pinned to linux so the systemd-run fixture passes
+        # on any host; the darwin tests pass their platform explicitly.
+        self.enterContext(patch.dict(os.environ, PATH=f'{self.bin}:{os.environ["PATH"]}', HOME=str(self.home),
+                                     TELEGRAM_PACK_PLATFORM='linux'))
 
     def settings(self, transcribe='enabled = true\ngpu = true\n', **replace):
         path = write_settings(self.root, python=f'"{sys.executable}"', **replace)
@@ -58,6 +61,7 @@ class ProbeFixture(unittest.TestCase):
         return b.load_settings(path, home=self.home)
 
     def probe(self, stdout='', exit_code=0, settings=None, **kwargs):
+        kwargs.setdefault('platform', 'linux')
         with patch.dict(os.environ, FAKE_PROBE_STDOUT=stdout, FAKE_PROBE_EXIT=str(exit_code)):
             return b.gpu_probe(settings or self.settings(), **kwargs)
 
@@ -220,6 +224,84 @@ class GpuProbeTests(ProbeFixture):
         with patch.object(b, 'UNIT_TEMPLATE', template):
             self.assertEqual(self.probe(settings=settings), ('FAIL', 'gpu probe: the bridge unit could not be rendered'))
         self.assertEqual(self.recorded(), [])
+
+
+class DarwinGpuProbeTests(ProbeFixture):
+    """On darwin the probe runs directly with the launchd agent's
+    environment: no systemd-run, no unit sandbox, a private TMPDIR that is
+    removed afterwards, and the shared result lines."""
+
+    def darwin_probe(self, stdout='', exit_code=0, settings=None, run_error=None):
+        settings = settings or self.settings()
+        calls, made, prefixes = [], [], []
+
+        def tmp_factory(prefix):
+            prefixes.append(prefix)
+            made.append(Path(tempfile.mkdtemp(prefix=prefix, dir=self.root)))
+            return made[-1]
+
+        def recording_run(argv, stdin=None, capture_output=False, env=None):
+            calls.append(dict(argv=argv, stdin=stdin.read() if stdin is not None else None,
+                              capture_output=capture_output, env=env,
+                              tmpdir_exists=Path(env['TMPDIR']).is_dir() if env else False))
+            if run_error is not None:
+                raise run_error
+            return type('Done', (), {'returncode': exit_code, 'stdout': stdout.encode()})()
+
+        def forbidden_which(name):
+            self.fail(f'which({name!r}) must not be looked up on darwin')
+
+        result = b.gpu_probe(settings, run=recording_run, which=forbidden_which,
+                             platform='darwin', tmp_factory=tmp_factory)
+        return result, settings, calls, made, prefixes
+
+    def test_runs_the_probe_directly_with_the_launchd_environment(self):
+        result, settings, calls, made, prefixes = self.darwin_probe('{"device": "gpu", "seconds": 1}\n')
+        self.assertEqual(result, ('ok', 'gpu probe: device gpu (1 s)'))
+        self.assertEqual(prefixes, ['gpu-probe.'])
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertEqual(call['argv'], [sys.executable, str(b.GPU_PROBE), settings.model])
+        self.assertEqual(call['stdin'], CLIP)
+        self.assertTrue(call['capture_output'])
+        self.assertTrue(call['tmpdir_exists'])
+        expected_env = {'PATH': b.LAUNCHD_PATH, 'HOME': str(self.home),
+                        'LANG': os.environ.get('LANG') or 'C.UTF-8', 'TMPDIR': str(made[0])}
+        expected_env.update(settings.transcribe['env'])
+        expected_env['VOICE_TRANSCRIBE_GPU'] = '1'
+        self.assertEqual(call['env'], expected_env)
+        self.assertEqual(call['env']['PATH'], b.LAUNCHD_PATH)
+        self.assertEqual(call['env']['TMPDIR'], str(made[0]))
+        self.assertEqual(call['env']['VOICE_TRANSCRIBE_GPU'], '1')
+        self.assertFalse(made[0].exists())
+
+    def test_the_tmpdir_is_removed_after_a_non_zero_exit_and_after_oserror(self):
+        result, _, _, made, _ = self.darwin_probe('{"device": "gpu", "seconds": 1}\n', exit_code=3)
+        self.assertEqual(result, ('FAIL', 'gpu probe: the probe failed (exit 3)'))
+        self.assertFalse(made[0].exists())
+        result, _, _, made, _ = self.darwin_probe(run_error=OSError('no probe'))
+        self.assertEqual(result, ('FAIL', 'gpu probe: the clip or the probe could not be opened'))
+        self.assertFalse(made[0].exists())
+
+    def test_a_missing_queue_directory_fails_before_running(self):
+        settings = self.settings()
+        settings.queue_dir.rmdir()
+        result, _, calls, made, _ = self.darwin_probe(settings=settings)
+        self.assertEqual(result, ('FAIL', f'gpu probe: {settings.queue_dir} is missing '
+                                          '(the bridge writes it; run install.sh)'))
+        self.assertEqual(calls, [])
+        self.assertEqual(made, [])
+
+    def test_device_lines_are_the_shared_ones(self):
+        self.assertEqual(self.darwin_probe('{"device": "gpu", "seconds": 2.4}\n')[0],
+                         ('ok', 'gpu probe: device gpu (2.4 s)'))
+        auto = self.settings('enabled = true\nmethod = "auto"\n')
+        self.assertEqual(self.darwin_probe(f'{RUNNING}\n{{"device": "cpu: busy", "seconds": 30}}\n',
+                                           settings=auto)[0],
+                         ('skip', 'gpu probe: GPU not free now (cpu: busy), try later'))
+        self.assertEqual(self.darwin_probe(f'{RUNNING}\n{{"device": "cpu: gpu-failed", "seconds": 30}}\n',
+                                           settings=auto)[0],
+                         ('FAIL', 'gpu probe: device cpu: gpu-failed'))
 
 
 class CheckInstallFlagTests(ProbeFixture):
