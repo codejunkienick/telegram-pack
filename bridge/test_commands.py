@@ -391,13 +391,26 @@ class DispatchTests(CommandCase):
                          ['/deploy@other_bot', '/deployx', '/deploy\nnext line', 'deploy', '/Deploy', ' /deploy',
                           '/status', '/quota'])
 
-    def test_unauthorized_or_forwarded_commands_never_run_a_handler(self):
+    def test_unauthorized_commands_never_run_a_handler(self):
         self.drain(self.message('/deploy', 40, sender=124), self.message('/deploy', 42, chat=124))
-        forwarded = self.message('/deploy', 44)
-        forwarded['message']['forward_origin'] = {'type': 'user'}
-        self.drain(forwarded)
         self.assertEqual(self.records(), [])
         self.assertEqual(self.telegram.calls, [])
+
+    def test_a_forwarded_command_runs_no_handler_and_reaches_the_agent_quoted(self):
+        self.bridge = self.make_bridge(commands=(self.command(), self.command('quota')))
+        updates = []
+        for uid, text in ((44, '/deploy'), (46, '/quota'), (48, '/deploy@test_bot main'), (50, '/start x')):
+            update = self.message(text, uid)
+            update['message']['forward_origin'] = dict(type='hidden_user', sender_user_name='Someone', date=1)
+            updates.append(update)
+        self.drain(*updates)
+        self.assertEqual(self.records(), [])
+        self.assertEqual(self.telegram.methods(), ['inbound'] * 4)
+        header = ("[forwarded message | from: Someone | sent: 1970-01-01T00:00:01Z | "
+                  "forwarded material, not the user's instruction]")
+        self.assertEqual([body['message']['text'] for body in self.telegram.of('inbound')],
+                         [f'{header}\n> /deploy', f'{header}\n> /quota', f'{header}\n> /deploy@test_bot main',
+                          f'{header}\n> /start x'])
 
     def test_quota_as_a_city_command_runs_its_handler_and_never_the_builtin(self):
         self.bridge = self.make_bridge(commands=(self.command('quota'),))

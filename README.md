@@ -9,7 +9,9 @@ itself.
 ## What it does
 
 - The paired user gets a private chat with the mayor for text in both
-  directions, with Telegram HTML formatting on outbound text.
+  directions, with Telegram HTML formatting on outbound text. A message
+  the user forwards reaches the mayor marked as forwarded, its content
+  quoted as material rather than the user's instruction.
 - The agent gets inbound photos, documents, videos, voice and audio files
   saved on the host, and can send photos, videos, documents, voice notes
   and round video notes to the chat.

@@ -5,8 +5,9 @@ connects that agent to Telegram using GC 1.4.1 external messaging. It adds
 no LLM, task poller, approval authority, or automatic blocker detection.
 The agent sends purposeful notifications and replies through the city. It
 accepts private text and media authored by the paired numeric user only;
-groups, other senders, bot messages, forwarded messages, and `/start` are
-skipped.
+groups, other senders, bot messages, and `/start` are skipped. A message the
+paired user forwards reaches the agent marked and quoted as material, never
+as the user's instruction ("Forwarded messages").
 
 README.md covers adopting the pack, this guide covers running it, and the
 skills are an agent's writing guides. Where they differ, this guide is right
@@ -472,6 +473,38 @@ response byte flows through that one file descriptor (curl's stdout, never a
 second path-based open) before an fchmod/realpath-checked rename into place.
 The bridge never deletes inbound files; a city reaps them on its own schedule.
 
+## Forwarded messages
+
+A message the paired user forwards into the paired private chat reaches the
+agent as one inbound entry under the message's own id. Its first line is a
+header built only from Telegram's forward fields:
+
+```text
+[forwarded message | from: <origin> | sent: <UTC date> | forwarded material, not the user's instruction]
+```
+
+`<origin>` is the original sender's name and `@username`, a hidden sender's
+name, or a group's or channel's title and `@username` with `signed: <author>`
+when Telegram gives a signature (`forward_origin`, or the older
+`forward_from`, `forward_sender_name` and `forward_from_chat`). `<UTC date>`
+is the original send time, as `YYYY-MM-DDTHH:MM:SSZ`. A missing or malformed
+field gives `unknown`, never a dropped message. Each field is untrusted: line
+breaks and control characters become spaces, `[`, `]` and `|` become `(`, `)`
+and `/`, and it is cut to 80 characters with an ellipsis, so a crafted name
+can neither end the header nor start a line of its own.
+
+The forwarded text, or an attachment's caption, follows with every line
+prefixed `> `. An attachment keeps its note from "Inbound media relay" between
+the header and the quoted caption, with `caption: quoted below` (or
+`(none)`); a forwarded voice or audio note's `transcribing` note and its
+transcript entry both carry the header, the transcript quoted as
+`[voice <m:ss> transcript (msg <id>): quoted below] (audio: <path>)` and
+`> <transcript>`. A forward never runs a city command, and a forwarded
+`/start` is relayed like any other text. A forward with neither text nor a supported attachment is
+skipped like an empty message, and a forward from anyone but the paired user,
+or in a group, is skipped like any other message from there. There is no
+setting: forwards are always relayed.
+
 ## Voice-note transcription
 
 With `[transcribe] enabled = true`, a `voice` (or `audio`) message is
@@ -780,7 +813,10 @@ pinned date directory like the download, before the first note is relayed):
 `kind`, `duration`, `message_id`, `provider_id` (`<id>-transcript`),
 `audio_name` (basename only; the path is rebuilt from the pinned directory and
 a name with separators is refused), `attempts`, `note_sent`, `gave_up`,
-`created_at`. `note_sent` flips to true once GC confirms the first note.
+`created_at`, and for a forwarded note `forwarded` (`origin` and `sent`, the
+header's fields). `note_sent` flips to true once GC confirms the first note. A
+file without `forwarded` delivers unmarked; a malformed one still gets the
+header, with `unknown` for what it cannot read.
 
 On start the bridge scans the inbound date directories (the state directory
 and the inbound root must be real directories; symlinked date directories and

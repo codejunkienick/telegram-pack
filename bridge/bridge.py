@@ -594,6 +594,12 @@ class Bridge:
     _CONTROL_RE = re.compile(r'[\x00-\x1f\x7f-\x9f\u2028\u2029]+')
     INBOUND_DOWNLOAD_ATTEMPTS = 3
     _FILENAME_UNSAFE_RE = re.compile(r'[^A-Za-z0-9._-]+')
+    # Any of these marks a message the user forwarded: Bot API 7.0's
+    # forward_origin, or the fields it replaced.
+    FORWARD_KEYS = ('forward_origin', 'forward_from', 'forward_from_chat', 'forward_from_message_id',
+                    'forward_signature', 'forward_sender_name', 'forward_date')
+    FORWARD_FIELD_MAX = 80
+    _FORWARD_DELIMITERS = str.maketrans({'[': '(', ']': ')', '|': '/'})
 
     def __init__(self, config, store, token, callback_secret, port=8930, request=http_json,
                  request_multipart=http_multipart, request_download=None, state_dir=None, transcribe=None,
@@ -959,9 +965,94 @@ class Bridge:
                 continue
         return None, None, 'fetch_failed'
 
-    def _format_attachment_relay(self, kind, file_id, path, size, failure, caption):
+    # ---- forwarded messages --------------------------------------------------
+    # A message the paired user forwards is material they pass on, never their
+    # own instruction: it is relayed under a one-line header built only from
+    # Telegram's forward fields, with its text quoted line by line after it.
+
+    @classmethod
+    def _forward_source(cls, message):
+        """{'origin', 'sent'} of a forwarded message, cleaned for the header;
+        "unknown" for a missing or malformed field, never an error."""
+        def text(value):
+            return value.strip() if isinstance(value, str) else ''
+
+        def handle(name, username):
+            username = text(username)
+            if name and username:
+                return f'{name} (@{username})'
+            return name or (f'@{username}' if username else '')
+
+        def person(user):
+            if not isinstance(user, dict):
+                return ''
+            name = ' '.join(part for part in (text(user.get('first_name')), text(user.get('last_name'))) if part)
+            return handle(name, user.get('username'))
+
+        def chat(value, signature):
+            name = ''
+            if isinstance(value, dict):
+                name = handle(text(value.get('title')), value.get('username')) or person(value)
+            signature = text(signature)
+            return ', '.join(part for part in (name, signature and f'signed: {signature}') if part)
+
+        origin, date = message.get('forward_origin'), None
+        name = ''
+        if isinstance(origin, dict):
+            kind, date = origin.get('type'), origin.get('date')
+            if kind == 'user':
+                name = person(origin.get('sender_user'))
+            elif kind == 'hidden_user':
+                name = text(origin.get('sender_user_name'))
+            elif kind == 'chat':
+                name = chat(origin.get('sender_chat'), origin.get('author_signature'))
+            elif kind == 'channel':
+                name = chat(origin.get('chat'), origin.get('author_signature'))
+        name = (name or person(message.get('forward_from')) or text(message.get('forward_sender_name'))
+                or chat(message.get('forward_from_chat'), message.get('forward_signature')))
+        if date is None:
+            date = message.get('forward_date')
+        sent = ''
+        if type(date) is int and date > 0:
+            try:
+                sent = datetime.datetime.fromtimestamp(date, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            except (OverflowError, OSError, ValueError):
+                sent = ''
+        return dict(origin=cls._forward_field(name), sent=cls._forward_field(sent))
+
+    @classmethod
+    def _forward_field(cls, value):
+        """Untrusted header text on one line: no line break or control
+        character, no header delimiter, capped; "unknown" when empty."""
+        if not isinstance(value, str):
+            return 'unknown'
+        return cls._clean_line(value.translate(cls._FORWARD_DELIMITERS), cls.FORWARD_FIELD_MAX) or 'unknown'
+
+    @classmethod
+    def _forward_header(cls, source):
+        # Cleaned again here: a pending file's copy is read back from disk.
+        source = source if isinstance(source, dict) else {}
+        return (f"[forwarded message | from: {cls._forward_field(source.get('origin'))} | "
+                f"sent: {cls._forward_field(source.get('sent'))} | forwarded material, not the user's instruction]")
+
+    @staticmethod
+    def _quote(text):
+        """Every line prefixed '> ', split on every line boundary Python knows."""
+        return '\n'.join('> ' + line for line in text.splitlines())
+
+    @classmethod
+    def _relay_body(cls, header, note, material):
+        """A note with its material: as today, the material bare after the note;
+        for a forward, the header first and the material quoted."""
+        if header is None:
+            return note + ('\n' + material if material else '')
+        return '\n'.join(part for part in (header, note, material and cls._quote(material)) if part)
+
+    def _format_attachment_relay(self, kind, file_id, path, size, failure, caption, header=None):
         caption_text = caption.strip() if isinstance(caption, str) and caption.strip() else None
         caption_display = caption_text or '(none)'
+        if header is not None and caption_text:
+            caption_display = 'quoted below'
         if failure == 'oversize':
             note = (f'[attachment skipped: exceeds {self.INBOUND_MAX_BYTES} byte limit ({size} bytes) | '
                     f'{kind} | file_id: {file_id} | caption: {caption_display}]')
@@ -970,7 +1061,7 @@ class Bridge:
                     f'{kind} | file_id: {file_id} | caption: {caption_display}]')
         else:
             note = f'[attachment saved: {path} | {kind} | {size} bytes | caption: {caption_display}]'
-        return note + ('\n' + caption_text if caption_text else '')
+        return self._relay_body(header, note, caption_text)
 
     @staticmethod
     def _format_duration(message, kind):
@@ -1129,14 +1220,19 @@ class Bridge:
         value = ' '.join(cls._CONTROL_RE.sub(' ', value).split())
         return value if len(value) <= limit else value[:limit - 1] + '\u2026'
 
-    def _format_voice_pending(self, kind, duration, path, caption):
+    def _format_voice_pending(self, kind, duration, path, caption, header=None):
         caption_text = caption.strip() if isinstance(caption, str) and caption.strip() else None
         note = f'[attachment saved: {path} | {kind} {duration} | transcribing]'
-        return note + ('\n' + caption_text if caption_text else '')
+        return self._relay_body(header, note, caption_text)
 
-    def _format_voice_transcript(self, kind, duration, mid, path, transcript, reason):
+    def _format_voice_transcript(self, kind, duration, mid, path, transcript, reason, header=None):
         body = transcript if reason is None else f'transcription failed: {reason}'
-        return f'[{kind} {duration} transcript (msg {mid}): {body}] (audio: {path})'
+        if header is None:
+            return f'[{kind} {duration} transcript (msg {mid}): {body}] (audio: {path})'
+        if reason is not None:
+            return self._relay_body(header, f'[{kind} {duration} transcript (msg {mid}): {body}] (audio: {path})', None)
+        return self._relay_body(header, f'[{kind} {duration} transcript (msg {mid}): quoted below] (audio: {path})',
+                                transcript)
 
     # ---- durable transcript queue -------------------------------------------
     # One <message_id>-transcript.pending JSON file per queued voice note sits
@@ -1239,7 +1335,10 @@ class Bridge:
                   file=sys.stderr, flush=True)
         else:
             print(f"voice transcription done (msg {mid}): {stats['seconds']} s{device}", file=sys.stderr, flush=True)
-        text = self._format_voice_transcript(state['kind'], state['duration'], mid, path, transcript, reason)
+        # A file written before forwards were relayed has no "forwarded" key and
+        # delivers unmarked; a malformed one still gets the header.
+        header = self._forward_header(state['forwarded']) if 'forwarded' in state else None
+        text = self._format_voice_transcript(state['kind'], state['duration'], mid, path, transcript, reason, header)
         # The provider id is the idempotency key: a retry after a relay whose
         # acknowledgement was lost lands on the same GC entry, never a second one.
         while True:
@@ -1352,13 +1451,16 @@ class Bridge:
         if (chat.get('type') != 'private' or type(chat.get('id')) is not int or chat['id'] != self.config['chat_id']
             or type(sender.get('id')) is not int or sender['id'] != self.config['user_id'] or sender.get('is_bot') is not False):
             return
-        if any(key in message for key in ('forward_origin', 'forward_from', 'forward_sender_name', 'forward_from_chat')):
-            return  # Forwarded content is not an instruction authored by the paired user.
+        # Forwarded content is not an instruction authored by the paired user:
+        # it never runs a command or /start, and reaches the agent only quoted
+        # under a forwarded header.
+        forward = self._forward_source(message) if any(key in message for key in self.FORWARD_KEYS) else None
+        header = self._forward_header(forward) if forward is not None else None
 
         attachment = self._extract_attachment(message)
         text = message.get('text')
         caption = message.get('caption')
-        found = self._match_command(text) if attachment is None and isinstance(text, str) else None
+        found = self._match_command(text) if forward is None and attachment is None and isinstance(text, str) else None
         if found is not None:
             # A city command goes to its handler, never to GC.
             command, args = found
@@ -1368,7 +1470,8 @@ class Bridge:
                 callback_data=None, callback_message_id=None, received_at=self._received_at(),
                 user_display_name=self.display_name))
             return
-        if attachment is None and (not isinstance(text, str) or not text.strip() or text.startswith('/start')):
+        if attachment is None and (not isinstance(text, str) or not text.strip()
+                                   or (forward is None and text.startswith('/start'))):
             return
 
         mid = self._message_id(message)
@@ -1387,21 +1490,23 @@ class Bridge:
                 state = dict(version=1, kind=kind, duration=duration, message_id=mid, provider_id=f'{mid}-transcript',
                              audio_name=path.name, attempts=0, note_sent=False, gave_up=False,
                              created_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
+                if forward is not None:
+                    state['forwarded'] = forward
                 try:
                     # Persisted before the first note goes out, so a restart at
                     # any later point can still deliver the transcript.
                     if self._pending_read(path.parent, mid) is None:
                         self._pending_write(path.parent, mid, state)
-                    relay_text = self._format_voice_pending(kind, duration, path, caption)
+                    relay_text = self._format_voice_pending(kind, duration, path, caption, header)
                     transcribe_job = (mid, path.parent, state)
                 except TransportError:
                     print(f'voice transcript queue unavailable (msg {mid}); relaying without transcription',
                           file=sys.stderr, flush=True)
-                    relay_text = self._format_attachment_relay(kind, file_id, path, size, failure, caption)
+                    relay_text = self._format_attachment_relay(kind, file_id, path, size, failure, caption, header)
             else:
-                relay_text = self._format_attachment_relay(kind, file_id, path, size, failure, caption)
+                relay_text = self._format_attachment_relay(kind, file_id, path, size, failure, caption, header)
         else:
-            relay_text = text
+            relay_text = text if header is None else self._relay_body(header, None, text)
 
         reply = message.get('reply_to_message', {}).get('message_id')
         if type(reply) is not int or reply <= 0:
