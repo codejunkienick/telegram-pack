@@ -7,6 +7,7 @@ import argparse
 import contextlib
 import datetime
 import fcntl
+import getpass
 import hashlib
 import hmac
 import importlib.util
@@ -2851,11 +2852,32 @@ def supported_models(path=None, sums=None):
             if name.startswith('ggml-') and name.endswith('.bin') and not name.startswith('ggml-silero-')]
 
 
-def install_problems(settings, which=shutil.which, sums=None, hasher=_sha256):
+def _interpreter_version(python):
+    """(major, minor) of the interpreter at `python`, or None when it cannot
+    be run or its answer cannot be read."""
+    try:
+        done = subprocess.run([str(python), '-c', 'import sys; print(*sys.version_info[:2])'],
+                              capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    try:
+        major, minor = done.stdout.split()
+        return int(major), int(minor)
+    except (AttributeError, ValueError):
+        return None
+
+
+def install_problems(settings, which=shutil.which, sums=None, hasher=_sha256, platform=None,
+                     version=_interpreter_version, osrelease='/proc/sys/kernel/osrelease',
+                     systemd_dir='/run/systemd/system', linger_dir='/var/lib/systemd/linger', home=None):
     """[(ok, line)] for everything the bridge needs on this host; never prints
     a credential. The transcriber checks run only when it is enabled. A line
     starting with WARN is ok (not a failure): check-install prints it as a
     WARN line and still exits 0."""
+    plat = voice_transcribe.host_platform() if platform is None else platform
+    home_path = Path(home) if home else Path.home()
     results = []
 
     def check(ok, line):
@@ -2864,8 +2886,70 @@ def install_problems(settings, which=shutil.which, sums=None, hasher=_sha256):
     def warn(line):
         results.append((True, f'WARN  {line}'))
 
-    check(os.access(settings.python, os.X_OK), f'python {settings.python}')
-    check(which('curl'), 'curl on PATH')
+    def checked_paths():
+        entries = []
+        for value, what in ((getattr(settings, 'path', None), 'settings file'),
+                            (getattr(settings, 'token_file', None), 'bot token file'),
+                            (getattr(settings, 'callback_secret_file', None), 'callback secret file'),
+                            (getattr(settings, 'state_dir', None), 'state directory'),
+                            (getattr(settings, 'lock_dir', None), 'lock directory'),
+                            (getattr(settings, 'whisper_cli', None), 'whisper-cli'),
+                            (getattr(settings, 'models_dir', None), 'models directory')):
+            if value is not None:
+                entries.append((Path(value), what))
+        for command in settings.config.get('commands', ()):
+            if command.get('handler'):
+                entries.append((Path(command['handler']), f"command /{command['name']} handler"))
+        return entries
+
+    if plat == 'wsl':
+        try:
+            release = Path(osrelease).read_text()
+        except (OSError, UnicodeDecodeError):
+            release = ''
+        is_wsl2 = 'wsl2' in release.lower()
+        systemd_ok = Path(systemd_dir).is_dir()
+        if is_wsl2 and systemd_ok:
+            check(True, 'WSL 2 with systemd')
+        else:
+            if not is_wsl2:
+                check(False, 'WSL 1 is not supported: convert the distribution with '
+                             'wsl --set-version <distro> 2')
+            if not systemd_ok:
+                check(False, 'systemd is not running in this WSL distribution: add [boot] systemd=true '
+                             'to /etc/wsl.conf, run wsl --shutdown in Windows, reopen the distribution')
+        for path, what in checked_paths():
+            if str(path).startswith('/mnt/'):
+                check(False, f'{what} {path} is on a Windows drive (/mnt/...): '
+                             'keep it in the Linux file system')
+        user = getpass.getuser()
+        if not (Path(linger_dir) / user).exists():
+            warn(f'no linger for {user}: the bridge stops when your last WSL session ends '
+                 f'(loginctl enable-linger {user})')
+    if plat == 'darwin':
+        protected = (home_path / 'Desktop', home_path / 'Documents', home_path / 'Downloads',
+                     home_path / 'Library' / 'Mobile Documents')
+        for path, what in checked_paths():
+            if any(path.is_relative_to(root) for root in protected):
+                warn(f'{what} {path} is in a folder macOS privacy protection blocks for a launchd agent; move it')
+
+    if not os.access(settings.python, os.X_OK):
+        check(False, f'python {settings.python}')
+    else:
+        found = version(settings.python)
+        try:
+            new_enough = found is not None and tuple(found) >= (3, 11)
+        except TypeError:
+            new_enough = False
+        if new_enough:
+            check(True, f'python {settings.python}')
+        else:
+            check(False, f'python {settings.python} is not Python 3.11 or later '
+                         '(set python in the settings to a 3.11+ interpreter)')
+    if plat == 'darwin':
+        check(which('curl', path=LAUNCHD_PATH), 'curl on PATH')
+    else:
+        check(which('curl'), 'curl on PATH')
     for path, what in ((settings.token_file, 'bot token'), (settings.callback_secret_file, 'callback secret')):
         try:
             private_text(path)
@@ -2885,15 +2969,25 @@ def install_problems(settings, which=shutil.which, sums=None, hasher=_sha256):
                 ok = True
             except SettingsError:
                 ok = False
-            check(ok, f"command /{command['name']} handler {command['handler']} (runs in the unit's sandbox)")
+            suffix = ("(runs with your user's full rights: no sandbox on macOS)" if plat == 'darwin'
+                      else "(runs in the unit's sandbox)")
+            check(ok, f"command /{command['name']} handler {command['handler']} {suffix}")
         else:
             check(True, f"command /{command['name']} handler {command['url']} (loopback; outside the unit's sandbox)")
     for path in getattr(settings, 'handler_write_paths', ()):
         check(path.is_dir(), f'handler write path {path}')
+        if plat == 'darwin':
+            warn(f'handler write path {path} is not enforced on macOS (no sandbox)')
     if settings.transcribe is None:
         check(True, 'transcription off')
         return results
-    check(which('ffmpeg'), 'ffmpeg on PATH')
+    if plat == 'darwin':
+        check(which('ffmpeg', path=LAUNCHD_PATH), 'ffmpeg on PATH')
+        cpus = settings.transcribe.get('cpus') or (settings.transcribe.get('env') or {}).get('VOICE_TRANSCRIBE_CPUS', '')
+        if cpus:
+            check(False, 'transcribe.cpus is not supported on macOS (no CPU affinity); remove it')
+    else:
+        check(which('ffmpeg'), 'ffmpeg on PATH')
     try:
         st = os.stat(settings.queue_dir)
         check(_is_owner_only_directory(st),

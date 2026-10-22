@@ -633,6 +633,8 @@ class InstallCheckTests(unittest.TestCase):
 
     def failures(self, **kwargs):
         kwargs.setdefault('which', lambda name: '/usr/bin/' + name)
+        kwargs.setdefault('platform', 'linux')
+        kwargs.setdefault('version', lambda python: (3, 14))
         return [line for ok, line in b.install_problems(self.settings, **kwargs) if not ok]
 
     def model(self, name, data):
@@ -642,11 +644,118 @@ class InstallCheckTests(unittest.TestCase):
     def test_everything_present_and_matching_passes(self):
         sums = {**self.model('large-v3-turbo-q5_0', b'turbo'), **self.model('silero-v6.2.0', b'vad')}
         self.assertEqual(self.failures(sums=sums), [])
+        results = b.install_problems(self.settings, which=lambda n: '/usr/bin/' + n, sums=sums,
+                                     platform='linux', version=lambda python: (3, 14))
+        self.assertEqual(results, [
+            (True, f'python {self.settings.python}'),
+            (True, 'curl on PATH'),
+            (True, 'bot token file is owner-only'),
+            (True, 'callback secret file is created by install.sh'),
+            (True, f'state directory {self.settings.state_dir}'),
+            (True, f'lock directory {self.settings.lock_dir}'),
+            (True, 'ffmpeg on PATH'),
+            (True, f'transcription queue {self.queue} is created by install.sh'),
+            (True, f'whisper-cli {self.cli}'),
+            (True, f'model {self.models}/ggml-large-v3-turbo-q5_0.bin SHA-256'),
+            (True, f'model {self.models}/ggml-silero-v6.2.0.bin SHA-256'),
+        ])
+
+    def test_an_old_or_unreadable_interpreter_fails_on_linux_and_darwin(self):
+        sums = {**self.model('large-v3-turbo-q5_0', b'turbo'), **self.model('silero-v6.2.0', b'vad')}
+        line = (f'python {self.settings.python} is not Python 3.11 or later '
+                '(set python in the settings to a 3.11+ interpreter)')
+        for platform in ('linux', 'darwin'):
+            for version in (lambda python: (3, 9), lambda python: None):
+                with self.subTest(platform=platform, version=version):
+                    results = b.install_problems(
+                        self.settings, which=lambda n, path=None: '/usr/bin/' + n, sums=sums,
+                        platform=platform, version=version, home=self.root / 'home')
+                    self.assertIn((False, line), results)
+        results = b.install_problems(self.settings, which=lambda n: '/usr/bin/' + n, sums=sums,
+                                     platform='linux', version=lambda python: (3, 11))
+        self.assertIn((True, f'python {self.settings.python}'), results)
+
+    def test_a_non_executable_interpreter_keeps_the_existing_line(self):
+        sums = {**self.model('large-v3-turbo-q5_0', b'turbo'), **self.model('silero-v6.2.0', b'vad')}
+        python = self.root / 'python'
+        python.write_text('#!/bin/sh\n')
+        settings = b.Settings(**dict(self.settings.__dict__, python=python))
+        results = b.install_problems(settings, which=lambda n: '/usr/bin/' + n, sums=sums,
+                                     platform='linux', version=lambda path: (3, 14))
+        self.assertIn((False, f'python {python}'), results)
+
+    def test_darwin_checks(self):
+        sums = {**self.model('large-v3-turbo-q5_0', b'turbo'), **self.model('silero-v6.2.0', b'vad')}
+        home = self.root / 'home'
+        calls = []
+
+        def recording_which(name, path=None):
+            calls.append((name, path))
+            return '/usr/bin/' + name
+
+        handler = self.root / 'handler'
+        handler.write_text('#!/bin/sh\n')
+        handler.chmod(0o755)
+        out = self.root / 'out'
+        out.mkdir()
+        state = home / 'Documents' / 'state'
+        state.mkdir(parents=True)
+        transcribe = dict(self.settings.transcribe,
+                          env=dict(self.settings.transcribe['env'], VOICE_TRANSCRIBE_CPUS='0-3'))
+        settings = b.Settings(**dict(
+            self.settings.__dict__, transcribe=transcribe, state_dir=state,
+            config=dict(self.settings.config, commands=(dict(name='deploy', handler=str(handler)),)),
+            handler_write_paths=(out,)))
+        results = b.install_problems(settings, which=recording_which, sums=sums, platform='darwin',
+                                     version=lambda python: (3, 14), home=home)
+        self.assertIn(('curl', b.LAUNCHD_PATH), calls)
+        self.assertIn(('ffmpeg', b.LAUNCHD_PATH), calls)
+        self.assertIn((False, 'transcribe.cpus is not supported on macOS (no CPU affinity); remove it'), results)
+        self.assertIn((True, f"command /deploy handler {handler} "
+                             "(runs with your user's full rights: no sandbox on macOS)"), results)
+        self.assertIn((True, f'handler write path {out}'), results)
+        self.assertIn((True, f'WARN  handler write path {out} is not enforced on macOS (no sandbox)'), results)
+        self.assertIn((True, f'WARN  state directory {state} is in a folder macOS privacy protection '
+                             'blocks for a launchd agent; move it'), results)
+
+    def test_wsl_checks(self):
+        import getpass
+        sums = {**self.model('large-v3-turbo-q5_0', b'turbo'), **self.model('silero-v6.2.0', b'vad')}
+        user = getpass.getuser()
+        systemd = self.root / 'systemd'
+        systemd.mkdir()
+        linger = self.root / 'linger'
+        linger.mkdir()
+        (linger / user).write_text('')
+        release = self.root / 'osrelease'
+        release.write_text('microsoft-standard-WSL2\n')
+        base = dict(which=lambda n: '/usr/bin/' + n, sums=sums, platform='wsl',
+                    version=lambda python: (3, 14), osrelease=str(release),
+                    systemd_dir=str(systemd), linger_dir=str(linger), home=self.root / 'home')
+        results = b.install_problems(self.settings, **base)
+        self.assertEqual(results[0], (True, 'WSL 2 with systemd'))
+        results = b.install_problems(self.settings, **dict(base, systemd_dir=str(self.root / 'missing-systemd')))
+        self.assertIn((False, 'systemd is not running in this WSL distribution: add [boot] systemd=true '
+                              'to /etc/wsl.conf, run wsl --shutdown in Windows, reopen the distribution'), results)
+        release.write_text('4.4.0-19041-Microsoft\n')
+        results = b.install_problems(self.settings, **base)
+        self.assertIn((False, 'WSL 1 is not supported: convert the distribution with '
+                              'wsl --set-version <distro> 2'), results)
+        release.write_text('microsoft-standard-WSL2\n')
+        settings = b.Settings(**dict(self.settings.__dict__, token_file=Path('/mnt/c/token')))
+        results = b.install_problems(settings, **base)
+        self.assertIn((False, 'bot token file /mnt/c/token is on a Windows drive (/mnt/...): '
+                              'keep it in the Linux file system'), results)
+        empty_linger = self.root / 'empty-linger'
+        empty_linger.mkdir()
+        results = b.install_problems(self.settings, **dict(base, linger_dir=str(empty_linger)))
+        self.assertIn((True, f'WARN  no linger for {user}: the bridge stops when your last WSL session ends '
+                             f'(loginctl enable-linger {user})'), results)
 
     def test_an_english_only_model_with_another_language_warns_and_still_passes(self):
         sums = {**self.model('small.en', b'small'), **self.model('silero-v6.2.0', b'vad')}
         settings = b.Settings(**dict(self.settings.__dict__, model='small.en', language='ru'))
-        results = b.install_problems(settings, which=lambda n: '/usr/bin/' + n, sums=sums)
+        results = b.install_problems(settings, which=lambda n: '/usr/bin/' + n, sums=sums, platform='linux')
         self.assertEqual([line for ok, line in results if not ok], [])
         warns = [line for ok, line in results if line.startswith('WARN')]
         self.assertEqual(len(warns), 1)
@@ -657,7 +766,7 @@ class InstallCheckTests(unittest.TestCase):
             with self.subTest(language=language):
                 other = b.Settings(**dict(self.settings.__dict__, model='small.en', language=language))
                 lines = [line for ok, line in b.install_problems(
-                    other, which=lambda n: '/usr/bin/' + n, sums=sums)]
+                    other, which=lambda n: '/usr/bin/' + n, sums=sums, platform='linux')]
                 self.assertFalse(any(line.startswith('WARN') for line in lines))
 
     def test_check_install_prints_the_warn_line_and_exits_0(self):
@@ -675,7 +784,8 @@ class InstallCheckTests(unittest.TestCase):
 
     def test_the_queue_directory_is_created_by_install_or_must_be_owner_only(self):
         sums = {**self.model('large-v3-turbo-q5_0', b'turbo'), **self.model('silero-v6.2.0', b'vad')}
-        lines = [line for ok, line in b.install_problems(self.settings, which=lambda n: '/usr/bin/' + n, sums=sums)]
+        lines = [line for ok, line in b.install_problems(self.settings, which=lambda n: '/usr/bin/' + n, sums=sums,
+                                                         platform='linux')]
         self.assertIn(f'transcription queue {self.queue} is created by install.sh', lines)
         self.queue.mkdir(mode=0o755, parents=True)
         self.queue.chmod(0o755)
@@ -695,14 +805,15 @@ class InstallCheckTests(unittest.TestCase):
         self.assertIn(f'model {self.models}/ggml-large-v3-turbo-q5_0.bin is missing', failed)
         self.assertIn('transcribe model small is not one of the supported models: large-v3-turbo-q5_0',
                       [line for ok, line in b.install_problems(
-                          b.Settings(**dict(self.settings.__dict__, model='small')), which=lambda n: n, sums=sums)
+                          b.Settings(**dict(self.settings.__dict__, model='small')), which=lambda n: n, sums=sums,
+                          platform='linux')
                        if not ok])
 
     def test_a_world_readable_token_fails_and_is_never_printed(self):
         token = self.settings.token_file
         token.chmod(0o644)
         sums = {**self.model('large-v3-turbo-q5_0', b'turbo'), **self.model('silero-v6.2.0', b'vad')}
-        results = b.install_problems(self.settings, which=lambda n: n, sums=sums)
+        results = b.install_problems(self.settings, which=lambda n: n, sums=sums, platform='linux')
         self.assertIn((False, 'bot token file must be an owner-only regular file'), results)
         self.assertNotIn('TESTTOKEN', repr(results))
 
@@ -722,27 +833,27 @@ class InstallCheckTests(unittest.TestCase):
         self.assertEqual(b.supported_models(),
                          ['large-v3-turbo-q5_0', 'small.en', 'small.en-q5_1', 'base.en', 'small'])
         self.assertEqual([line for ok, line in b.install_problems(settings, which=lambda n: '/usr/bin/' + n,
-                                                                  sums=sums) if not ok],
+                                                                  sums=sums, platform='linux') if not ok],
                          ['transcribe model tiny is not one of the supported models: large-v3-turbo-q5_0'])
 
     def test_an_unlisted_model_present_on_disk_warns_and_passes(self):
         sums = {**self.model('large-v3-turbo-q5_0', b'turbo'), **self.model('silero-v6.2.0', b'vad')}
         (self.models / 'ggml-tiny.bin').write_bytes(b'tiny-model')
         settings = b.Settings(**dict(self.settings.__dict__, model='tiny'))
-        results = b.install_problems(settings, which=lambda n: '/usr/bin/' + n, sums=sums)
+        results = b.install_problems(settings, which=lambda n: '/usr/bin/' + n, sums=sums, platform='linux')
         self.assertEqual([line for ok, line in results if not ok], [])
         warns = [line for ok, line in results if line.startswith('WARN')]
         self.assertEqual(warns, ['WARN  model ggml-tiny.bin is not in transcriber/models.sha256; skipping hash check'])
         # An empty unlisted file does not pass.
         (self.models / 'ggml-tiny.bin').write_bytes(b'')
-        results = b.install_problems(settings, which=lambda n: '/usr/bin/' + n, sums=sums)
+        results = b.install_problems(settings, which=lambda n: '/usr/bin/' + n, sums=sums, platform='linux')
         self.assertEqual([line for ok, line in results if not ok],
                          ['transcribe model tiny is not one of the supported models: large-v3-turbo-q5_0'])
 
     def test_a_listed_vad_name_as_model_fails_as_unsupported(self):
         sums = {**self.model('large-v3-turbo-q5_0', b'turbo'), **self.model('silero-v6.2.0', b'vad')}
         settings = b.Settings(**dict(self.settings.__dict__, model='silero-v6.2.0'))
-        results = b.install_problems(settings, which=lambda n: '/usr/bin/' + n, sums=sums)
+        results = b.install_problems(settings, which=lambda n: '/usr/bin/' + n, sums=sums, platform='linux')
         self.assertEqual([line for ok, line in results if not ok],
                          ['transcribe model silero-v6.2.0 is not one of the supported models: '
                           'large-v3-turbo-q5_0'])
