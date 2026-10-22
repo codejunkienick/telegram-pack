@@ -58,7 +58,7 @@ city.
 | `token_file`, `callback_secret_file` | yes | owner-only credential files (`install.sh` creates a missing callback secret: the unit cannot write outside its state and lock directories) |
 | `[bot]` `bot_id`, `user_id`, `chat_id`, `account_id` | yes | positive numeric ids (`chat_id` equals `user_id`: a private chat), the bot username as the adapter account |
 | `lock_dir` | no | where the per-bot lock lives; default the token file's directory |
-| `unit` | no | service name: the systemd unit name on Linux and WSL, and on macOS the source of the launchd label (this name without its `.service` suffix); default `<city>-telegram.service` |
+| `unit` | no | service name: the systemd unit name on Linux and WSL 2, and on macOS the source of the launchd label (this name without its `.service` suffix); default `<city>-telegram.service` |
 | `python` | no | interpreter for the unit and the transcriber; default `/usr/bin/python3` |
 | `user_display_name` | no | the actor name on relayed messages; default `User` |
 | `timezone` | no | times in notices and the time zone passed to handlers (`TZ`); default `UTC` |
@@ -89,7 +89,7 @@ requests.
 (python, curl, owner-only credentials, and with transcription on: ffmpeg,
 whisper-cli, the models and their SHA-256), creates the callback secret and
 the transcription queue when they are missing, links
-`~/.local/bin/voice-transcribe`, and on Linux and WSL renders the systemd
+`~/.local/bin/voice-transcribe`, and on Linux and WSL 2 renders the systemd
 unit into `~/.config/systemd/user/<unit>`. On macOS it writes the
 LaunchAgent plist into `~/Library/LaunchAgents/<label>.plist`, where
 `<label>` is the `unit` name without its `.service` suffix, and prints
@@ -97,7 +97,7 @@ the launchctl next line. It is
 idempotent, never starts or stops a service and never contacts Telegram;
 `--dry-run` only reports.
 Then, in the user's shell (an agent asks the user, or runs it only where
-it may manage the user's services), on Linux and WSL:
+it may manage the user's services), on Linux and WSL 2:
 
 ```sh
 python3 <pack>/bridge/bridge.py --settings <settings> probe
@@ -107,7 +107,10 @@ systemctl --user status <unit>
 python3 <pack>/bridge/bridge.py --settings <settings> set-commands
 ```
 
-On macOS:
+On macOS (in a shell whose `python3` on PATH is 3.11 or later, e.g.
+`/opt/homebrew/bin` first on PATH: `install.sh` refuses an older
+`python3` on PATH, and the commands below run bare `python3`; the
+settings' `python` is the interpreter the agent itself runs):
 
 ```sh
 python3 <pack>/bridge/bridge.py --settings <settings> probe
@@ -122,10 +125,10 @@ python3 <pack>/bridge/bridge.py --settings <settings> set-commands
 <chat_id>` (`commands set: 0 () for chat <chat_id>` when the menu is empty).
 
 `bridge.py --settings <settings> render-unit` prints the service for
-this host: the systemd unit text on Linux and WSL, the launchd
+this host: the systemd unit text on Linux and WSL 2, the launchd
 LaunchAgent plist on macOS, and `check-install` runs the checks alone
 (`--gpu-probe` adds the GPU probe, below; without it no transcription
-runs). On Linux and WSL the unit runs
+runs). On Linux and WSL 2 the unit runs
 `<python> <pack>/bridge/bridge.py --settings <settings> run` with the state
 directory and the lock directory as its only writable paths, plus the
 transcription queue with transcription on and every `handler_write_paths`
@@ -136,31 +139,39 @@ RestrictRealtime, RestrictNamespaces, SystemCallArchitectures=native and
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK, all of which
 the GPU probe carries too. On macOS the plist runs
 `<python> <pack>/bridge/bridge.py --settings <settings> run --conflict-exit-status 0`
-with the state directory as its working directory, loads at login
-(`RunAtLoad`), and writes its output to
-`~/Library/Logs/<label>.log`.
+with the state directory as its working directory, loads at login, restarts after 15 s, allows 45 s to stop, sets `PATH` to `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`, and writes its output to `~/Library/Logs/<label>.log`. `run` accepts `--conflict-exit-status <0-255>` (default 2, a `run` flag only): on Linux and WSL 2 a polling conflict exits 2 and the unit does not restart it, while the macOS agent passes 0 (below).
 
 The adapter binds only `127.0.0.1:<port>`, registers its GC callback, and
 refreshes the in-memory registration every ~30 seconds. At startup the
 Telegram probe is retried with backoff for up to 10 minutes, so a short network
 outage does not exit the process; an identity mismatch or an existing webhook
 still exits at once. Other failures exit and the service restarts it
-every 15 s without a start limit (systemd on Linux and WSL; on macOS
+every 15 s without a start limit (systemd on Linux and WSL 2; on macOS
 launchd restarts the agent after an unsuccessful exit, throttled to
 15 s), so an outage can never leave it permanently failed. When the
 service is down, `reply-current` says so and names the restart command:
-`systemctl --user restart <unit>` on Linux and WSL; on macOS
+`systemctl --user restart <unit>` on Linux and WSL 2; on macOS
 `launchctl bootstrap gui/<uid> ~/Library/LaunchAgents/<label>.plist`
 when the agent is not loaded, otherwise
 `launchctl kickstart -k gui/<uid>/<label>`. The service state comes from
-`systemctl --user is-active` on Linux and WSL and from
+`systemctl --user is-active` on Linux and WSL 2 and from
 `launchctl print gui/<uid>/<label>` on macOS (`state = running` is
 reported as active, a missing agent as not loaded). A bot polling
-conflict on Linux and WSL exits with status 2 and disables automatic
+conflict on Linux and WSL 2 exits with status 2 and disables automatic
 restart; stop the other poller/webhook, then start the unit explicitly.
 On macOS the agent passes `--conflict-exit-status 0`, so a polling
 conflict exits successfully and launchd does not restart it; stop the
-other poller/webhook, then start the agent explicitly.
+other poller/webhook, then start it again with
+`launchctl kickstart gui/$(id -u)/<label>`.
+
+`check-install` adds host lines per OS. A `WARN` line is not a
+failure: `check-install` still exits 0, so a successful install can
+show `WARN` instead of `ok` for the warnings below. On WSL 2 it passes
+`WSL 2 with systemd`, fails WSL 1 and a distribution without systemd
+running, fails any checked path under `/mnt/`, and warns without
+linger. On macOS it warns for a checked path in `~/Desktop`,
+`~/Documents`, `~/Downloads` or iCloud Drive, fails `transcribe.cpus`
+(below), marks each handler `(runs with your user's full rights: no sandbox on macOS)`, and warns that each `handler_write_paths` entry `is not enforced on macOS (no sandbox)`; `curl` and `ffmpeg` are looked up on the launchd `PATH` above.
 
 After each successful `getUpdates` the bridge records
 `<state_dir>/telegram-bridge-heartbeat.json`
@@ -319,7 +330,7 @@ an action Telegram refuses (an edit of an unchanged message, say) is logged as
 sends no failure notice. The HTML fallback of "Formatted messages" applies to
 sends and edits.
 
-**Sandbox.** An executable handler runs inside the bridge unit's sandbox:
+**Sandbox.** On Linux and WSL 2 an executable handler runs inside the bridge unit's sandbox:
 `ProtectSystem=strict`, a read-only home, a private `/tmp`, and as writable
 paths only the bridge's state and lock directories (which hold the ledger:
 a handler must leave them alone), the transcription queue, and the
@@ -329,7 +340,13 @@ a handler must leave them alone), the transcription queue, and the
 service and runs outside the sandbox. `check-install` lists every handler and
 fails on a handler that is no longer a safe executable or a write path that is
 not a directory. The settings and credential files are read-only for a
-handler too.
+handler too. On macOS, launchd has no equivalent of the unit's sandbox: the
+bridge and every command handler run with the user's full rights; the write
+limit to the state, lock, queue and handler directories, the read-only
+credentials, the private `/tmp` and the address-family and syscall
+restrictions do not apply, and `handler_write_paths` is accepted but not
+enforced. The settings, token and secret stay owner-only and are refused
+otherwise; other local accounts must be trusted, as on Linux.
 
 Example, in the settings file:
 
@@ -488,7 +505,10 @@ decoding it confines itself (and so ffmpeg and whisper-cli) to the settings'
 (`ionice -c 2 -n 7`), and runs at most 64 whisper threads.
 Idle priority is not used: on a busy host it starves the note. An explicitly
 configured `cpus` list that cannot be applied fails the note (`fence_failed`);
-nice and `ionice` are best-effort only and never fail the note.
+nice and `ionice` are best-effort only and never fail the note. On macOS
+there is no CPU affinity and no `ionice`: `check-install` refuses
+`transcribe.cpus` there, a note that still runs with `cpus` set fails
+`fence_failed`, and only nice 10 applies.
 
 ### Setting up whisper.cpp
 
@@ -511,7 +531,10 @@ Prerequisites (git, cmake, make or ninja, a C++ compiler, ffmpeg, curl and
 sha256sum) are only reported: a missing tool is `FAIL  <tool> not found
 (install it with your package manager)` and the script exits 1 before any
 change, installing nothing itself. There is no sudo, nothing is installed
-system-wide and nothing is started.
+system-wide and nothing is started. On macOS the hash prerequisite is
+`sha256sum` when present, else the built-in `shasum` (`ok    shasum -a 256`),
+which then hashes the models; with neither, the same `sha256sum` FAIL line
+applies.
 
 The checkout is the directory the `whisper_cli` layout names
 (`<checkout>/build/bin/whisper-cli`). A missing checkout is cloned from
@@ -528,7 +551,9 @@ built only when it is missing
 --target whisper-cli`). For method `gpu` or `auto` the configure adds
 `-DGGML_CUDA=1` only when nvcc is on PATH (nvcc is no prerequisite);
 without nvcc it builds for the CPU and reports that the GPU is tried and
-falls back to the CPU.
+falls back to the CPU. On macOS it never adds that flag, even with `nvcc`
+on PATH: whisper.cpp builds with Metal by default there, so for method
+`gpu` or `auto` the lines report Metal (`would build whisper-cli at <path> with Metal (whisper.cpp's default on macOS)`, then `ok    whisper-cli built with Metal at <path>`), and the configure is exactly `cmake -B build` (plus `-G Ninja` when only ninja exists); for method `cpu` the plain lines apply.
 
 Each model file (`<models_dir>/ggml-<name>.bin` for `model` and for
 `vad_model`) is normally named in `transcriber/models.sha256`; a present,
@@ -579,9 +604,12 @@ decoded, right before whisper, the transcriber runs the check once:
   reason — on the CPU with `cpu: check-error`. Nothing the check prints
   reaches the log beyond that label.
 
-The pack's default check is a small standard-library script. It uses
+The pack's default check is a small standard-library script. On Apple
+Silicon it answers `{"gpu": true}` for Metal without running anything.
+Otherwise it uses
 `nvidia-smi --query-gpu=memory.used,memory.total` only when that is found
-on PATH: free MiB at least `GPU_MIN_FREE_MB` (default 2048) answers
+on PATH (on WSL 2 the check's `PATH` also looks in `/usr/lib/wsl/lib`):
+free MiB at least `GPU_MIN_FREE_MB` (default 2048) answers
 `{"gpu": true}`, less answers `{"gpu": false, "reason": "vram-low"}`,
 and when it cannot tell (no `nvidia-smi`, a non-zero exit, or an answer
 that is not one well-formed line) it answers
@@ -591,7 +619,8 @@ group, reads at most 4 KiB in at most 5 s, and is killed by process group
 on timeout or overrun. No vendor tool runs in the bridge, the
 adapter or the method paths of the transcriber itself.
 
-A CPU run never sees the GPU (`CUDA_VISIBLE_DEVICES` empty), whichever path
+A CPU run never sees the GPU (`CUDA_VISIBLE_DEVICES` empty; on macOS the
+same call keeps `-ng`, so CPU runs stay off Metal), whichever path
 led to it. The bridge logs one line per note with the device and the
 reason, never the text: `voice transcription done (msg <id>): <s> s; device
 gpu`, `device gpu: <reason>` or `device cpu: <reason>` with a reason of
@@ -708,18 +737,25 @@ After the change is integrated, on the host:
    proves the GPU where the bridge runs, before the restart (below). It
    skips with `method = "cpu"` and probes with `method = "auto"` or
    `"gpu"`.
-4. `systemctl --user restart <city>-telegram.service`, then send a voice
-   note: the journal (`journalctl --user -u <city>-telegram.service`) shows
-   `voice transcription done (msg <id>): ... device gpu`. Back out with
-   `method = "cpu"` and another restart.
+4. Restart the bridge, then send a voice note. On Linux and WSL 2:
+   `systemctl --user restart <city>-telegram.service`, and the journal
+   (`journalctl --user -u <city>-telegram.service`) shows
+   `voice transcription done (msg <id>): ... device gpu`. On macOS:
+   `launchctl kickstart -k gui/$(id -u)/<label>`, and the log
+   (`~/Library/Logs/<label>.log`) shows the same line; on Apple Silicon
+   prefer `method = "auto"`, whose default check answers for Metal.
+   Back out with `method = "cpu"` and another restart the same way.
 
 `check-install --gpu-probe [--clip <path>]` transcribes a short clip with the
-pack's transcriber and `VOICE_TRANSCRIBE_GPU=1` inside a transient unit
+pack's transcriber and `VOICE_TRANSCRIBE_GPU=1`. On Linux and WSL 2 that is
+inside a transient unit
 (`systemd-run --user --wait --pipe --collect`) that carries the bridge unit's
 sandbox: every `[Service]` setting of the rendered unit except how the process
 starts and restarts, `ReadWritePaths` included, so the two cannot drift. The
-clip goes in on stdin and is written only inside that unit's `PrivateTmp`; it
-waits in the host-wide transcription queue like any note. The default clip is
+clip goes in on stdin and is written only inside that unit's `PrivateTmp`. On
+macOS there is no `systemd-run` and no sandbox to reproduce, so the probe runs
+directly with the launchd agent's environment and a fresh private `TMPDIR`.
+Either way it waits in the host-wide transcription queue like any note. The default clip is
 `samples/jfk.wav` of the whisper.cpp checkout `whisper_cli` is built in
 (`<checkout>/build/bin/whisper-cli`). It prints one line, never transcript
 text: `ok    gpu probe: device gpu (<seconds> s)` (or `device gpu:
