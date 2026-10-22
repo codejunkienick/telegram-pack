@@ -80,6 +80,30 @@ printf '%s %s\\n' "$(basename "$0")" "$*" >> "$FAKE_LOG"
 exit 0
 """
 
+SHA256SUM_FAKE = """#!/usr/bin/env python3
+import hashlib, sys
+for name in sys.argv[1:]:
+    with open(name, "rb") as fh:
+        print(hashlib.sha256(fh.read()).hexdigest() + "  " + name)
+"""
+
+SHASUM_FAKE = """#!/usr/bin/env python3
+import hashlib, os, sys
+with open(os.environ["FAKE_LOG"], "a") as log:
+    log.write("shasum " + " ".join(sys.argv[1:]) + "\\n")
+for name in [a for a in sys.argv[1:] if a not in ("-a", "256")]:
+    with open(name, "rb") as fh:
+        print(hashlib.sha256(fh.read()).hexdigest() + "  " + name)
+"""
+
+UNAME_DARWIN_FAKE = """#!/bin/sh
+printf 'Darwin\\n'
+"""
+
+UNAME_LINUX_FAKE = """#!/bin/sh
+printf 'Linux\\n'
+"""
+
 
 class SetupTests(unittest.TestCase):
     def setUp(self):
@@ -101,7 +125,8 @@ class SetupTests(unittest.TestCase):
         path.write_text(body)
         path.chmod(0o755)
 
-    def make_bin(self, with_nvcc=True, omit=(), with_ninja=False):
+    def make_bin(self, with_nvcc=True, omit=(), with_ninja=False,
+                 with_shasum=False):
         """A PATH dir: fakes first, real core tools as symlinks, nothing else."""
         directory = Path(tempfile.mkdtemp(dir=self.root))
         self._write_fake(directory, "git", GIT_FAKE)
@@ -109,6 +134,8 @@ class SetupTests(unittest.TestCase):
         self._write_fake(directory, "curl", CURL_FAKE)
         if with_ninja:
             self._write_fake(directory, "ninja", TOOL_FAKE)
+        if with_shasum:
+            self._write_fake(directory, "shasum", SHASUM_FAKE)
         for name in ("ffmpeg",):
             if name not in omit:
                 self._write_fake(directory, name, TOOL_FAKE)
@@ -121,6 +148,9 @@ class SetupTests(unittest.TestCase):
             if name in omit:
                 continue
             real = shutil.which(name)
+            if name == "sha256sum" and real is None:
+                self._write_fake(directory, name, SHA256SUM_FAKE)
+                continue
             self.assertIsNotNone(real, name)
             (directory / name).symlink_to(real)
         compiler = shutil.which("c++") or shutil.which("g++")
@@ -148,9 +178,14 @@ class SetupTests(unittest.TestCase):
         env = dict(HOME=str(self.home), PATH=str(bin_dir),
                    FAKE_LOG=str(self.log),
                    TELEGRAM_PACK_MODELS_SHA256=str(self.sums),
+                   TELEGRAM_PACK_PLATFORM="linux",
                    LANG="C")
         if env_extra:
-            env.update(env_extra)
+            for key, value in env_extra.items():
+                if value is None:
+                    env.pop(key, None)
+                else:
+                    env[key] = value
         return subprocess.run(
             [str(SETUP), "--settings", str(settings), *extra],
             env=env, capture_output=True, text=True, timeout=60)
@@ -227,6 +262,104 @@ class SetupTests(unittest.TestCase):
                      if ln.startswith("cmake -B build")]
         self.assertEqual(configure, ["cmake -B build"])
         self.assertIn(CPU_FALLBACK, result.stdout.splitlines())
+
+    def test_darwin_auto_with_nvcc_builds_metal_without_cuda(self):
+        settings = self.settings("auto")
+        result = self.run_setup(
+            settings, self.make_bin(with_nvcc=True),
+            env_extra={"TELEGRAM_PACK_PLATFORM": "darwin"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        configure = [ln for ln in self.log_text().splitlines()
+                     if ln.startswith("cmake -B build")]
+        self.assertEqual(configure, ["cmake -B build"])
+        self.assertIn(
+            f"ok    whisper-cli built with Metal at {self.whisper_cli}",
+            result.stdout.splitlines())
+
+    def test_darwin_dry_run_reports_metal(self):
+        settings = self.settings("auto")
+        result = self.run_setup(
+            settings, self.make_bin(with_nvcc=True), "--dry-run",
+            env_extra={"TELEGRAM_PACK_PLATFORM": "darwin"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            f"would build whisper-cli at {self.whisper_cli} with Metal "
+            "(whisper.cpp's default on macOS)",
+            result.stdout.splitlines())
+        self.assertFalse(self.checkout.exists())
+
+    def test_darwin_cpu_uses_plain_lines(self):
+        settings = self.settings("cpu")
+        result = self.run_setup(
+            settings, self.make_bin(with_nvcc=True),
+            env_extra={"TELEGRAM_PACK_PLATFORM": "darwin"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        configure = [ln for ln in self.log_text().splitlines()
+                     if ln.startswith("cmake -B build")]
+        self.assertEqual(configure, ["cmake -B build"])
+        self.assertIn(f"ok    whisper-cli built at {self.whisper_cli}",
+                      result.stdout.splitlines())
+        self.assertNotIn("Metal", result.stdout)
+
+    def test_darwin_without_sha256sum_uses_shasum(self):
+        settings = self.settings("cpu")
+        bin_dir = self.make_bin(omit=("sha256sum",), with_shasum=True)
+        result = self.run_setup(
+            settings, bin_dir,
+            env_extra={"TELEGRAM_PACK_PLATFORM": "darwin"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("ok    shasum -a 256", result.stdout.splitlines())
+        shasum_lines = [ln for ln in self.log_text().splitlines()
+                        if ln.startswith("shasum ")]
+        self.assertTrue(shasum_lines)
+        self.assertTrue(all("-a 256" in ln for ln in shasum_lines))
+        for name in ("ggml-large-v3-turbo-q5_0.bin", "ggml-silero-v6.2.0.bin"):
+            self.assertEqual((self.models_dir / name).read_bytes(), FAKE_BYTES)
+
+    def test_darwin_without_sha256sum_or_shasum_fails(self):
+        settings = self.settings("auto")
+        bin_dir = self.make_bin(omit=("sha256sum",))
+        result = self.run_setup(
+            settings, bin_dir,
+            env_extra={"TELEGRAM_PACK_PLATFORM": "darwin"})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(
+            "FAIL  sha256sum not found (install it with your package manager)",
+            result.stdout)
+        self.assertFalse(self.checkout.exists())
+        self.assertNotIn("git clone", self.log_text())
+
+    def test_uname_darwin_without_platform_reports_metal(self):
+        settings = self.settings("auto")
+        bin_dir = self.make_bin(with_nvcc=True)
+        self._write_fake(bin_dir, "uname", UNAME_DARWIN_FAKE)
+        for platform in (None, ""):
+            with self.subTest(platform=platform):
+                result = self.run_setup(
+                    settings, bin_dir, "--dry-run",
+                    env_extra={"TELEGRAM_PACK_PLATFORM": platform})
+                self.assertEqual(result.returncode, 0,
+                                 result.stdout + result.stderr)
+                self.assertIn(
+                    f"would build whisper-cli at {self.whisper_cli} with Metal "
+                    "(whisper.cpp's default on macOS)",
+                    result.stdout.splitlines())
+                self.assertFalse(self.checkout.exists())
+
+    def test_uname_linux_without_platform_uses_linux(self):
+        settings = self.settings("auto")
+        bin_dir = self.make_bin(with_nvcc=True)
+        self._write_fake(bin_dir, "uname", UNAME_LINUX_FAKE)
+        result = self.run_setup(
+            settings, bin_dir, "--dry-run",
+            env_extra={"TELEGRAM_PACK_PLATFORM": None})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            f"would build whisper-cli at {self.whisper_cli} "
+            "with CUDA (-DGGML_CUDA=1)",
+            result.stdout.splitlines())
+        self.assertNotIn("Metal", result.stdout)
+        self.assertFalse(self.checkout.exists())
 
     def test_second_run_is_all_ok(self):
         settings = self.settings("auto")

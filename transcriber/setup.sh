@@ -83,6 +83,17 @@ if [ "$enabled" != 1 ]; then
   exit 0
 fi
 
+# Platform: TELEGRAM_PACK_PLATFORM (tests only) when set, else uname;
+# only darwin differs, everything else (WSL included) is linux.
+os=${TELEGRAM_PACK_PLATFORM:-}
+if [ -z "$os" ]; then
+  case $(uname -s 2>/dev/null) in
+    Darwin) os=darwin ;;
+    *) os=linux ;;
+  esac
+fi
+hash_cmd=sha256sum
+
 # Prerequisites: report every missing tool, then fail before any change.
 missing=0
 if command -v git >/dev/null 2>&1; then printf 'ok    git\n'; else printf 'FAIL  git not found (install it with your package manager)\n'; missing=$((missing + 1)); fi
@@ -92,7 +103,11 @@ if command -v make >/dev/null 2>&1; then printf 'ok    make\n'; elif command -v 
 if command -v c++ >/dev/null 2>&1; then printf 'ok    c++\n'; elif command -v g++ >/dev/null 2>&1; then printf 'ok    g++\n'; elif command -v clang++ >/dev/null 2>&1; then printf 'ok    clang++\n'; else printf 'FAIL  c++ not found (install it with your package manager)\n'; missing=$((missing + 1)); fi
 if command -v ffmpeg >/dev/null 2>&1; then printf 'ok    ffmpeg\n'; else printf 'FAIL  ffmpeg not found (install it with your package manager)\n'; missing=$((missing + 1)); fi
 if command -v curl >/dev/null 2>&1; then printf 'ok    curl\n'; else printf 'FAIL  curl not found (install it with your package manager)\n'; missing=$((missing + 1)); fi
-if command -v sha256sum >/dev/null 2>&1; then printf 'ok    sha256sum\n'; else printf 'FAIL  sha256sum not found (install it with your package manager)\n'; missing=$((missing + 1)); fi
+if [ "$os" = darwin ]; then
+  if command -v sha256sum >/dev/null 2>&1; then printf 'ok    sha256sum\n'; elif command -v shasum >/dev/null 2>&1; then printf 'ok    shasum -a 256\n'; hash_cmd=shasum; else printf 'FAIL  sha256sum not found (install it with your package manager)\n'; missing=$((missing + 1)); fi
+else
+  if command -v sha256sum >/dev/null 2>&1; then printf 'ok    sha256sum\n'; else printf 'FAIL  sha256sum not found (install it with your package manager)\n'; missing=$((missing + 1)); fi
+fi
 # nvcc is no prerequisite: without it a gpu/auto build is a CPU build.
 if [ "$missing" -ne 0 ]; then exit 1; fi
 
@@ -134,16 +149,21 @@ else
 fi
 
 # Build only when whisper_cli is missing. CUDA only for gpu/auto with
-# nvcc on PATH; without nvcc the build is for the CPU.
+# nvcc on PATH, and never on darwin (Metal is the default there);
+# without nvcc the build is for the CPU.
 want_cuda=0
-if [ "$method" = gpu ] || [ "$method" = auto ]; then
-  if command -v nvcc >/dev/null 2>&1; then want_cuda=1; fi
+if [ "$os" != darwin ]; then
+  if [ "$method" = gpu ] || [ "$method" = auto ]; then
+    if command -v nvcc >/dev/null 2>&1; then want_cuda=1; fi
+  fi
 fi
 if [ -f "$whisper_cli" ] && [ -x "$whisper_cli" ]; then
   printf 'ok    whisper-cli at %s\n' "$whisper_cli"
 elif [ "$dry_run" = 1 ]; then
   if [ "$want_cuda" = 1 ]; then
     printf 'would build whisper-cli at %s with CUDA (-DGGML_CUDA=1)\n' "$whisper_cli"
+  elif [ "$os" = darwin ] && { [ "$method" = gpu ] || [ "$method" = auto ]; }; then
+    printf 'would build whisper-cli at %s with Metal (whisper.cpp'\''s default on macOS)\n' "$whisper_cli"
   elif [ "$method" = gpu ] || [ "$method" = auto ]; then
     printf 'would build whisper-cli at %s for the CPU (no nvcc on PATH; the GPU is tried and falls back to the CPU)\n' "$whisper_cli"
   else
@@ -167,6 +187,8 @@ else
   fi
   if [ "$want_cuda" = 1 ]; then
     printf 'ok    whisper-cli built with CUDA at %s\n' "$whisper_cli"
+  elif [ "$os" = darwin ] && { [ "$method" = gpu ] || [ "$method" = auto ]; }; then
+    printf 'ok    whisper-cli built with Metal at %s\n' "$whisper_cli"
   elif [ "$method" = gpu ] || [ "$method" = auto ]; then
     printf 'ok    whisper-cli built for the CPU (no nvcc on PATH; the GPU is tried and falls back to the CPU)\n'
   else
@@ -177,7 +199,11 @@ fi
 # Models: check the recorded SHA-256, download only what is missing,
 # never overwrite a file that is already there.
 file_hash() {
-  sha256sum "$1" | cut -d' ' -f1
+  if [ "$hash_cmd" = shasum ]; then
+    shasum -a 256 "$1" | cut -d' ' -f1
+  else
+    sha256sum "$1" | cut -d' ' -f1
+  fi
 }
 setup_model() {
   _name=$1
