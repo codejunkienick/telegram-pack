@@ -18,6 +18,7 @@ import json
 import math
 import os
 from pathlib import Path
+import plistlib
 import queue
 import re
 import secrets
@@ -65,6 +66,7 @@ voice_transcribe = importlib.util.module_from_spec(_transcriber_spec)
 _transcriber_spec.loader.exec_module(voice_transcribe)
 SETTINGS_ENV = 'TELEGRAM_BRIDGE_SETTINGS'
 SETTINGS_NAME = 'telegram-bridge.toml'
+LAUNCHD_PATH = '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
 
 
 NAME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}')
@@ -2167,6 +2169,22 @@ class Bridge:
                     pass
 
 
+class _ConflictExitStatusAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        namespace.conflict_exit_status_given = True
+
+
+def _conflict_exit_status(value):
+    try:
+        status = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError('--conflict-exit-status must be an integer from 0 to 255') from None
+    if not 0 <= status <= 255:
+        raise argparse.ArgumentTypeError('--conflict-exit-status must be an integer from 0 to 255')
+    return status
+
+
 def _build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--settings', type=Path,
@@ -2195,6 +2213,10 @@ def _build_parser():
                         help='check-install: also transcribe a clip on the GPU inside the bridge unit\'s sandbox')
     parser.add_argument('--clip', type=Path,
                         help='the --gpu-probe clip (default: samples/jfk.wav of the whisper.cpp checkout)')
+    parser.add_argument('--conflict-exit-status', type=_conflict_exit_status, default=2,
+                        action=_ConflictExitStatusAction, metavar='N',
+                        help='run: exit status for a polling conflict (0-255, default 2)')
+    parser.set_defaults(conflict_exit_status_given=False)
     return parser
 
 
@@ -2205,19 +2227,43 @@ def _validate_attachment_flags(parser, args):
         parser.error('--gpu-probe is a check-install flag')
     if args.clip and not args.gpu_probe:
         parser.error('--clip requires --gpu-probe')
+    if getattr(args, 'conflict_exit_status_given', False) and args.command != 'run':
+        parser.error('--conflict-exit-status is a run flag')
 
 
-def bridge_unit_state(unit):
-    """systemd's ActiveState of the bridge unit, or None when it cannot be asked."""
+def _launchd_label(unit):
+    return unit[:-len('.service')] if unit.endswith('.service') else unit
+
+
+def bridge_unit_state(unit, platform=None, run=subprocess.run):
+    """The bridge service's state, or None when it cannot be asked: systemd's
+    ActiveState on Linux/WSL, the launchd agent's state on macOS with
+    'running' reported as 'active' and a missing agent as 'not loaded'."""
+    plat = voice_transcribe.host_platform() if platform is None else platform
+    if plat == 'darwin':
+        label = _launchd_label(unit)
+        try:
+            result = run(['launchctl', 'print', f'gui/{os.getuid()}/{label}'],
+                         capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return 'not loaded'
+        for line in (result.stdout or '').splitlines():
+            match = re.match(r'^\s*state = (.+)$', line)
+            if match:
+                value = match.group(1).strip()
+                return 'active' if value == 'running' else value
+        return None
     try:
-        result = subprocess.run(['systemctl', '--user', 'is-active', unit],
-                                capture_output=True, text=True, timeout=10)
+        result = run(['systemctl', '--user', 'is-active', unit],
+                     capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return None
     return result.stdout.strip() or None
 
 
-def _relay_outbound(bridge, outbound, unit_state=bridge_unit_state):
+def _relay_outbound(bridge, outbound, unit_state=bridge_unit_state, platform=None, home=None):
     try:
         return bridge.gc('outbound', outbound, timeout=GC_OUTBOUND_TIMEOUT)
     except TransportError:
@@ -2225,6 +2271,16 @@ def _relay_outbound(bridge, outbound, unit_state=bridge_unit_state):
         # can only answer "rejected", which reads like a config problem.
         state = unit_state(bridge.unit) if bridge.unit else None
         if state is not None and state != 'active':
+            plat = voice_transcribe.host_platform() if platform is None else platform
+            if plat == 'darwin':
+                label = _launchd_label(bridge.unit)
+                uid = os.getuid()
+                if state == 'not loaded':
+                    plist = (Path(home) if home else Path.home()) / 'Library' / 'LaunchAgents' / f'{label}.plist'
+                    raise TransportError(
+                        f'bridge service not running (not loaded); run: launchctl bootstrap gui/{uid} {plist}') from None
+                raise TransportError(
+                    f'bridge service not running ({state}); run: launchctl kickstart -k gui/{uid}/{label}') from None
             raise TransportError(f'bridge service not running ({state}); run: systemctl --user restart {bridge.unit}') from None
         raise
 
@@ -2697,6 +2753,75 @@ def render_unit(settings, template=None, bridge_path=None):
     return text
 
 
+def launchd_label(settings):
+    """The launchd label of the bridge: the unit name without '.service'."""
+    return _launchd_label(settings.unit)
+
+
+def service_file(settings, platform=None, home=None):
+    """Where the rendered service file lives: the systemd user unit on
+    Linux/WSL (under $XDG_CONFIG_HOME or <home>/.config), the LaunchAgent
+    plist on macOS."""
+    plat = voice_transcribe.host_platform() if platform is None else platform
+    home_path = Path(home) if home else Path.home()
+    if plat == 'darwin':
+        return home_path / 'Library' / 'LaunchAgents' / f'{launchd_label(settings)}.plist'
+    xdg = os.environ.get('XDG_CONFIG_HOME')
+    base = Path(xdg) if xdg else home_path / '.config'
+    return base / 'systemd' / 'user' / settings.unit
+
+
+def service_next_line(settings, bridge_path, platform=None, home=None):
+    """The 'next:' line install.sh prints: the probe, the service-manager
+    reload or bootstrap for this platform, and set-commands."""
+    plat = voice_transcribe.host_platform() if platform is None else platform
+    bridge = str(bridge_path)
+    if plat == 'darwin':
+        label = launchd_label(settings)
+        plist = service_file(settings, platform=plat, home=home)
+        return (f'next: python3 {bridge} --settings {settings.path} probe; '
+                f'launchctl bootout gui/$(id -u)/{label} 2>/dev/null; '
+                f'launchctl bootstrap gui/$(id -u) {plist}; '
+                f'python3 {bridge} --settings {settings.path} set-commands '
+                '(README.md, "Adopt in a city", step 6)')
+    return (f'next: python3 {bridge} --settings {settings.path} probe; '
+            'systemctl --user daemon-reload; '
+            f'systemctl --user enable --now {settings.unit}; '
+            f'python3 {bridge} --settings {settings.path} set-commands '
+            '(README.md, "Adopt in a city", step 6)')
+
+
+def render_service(settings, platform=None, home=None, bridge_path=None):
+    """The service definition for this host: the systemd unit text on
+    Linux/WSL (exactly render_unit), a launchd LaunchAgent plist on macOS.
+    The agent passes --conflict-exit-status 0 so a polling conflict exits
+    successfully and KeepAlive does not restart it."""
+    plat = voice_transcribe.host_platform() if platform is None else platform
+    if plat != 'darwin':
+        return render_unit(settings, bridge_path=bridge_path)
+    bridge_path = Path(bridge_path or Path(__file__).resolve())
+    for value, what in ((bridge_path, 'bridge path'), (settings.path, 'settings path')):
+        _path_setting(str(value), what)
+    home_path = Path(home) if home else Path.home()
+    label = launchd_label(settings)
+    log = home_path / 'Library' / 'Logs' / f'{label}.log'
+    agent = {
+        'Label': label,
+        'ProgramArguments': [str(settings.python), str(bridge_path), '--settings', str(settings.path),
+                             'run', '--conflict-exit-status', '0'],
+        'WorkingDirectory': str(settings.state_dir),
+        'RunAtLoad': True,
+        'KeepAlive': {'SuccessfulExit': False},
+        'ThrottleInterval': 15,
+        'ExitTimeOut': 45,
+        'Umask': 63,
+        'EnvironmentVariables': {'PATH': LAUNCHD_PATH},
+        'StandardOutPath': str(log),
+        'StandardErrorPath': str(log),
+    }
+    return plistlib.dumps(agent, fmt=plistlib.FMT_XML).decode('utf-8')
+
+
 def _sha256(path):
     digest = hashlib.sha256()
     with open(path, 'rb') as stream:
@@ -2960,7 +3085,7 @@ def main():
     os.umask(0o077)
     settings = load_settings(settings_path(args.settings, args.city_root))
     if args.command == 'render-unit':
-        sys.stdout.write(render_unit(settings))
+        sys.stdout.write(render_service(settings))
         return
     if args.command == 'check-install':
         results = install_problems(settings)
@@ -3007,7 +3132,11 @@ def main():
             for signum in (signal.SIGTERM, signal.SIGINT):
                 signal.signal(signum, lambda *_: bridge.stop.set())
             bridge.reconcile_pending()
-            bridge.run()
+            try:
+                bridge.run()
+            except PollConflict as error:
+                print(str(error), file=sys.stderr)
+                sys.exit(args.conflict_exit_status)
 
 
 if __name__ == '__main__':

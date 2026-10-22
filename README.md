@@ -25,7 +25,8 @@ itself.
   ledger on one host, and cities share one copy of the code and one
   whisper.cpp build.
 - The operator gets setup checks from `install.sh` and `check-install`
-  before the bridge runs, and a systemd user unit for each city.
+  before the bridge runs, and a service for each city: a systemd user
+  unit on Linux and WSL, a launchd LaunchAgent on macOS.
 - The agent gets ready-made skills for Telegram formatting, attachments
   and voice transcripts.
 
@@ -35,7 +36,7 @@ itself.
 | `bridge/OPERATIONS.md` | the operations guide: settings, launch, delivery recovery, transcription |
 | `bridge/test_*.py` | `sh scripts/test.sh` (fake Telegram, GC and whisper-cli; no network) |
 | `settings.example.toml` | every settings key, with example values |
-| `install.sh` | checks a city's settings and host, links `voice-transcribe`, renders its unit |
+| `install.sh` | checks a city's settings and host, links `voice-transcribe`, renders its service |
 | `systemd/telegram-bridge.service.in` | the unit template |
 | `transcriber/` | `voice_transcribe.py` (whisper.cpp, configured language), `adapter.py` (the bridge's contract), `models.sha256` |
 | `commands/reply-current/` | `gc telegram reply-current`: reply in the paired chat |
@@ -47,7 +48,9 @@ itself.
 - Python 3.11 or later: check `python3 --version`.
 - curl: check `curl --version`.
 - gc 1.4.1 or later on PATH, its city running (`gc version`; tested on 1.5.0): check `gc version`.
-- A systemd user session (`systemctl --user`): check `systemctl --user status`.
+- On Linux and WSL, a systemd user session (`systemctl --user`): check
+  `systemctl --user status`; on macOS, launchd: check
+  `launchctl print gui/$(id -u)`.
 - For transcription also git, cmake, make or ninja, a C++ compiler, ffmpeg, curl, sha256sum, and network access to clone whisper.cpp and download the models (the default model `ggml-large-v3-turbo-q5_0.bin` is about 574 MB, plus the small VAD model): check `git --version`, `cmake --version` and `ffmpeg -version`.
 
 ## Adopt in a city
@@ -117,18 +120,28 @@ with this pack at `<pack>`:
    no wildcard route, and `gc extmsg bind --help` lists every flag.
 5. (shell) `<pack>/install.sh --settings ~/.config/<city>/telegram-bridge.toml`: it
    creates the callback secret and the shared queue directory if they are
-   missing, and it renders `~/.config/systemd/user/<city>-telegram.service`.
-   The unit reads the settings and credential files only (they are read-only
-   inside it) and writes its state directory, its lock directory, the queue
-   and any `handler_write_paths`. Success: every check line says `ok`, and
+   missing. On Linux and WSL it renders
+   `~/.config/systemd/user/<city>-telegram.service`; the unit reads the
+   settings and credential files only (they are read-only inside it)
+   and writes its state directory, its lock directory, the queue and any
+   `handler_write_paths`. Success: every check line says `ok`, and
    the last line is
    `next: python3 <pack>/bridge/bridge.py --settings <file> probe; systemctl --user daemon-reload; systemctl --user enable --now <unit>; python3 <pack>/bridge/bridge.py --settings <file> set-commands (README.md, "Adopt in a city", step 6)`.
+   On macOS `install.sh` does not place the LaunchAgent and its last line
+   still names the systemctl commands; render the agent instead with
+   `mkdir -p ~/Library/LaunchAgents && python3 <pack>/bridge/bridge.py --settings <file> render-unit > ~/Library/LaunchAgents/<label>.plist`,
+   where `<label>` is the unit name without its `.service` suffix.
 6. (shell) `python3 <pack>/bridge/bridge.py --settings <file> probe`, then
+   on Linux and WSL
    `systemctl --user daemon-reload && systemctl --user enable --now <city>-telegram.service`,
+   on macOS
+   `launchctl bootout gui/$(id -u)/<label> 2>/dev/null; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<label>.plist`,
    then `python3 <pack>/bridge/bridge.py --settings <file> set-commands`.
    Success: after probe, its line `Telegram identity and webhook checks passed`;
    after `enable --now`, `systemctl --user status <city>-telegram.service`
-   shows it active and `<state_dir>/telegram-bridge-heartbeat.json` appears
+   shows it active (on macOS, `launchctl print gui/$(id -u)/<label>`
+   shows `state = running`) and
+   `<state_dir>/telegram-bridge-heartbeat.json` appears
    within about a minute; after set-commands, its line
    `commands set: <count> (/<command> ...) for chat <chat_id>`.
 7. (you, then the agent) Send a message from the chat and check the mayor
@@ -166,8 +179,11 @@ the old unit before starting the new one (two pollers on one bot conflict).
 
 ## Uninstall
 
-1. (shell) `systemctl --user disable --now <unit>`
-2. (shell) `rm ~/.config/systemd/user/<unit> && systemctl --user daemon-reload`
+1. (shell) On Linux and WSL `systemctl --user disable --now <unit>`; on
+   macOS `launchctl bootout gui/$(id -u)/<label>`.
+2. (shell) On Linux and WSL
+   `rm ~/.config/systemd/user/<unit> && systemctl --user daemon-reload`;
+   on macOS `rm ~/Library/LaunchAgents/<label>.plist`.
 3. (agent or shell) `gc extmsg unbind --provider telegram --account-id <bot username> --conversation-id <chat id> --agent <agent>`
 4. (agent or shell) Remove the `[imports.telegram]` table and `gc reload`.
 5. (shell, optional) Delete the city's settings file, token and callback secret, and its state_dir (the ledger: keep a private copy if the bridge may return).

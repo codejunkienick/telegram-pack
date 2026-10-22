@@ -3,6 +3,8 @@ install checks. Temp files only; nothing reads the host's real settings."""
 import hashlib
 import importlib.util
 import os
+import plistlib
+from unittest.mock import patch
 from pathlib import Path
 import shutil
 import subprocess
@@ -537,10 +539,71 @@ class UnitTemplateTests(unittest.TestCase):
 
     def test_the_cli_prints_the_same_unit(self):
         path = write_settings(self.root)
+        env = dict(os.environ, TELEGRAM_PACK_PLATFORM='linux')
         result = subprocess.run([sys.executable, str(PACK / 'bridge' / 'bridge.py'), '--settings', str(path), 'render-unit'],
-                                capture_output=True, text=True, timeout=30)
+                                capture_output=True, text=True, timeout=30, env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, b.render_unit(b.load_settings(path), bridge_path=PACK / 'bridge' / 'bridge.py'))
+
+    def test_render_service_on_linux_and_wsl_is_the_systemd_unit(self):
+        settings = b.load_settings(write_settings(self.root))
+        for plat in ('linux', 'wsl'):
+            with self.subTest(platform=plat):
+                self.assertEqual(b.render_service(settings, platform=plat, bridge_path='/srv/pack/bridge/bridge.py'),
+                                 b.render_unit(settings, bridge_path='/srv/pack/bridge/bridge.py'))
+
+    def test_render_service_on_darwin_is_the_launchd_plist(self):
+        home = self.root / 'home'
+        for replace, label in ((dict(unit='"my-bridge.service"'), 'my-bridge'), (dict(), 'test-city-telegram')):
+            with self.subTest(label=label):
+                path = write_settings(self.root, **replace)
+                settings = b.load_settings(path)
+                text = b.render_service(settings, platform='darwin', home=home,
+                                        bridge_path='/srv/pack/bridge/bridge.py')
+                log = home / 'Library' / 'Logs' / f'{label}.log'
+                self.assertEqual(plistlib.loads(text.encode()), {
+                    'Label': label,
+                    'ProgramArguments': ['/usr/bin/python3', '/srv/pack/bridge/bridge.py', '--settings', str(path),
+                                         'run', '--conflict-exit-status', '0'],
+                    'WorkingDirectory': str(self.root / 'state'),
+                    'RunAtLoad': True,
+                    'KeepAlive': {'SuccessfulExit': False},
+                    'ThrottleInterval': 15,
+                    'ExitTimeOut': 45,
+                    'Umask': 63,
+                    'EnvironmentVariables': {'PATH': b.LAUNCHD_PATH},
+                    'StandardOutPath': str(log),
+                    'StandardErrorPath': str(log),
+                })
+
+    def test_service_file_and_next_line_for_each_platform(self):
+        home = self.root / 'home'
+        xdg = self.root / 'xdg'
+        settings = b.load_settings(write_settings(self.root, unit='"my-bridge.service"'))
+        bridge = PACK / 'bridge' / 'bridge.py'
+        with patch.dict(os.environ, {'XDG_CONFIG_HOME': str(xdg)}):
+            for plat in ('linux', 'wsl'):
+                with self.subTest(platform=plat):
+                    self.assertEqual(b.service_file(settings, platform=plat, home=home),
+                                     xdg / 'systemd' / 'user' / 'my-bridge.service')
+                    self.assertEqual(b.service_next_line(settings, bridge, platform=plat, home=home),
+                                     f'next: python3 {bridge} --settings {settings.path} probe; '
+                                     'systemctl --user daemon-reload; '
+                                     'systemctl --user enable --now my-bridge.service; '
+                                     f'python3 {bridge} --settings {settings.path} set-commands '
+                                     '(README.md, "Adopt in a city", step 6)')
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(b.service_file(settings, platform='linux', home=home),
+                             home / '.config' / 'systemd' / 'user' / 'my-bridge.service')
+        plist = home / 'Library' / 'LaunchAgents' / 'my-bridge.plist'
+        self.assertEqual(b.service_file(settings, platform='darwin', home=home), plist)
+        self.assertEqual(b.launchd_label(settings), 'my-bridge')
+        self.assertEqual(b.service_next_line(settings, bridge, platform='darwin', home=home),
+                         f'next: python3 {bridge} --settings {settings.path} probe; '
+                         'launchctl bootout gui/$(id -u)/my-bridge 2>/dev/null; '
+                         f'launchctl bootstrap gui/$(id -u) {plist}; '
+                         f'python3 {bridge} --settings {settings.path} set-commands '
+                         '(README.md, "Adopt in a city", step 6)')
 
     def test_an_unsafe_bridge_path_or_placeholder_refuses(self):
         settings = b.load_settings(write_settings(self.root))
@@ -716,7 +779,7 @@ class InstallScriptTests(unittest.TestCase):
 
     def install(self, *args):
         env = {k: v for k, v in os.environ.items() if not k.startswith('GC_') and k != b.SETTINGS_ENV}
-        env.update(HOME=str(self.home), XDG_CONFIG_HOME=str(self.home / '.config'))
+        env.update(HOME=str(self.home), XDG_CONFIG_HOME=str(self.home / '.config'), TELEGRAM_PACK_PLATFORM='linux')
         return subprocess.run(['sh', str(PACK / 'install.sh'), '--settings', str(self.path), *args],
                               env=env, capture_output=True, text=True, timeout=60)
 

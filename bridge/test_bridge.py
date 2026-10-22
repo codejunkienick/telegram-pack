@@ -1897,13 +1897,100 @@ class UnitDownMessageTests(unittest.TestCase):
 
     def test_names_the_restart_command_when_the_unit_is_down(self):
         with self.assertRaises(b.TransportError) as ctx:
-            b._relay_outbound(self.Rejecting(), {}, unit_state=lambda unit: 'failed' if unit == 'test-city-telegram.service' else None)
+            b._relay_outbound(self.Rejecting(), {}, unit_state=lambda unit: 'failed' if unit == 'test-city-telegram.service' else None,
+                              platform='linux')
         self.assertEqual(str(ctx.exception), 'bridge service not running (failed); run: systemctl --user restart test-city-telegram.service')
 
     def test_keeps_the_original_error_when_the_unit_is_active_or_unknown(self):
         for state in ('active', None):
             with self.assertRaisesRegex(b.TransportError, 'GC request rejected or unconfirmed'):
-                b._relay_outbound(self.Rejecting(), {}, unit_state=lambda unit: state)
+                b._relay_outbound(self.Rejecting(), {}, unit_state=lambda unit: state, platform='linux')
+
+    def test_darwin_hint_bootstraps_a_not_loaded_agent(self):
+        home = Path('/home/testuser')
+        with self.assertRaises(b.TransportError) as ctx:
+            b._relay_outbound(self.Rejecting(), {}, unit_state=lambda unit: 'not loaded',
+                              platform='darwin', home=home)
+        self.assertEqual(str(ctx.exception),
+                         f'bridge service not running (not loaded); run: launchctl bootstrap gui/{os.getuid()} '
+                         f'{home}/Library/LaunchAgents/test-city-telegram.plist')
+
+    def test_darwin_hint_kickstarts_a_loaded_agent(self):
+        with self.assertRaises(b.TransportError) as ctx:
+            b._relay_outbound(self.Rejecting(), {}, unit_state=lambda unit: 'spawn scheduled',
+                              platform='darwin', home=Path('/home/testuser'))
+        self.assertEqual(str(ctx.exception),
+                         f'bridge service not running (spawn scheduled); run: launchctl kickstart -k '
+                         f'gui/{os.getuid()}/test-city-telegram')
+
+    def test_bridge_unit_state_on_darwin(self):
+        unit = 'test-city-telegram.service'
+        cases = [((0, '\tstate = running\n'), 'active'), ((0, 'state = spawn scheduled'), 'spawn scheduled'),
+                 ((113, ''), 'not loaded'), ((0, 'no state line\n'), None)]
+        for (code, stdout), expected in cases:
+            with self.subTest(stdout=stdout):
+                seen = []
+                def fake_run(argv, **kwargs):
+                    seen.append((argv, kwargs))
+                    return subprocess.CompletedProcess(argv, code, stdout, '')
+                self.assertEqual(b.bridge_unit_state(unit, platform='darwin', run=fake_run), expected)
+                self.assertEqual(seen, [(['launchctl', 'print', f'gui/{os.getuid()}/test-city-telegram'],
+                                          dict(capture_output=True, text=True, timeout=10))])
+
+    def test_bridge_unit_state_on_darwin_when_launchctl_cannot_run(self):
+        def fake_run(argv, **kwargs):
+            raise OSError('no launchctl')
+        self.assertIsNone(b.bridge_unit_state('test-city-telegram.service', platform='darwin', run=fake_run))
+
+    def test_bridge_unit_state_on_linux_uses_systemctl(self):
+        seen = []
+        def fake_run(argv, **kwargs):
+            seen.append((argv, kwargs))
+            return subprocess.CompletedProcess(argv, 0, 'active\n', '')
+        self.assertEqual(b.bridge_unit_state('test-city-telegram.service', platform='linux', run=fake_run), 'active')
+        self.assertEqual(seen, [(['systemctl', '--user', 'is-active', 'test-city-telegram.service'],
+                                  dict(capture_output=True, text=True, timeout=10))])
+
+
+class ConflictExitStatusTests(BridgeTestCase):
+    def test_poll_conflict_from_a_409_answer(self):
+        def transport(url, body, *args, **kwargs):
+            if url.endswith('/getUpdates'):
+                return 409, dict(ok=False, error_code=409, description='Conflict')
+            if url.endswith('/extmsg/adapters'):
+                return 200, {}
+            return self.transport(url, body, *args, **kwargs)
+        self.bridge.request = transport
+        self.bridge.port = 0
+        with patch.object(self.bridge, 'probe_with_retry', return_value=True), \
+             patch('sys.stdout', new_callable=io.StringIO), patch('sys.stderr', new_callable=io.StringIO):
+            with self.assertRaises(b.PollConflict):
+                self.bridge.run()
+
+    def test_run_conflict_exit_status(self):
+        with tempfile.TemporaryDirectory() as root:
+            settings = write_settings(Path(root))
+            for argv, expected in ((['run', '--conflict-exit-status', '0'], 0), (['run'], 2)):
+                with self.subTest(argv=argv):
+                    with patch.object(b.Bridge, 'run', side_effect=b.PollConflict('another Telegram poller or webhook owns this bot; stop it before restarting')), \
+                         patch.object(b.signal, 'signal', lambda *a, **k: None), \
+                         patch('sys.stderr', new_callable=io.StringIO) as err:
+                        with self.assertRaises(SystemExit) as ctx:
+                            run_main(self, 'bridge.py', '--settings', str(settings), *argv)
+                    self.assertEqual(ctx.exception.code, expected)
+                    self.assertIn('another Telegram poller or webhook owns this bot', err.getvalue())
+
+    def test_conflict_exit_status_is_a_run_only_flag_of_0_to_255(self):
+        parser = b._build_parser()
+        self.assertEqual(parser.parse_args(['run', '--conflict-exit-status', '0']).conflict_exit_status, 0)
+        self.assertIn('--conflict-exit-status', parser.format_help())
+        with patch('sys.stderr', new_callable=io.StringIO):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(['run', '--conflict-exit-status', '256'])
+            args = parser.parse_args(['send', '--body-file', 'x', '--idempotency-key', 'k',
+                                      '--conflict-exit-status', '0'])
+            with self.assertRaises(SystemExit):
+                b._validate_attachment_flags(parser, args)
 
 
 

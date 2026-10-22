@@ -58,7 +58,7 @@ city.
 | `token_file`, `callback_secret_file` | yes | owner-only credential files (`install.sh` creates a missing callback secret: the unit cannot write outside its state and lock directories) |
 | `[bot]` `bot_id`, `user_id`, `chat_id`, `account_id` | yes | positive numeric ids (`chat_id` equals `user_id`: a private chat), the bot username as the adapter account |
 | `lock_dir` | no | where the per-bot lock lives; default the token file's directory |
-| `unit` | no | systemd unit name; default `<city>-telegram.service` |
+| `unit` | no | service name: the systemd unit name on Linux and WSL, and on macOS the source of the launchd label (this name without its `.service` suffix); default `<city>-telegram.service` |
 | `python` | no | interpreter for the unit and the transcriber; default `/usr/bin/python3` |
 | `user_display_name` | no | the actor name on relayed messages; default `User` |
 | `timezone` | no | times in notices and the time zone passed to handlers (`TZ`); default `UTC` |
@@ -89,11 +89,15 @@ requests.
 (python, curl, owner-only credentials, and with transcription on: ffmpeg,
 whisper-cli, the models and their SHA-256), creates the callback secret and
 the transcription queue when they are missing, links
-`~/.local/bin/voice-transcribe`, and renders the city's unit into
-`~/.config/systemd/user/<unit>`. It is idempotent, never starts or stops a unit
-and never contacts Telegram; `--dry-run` only reports. Then, in the user's
-shell (an agent asks the user, or runs it only where it may manage the
-user's units):
+`~/.local/bin/voice-transcribe`, and on Linux and WSL renders the systemd
+unit into `~/.config/systemd/user/<unit>`. On macOS it does not place the
+LaunchAgent; render it with
+`python3 <pack>/bridge/bridge.py --settings <settings> render-unit > ~/Library/LaunchAgents/<label>.plist`,
+where `<label>` is the `unit` name without its `.service` suffix. It is
+idempotent, never starts or stops a service and never contacts Telegram;
+`--dry-run` only reports.
+Then, in the user's shell (an agent asks the user, or runs it only where
+it may manage the user's services), on Linux and WSL:
 
 ```sh
 python3 <pack>/bridge/bridge.py --settings <settings> probe
@@ -103,13 +107,25 @@ systemctl --user status <unit>
 python3 <pack>/bridge/bridge.py --settings <settings> set-commands
 ```
 
+On macOS:
+
+```sh
+python3 <pack>/bridge/bridge.py --settings <settings> probe
+launchctl bootout gui/$(id -u)/<label> 2>/dev/null
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<label>.plist
+launchctl print gui/$(id -u)/<label>
+python3 <pack>/bridge/bridge.py --settings <settings> set-commands
+```
+
 `probe` prints `Telegram identity and webhook checks passed` and
 `set-commands` prints `commands set: <count> (/<command> ...) for chat
 <chat_id>` (`commands set: 0 () for chat <chat_id>` when the menu is empty).
 
-`bridge.py --settings <settings> render-unit` prints the unit and
-`check-install` runs the checks alone (`--gpu-probe` adds the GPU probe,
-below; without it no transcription runs). The unit runs
+`bridge.py --settings <settings> render-unit` prints the service for
+this host: the systemd unit text on Linux and WSL, the launchd
+LaunchAgent plist on macOS, and `check-install` runs the checks alone
+(`--gpu-probe` adds the GPU probe, below; without it no transcription
+runs). On Linux and WSL the unit runs
 `<python> <pack>/bridge/bridge.py --settings <settings> run` with the state
 directory and the lock directory as its only writable paths, plus the
 transcription queue with transcription on and every `handler_write_paths`
@@ -118,17 +134,33 @@ read-only inside the unit (`ReadOnlyPaths`), even inside the lock
 directory, and the unit sets RestrictSUIDSGID, LockPersonality,
 RestrictRealtime, RestrictNamespaces, SystemCallArchitectures=native and
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK, all of which
-the GPU probe carries too.
+the GPU probe carries too. On macOS the plist runs
+`<python> <pack>/bridge/bridge.py --settings <settings> run --conflict-exit-status 0`
+with the state directory as its working directory, loads at login
+(`RunAtLoad`), and writes its output to
+`~/Library/Logs/<label>.log`.
 
 The adapter binds only `127.0.0.1:<port>`, registers its GC callback, and
 refreshes the in-memory registration every ~30 seconds. At startup the
 Telegram probe is retried with backoff for up to 10 minutes, so a short network
 outage does not exit the process; an identity mismatch or an existing webhook
-still exits at once. Other failures exit and systemd restarts the unit every
-15 s without a start limit, so an outage can never leave it permanently
-failed. When the unit is down, `reply-current` says so and names the restart
-command. A bot polling conflict exits with status 2 and disables automatic
+still exits at once. Other failures exit and the service restarts it
+every 15 s without a start limit (systemd on Linux and WSL; on macOS
+launchd restarts the agent after an unsuccessful exit, throttled to
+15 s), so an outage can never leave it permanently failed. When the
+service is down, `reply-current` says so and names the restart command:
+`systemctl --user restart <unit>` on Linux and WSL; on macOS
+`launchctl bootstrap gui/<uid> ~/Library/LaunchAgents/<label>.plist`
+when the agent is not loaded, otherwise
+`launchctl kickstart -k gui/<uid>/<label>`. The service state comes from
+`systemctl --user is-active` on Linux and WSL and from
+`launchctl print gui/<uid>/<label>` on macOS (`state = running` is
+reported as active, a missing agent as not loaded). A bot polling
+conflict on Linux and WSL exits with status 2 and disables automatic
 restart; stop the other poller/webhook, then start the unit explicitly.
+On macOS the agent passes `--conflict-exit-status 0`, so a polling
+conflict exits successfully and launchd does not restart it; stop the
+other poller/webhook, then start the agent explicitly.
 
 After each successful `getUpdates` the bridge records
 `<state_dir>/telegram-bridge-heartbeat.json`
