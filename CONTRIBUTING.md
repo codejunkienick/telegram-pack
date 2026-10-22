@@ -13,7 +13,7 @@ sh scripts/test.sh
 The suite is offline and fake-only: it fakes Telegram, GC and whisper-cli,
 uses temporary directories, and reaches no network. It needs no real
 settings file and starts no unit. It needs Python 3.11 or later, and curl for the tests that run the real curl against a loopback server (they skip without it). Extra arguments go to unittest, for
-example `sh scripts/test.sh -v`.
+example `sh scripts/test.sh -v`. CI runs the same suite on Ubuntu and macOS with Python 3.11 and 3.13, and Windows is covered only through the Linux job because hosted Windows runners cannot run WSL 2.
 
 ## Settings compatibility
 
