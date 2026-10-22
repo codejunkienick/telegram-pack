@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -30,7 +31,7 @@ try:
     _ionice = __import__('subprocess').run(['ionice', '-p', str(os.getpid())], capture_output=True, text=True).stdout.strip()
 except Exception:
     _ionice = ''
-fence = dict(cpus=sorted(os.sched_getaffinity(0)), nice=os.getpriority(os.PRIO_PROCESS, 0),
+fence = dict(cpus=sorted(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else None, nice=os.getpriority(os.PRIO_PROCESS, 0),
              ionice=_ionice)
 with open(os.environ['FAKE_WHISPER_LOG'] + '.fence', 'w') as stream:
     json.dump(fence, stream)
@@ -149,6 +150,7 @@ class TranscriberTests(FakeWhisperCase):
         self.assertEqual(argv[argv.index('-vm') + 1], str(self.models / 'ggml-silero-v6.2.0.bin'))
         self.assertNotIn('-mc', argv)
 
+    @unittest.skipUnless(hasattr(os, 'sched_setaffinity'), 'CPU affinity requires sched_setaffinity')
     def test_whisper_runs_fenced_on_its_cpus_at_the_agents_priority(self):
         mine = sorted(os.sched_getaffinity(0))
         cpus = mine[-2:] if len(mine) > 1 else mine
@@ -157,7 +159,8 @@ class TranscriberTests(FakeWhisperCase):
         fence = json.loads(Path(str(self.log) + '.fence').read_text())
         self.assertEqual(fence['cpus'], cpus)
         self.assertEqual(fence['nice'], max(10, os.getpriority(os.PRIO_PROCESS, 0)))
-        self.assertEqual(fence['ionice'], 'best-effort: prio 7')
+        if shutil.which('ionice'):
+            self.assertEqual(fence['ionice'], 'best-effort: prio 7')
 
     def test_unset_threads_defaults_to_four(self):
         self.assertEqual(vt.Options(environ={}).threads, 4)
@@ -199,6 +202,7 @@ class TranscriberTests(FakeWhisperCase):
             vt._run_whisper(['whisper-cli'], run, time.monotonic() + 10)
         self.assertEqual(caught.exception.code, 'whisper_failed')
 
+    @unittest.skipUnless(hasattr(os, 'sched_setaffinity'), 'CPU affinity requires sched_setaffinity')
     def test_a_fence_that_cannot_be_set_stops_the_transcription(self):
         for cpus in ('99999', '3-1', 'all'):
             with self.subTest(cpus=cpus):
@@ -673,6 +677,64 @@ class LoopAndScriptTests(unittest.TestCase):
         self.assertEqual(vt.longest_repeat('very very very good'), 1)  # one word is speech, not a loop
         self.assertEqual(vt.longest_repeat('ship the pack, ship the pack, then test'), 2)
         self.assertEqual(vt.longest_repeat(''), 1)
+
+
+class HostPlatformTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def release(self, text):
+        path = self.root / 'osrelease'
+        path.write_text(text)
+        return str(path)
+
+    def test_darwin_from_system(self):
+        self.assertEqual(
+            vt.host_platform(environ={}, system='darwin',
+                             osrelease=self.release('5.15.153.1-microsoft-standard-WSL2\n')),
+            'darwin')
+
+    def test_wsl_from_osrelease(self):
+        for text in ('5.15.153.1-microsoft-standard-WSL2\n', '4.4.0-19041-Microsoft\n'):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    vt.host_platform(environ={}, system='linux', osrelease=self.release(text)),
+                    'wsl')
+
+    def test_linux_from_osrelease_and_from_a_missing_file(self):
+        self.assertEqual(
+            vt.host_platform(environ={}, system='linux',
+                             osrelease=self.release('6.17.1-arch1-1\n')),
+            'linux')
+        self.assertEqual(
+            vt.host_platform(environ={}, system='linux',
+                             osrelease=str(self.root / 'missing-osrelease')),
+            'linux')
+
+    def test_linux_from_a_non_utf8_osrelease(self):
+        path = self.root / 'osrelease'
+        path.write_bytes(b'\xff\xfe microsoft \x80\n')
+        self.assertEqual(
+            vt.host_platform(environ={}, system='linux', osrelease=str(path)),
+            'linux')
+
+    def test_the_environment_value_wins_for_each_platform(self):
+        self.assertEqual(vt.PLATFORMS, ('linux', 'wsl', 'darwin'))
+        self.assertEqual(vt.PLATFORM_ENV, 'TELEGRAM_PACK_PLATFORM')
+        microsoft = self.release('5.15.153.1-microsoft-standard-WSL2\n')
+        for platform in vt.PLATFORMS:
+            with self.subTest(platform=platform):
+                system = 'linux' if platform == 'darwin' else 'darwin'
+                self.assertEqual(
+                    vt.host_platform(environ={'TELEGRAM_PACK_PLATFORM': platform}, system=system,
+                                     osrelease=microsoft),
+                    platform)
+
+    def test_an_unknown_environment_value_is_ignored(self):
+        self.assertEqual(
+            vt.host_platform(environ={'TELEGRAM_PACK_PLATFORM': 'windows'}, system='linux',
+                             osrelease=self.release('6.17.1-arch1-1\n')),
+            'linux')
 
 
 if __name__ == '__main__':

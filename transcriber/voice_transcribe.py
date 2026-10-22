@@ -76,6 +76,25 @@ GPU_CHECK_MAX_BYTES = 4 * 1024
 GPU_CHECK_REASON_RE = re.compile(r'[a-z0-9-]{1,32}')
 GPU_CHECK_RESERVED_REASONS = frozenset({'gpu-failed', 'gpu-off', 'check-error'})
 GPU_CHECK_PATH = '/usr/local/bin:/usr/bin:/bin'
+PLATFORMS = ('linux', 'wsl', 'darwin')
+PLATFORM_ENV = 'TELEGRAM_PACK_PLATFORM'
+
+
+def host_platform(environ=None, system=None, osrelease='/proc/sys/kernel/osrelease'):
+    """One of PLATFORMS for this host. TELEGRAM_PACK_PLATFORM is for tests
+    only, like TELEGRAM_PACK_MODELS_SHA256: a value in PLATFORMS wins and
+    any other value is ignored."""
+    env = os.environ if environ is None else environ
+    pinned = env.get(PLATFORM_ENV)
+    if pinned in PLATFORMS:
+        return pinned
+    if (sys.platform if system is None else system) == 'darwin':
+        return 'darwin'
+    try:
+        release = Path(osrelease).read_text()
+    except (OSError, UnicodeDecodeError):
+        return 'linux'
+    return 'wsl' if 'microsoft' in release.lower() else 'linux'
 
 
 class TranscribeError(Exception):

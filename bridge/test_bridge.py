@@ -882,6 +882,8 @@ class BridgeTests(BridgeTestCase):
                 self.assertIsInstance(errors[0], b.TransportError)
                 self.assertEqual(str(errors[0]), 'credential must be an owner-only regular file')
         fd_dir = Path('/proc/self/fd')
+        if not fd_dir.is_dir():
+            fd_dir = Path('/dev/fd')
         if fd_dir.is_dir():
             before = len(list(fd_dir.iterdir()))
             for _ in range(10):

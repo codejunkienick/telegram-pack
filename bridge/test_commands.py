@@ -734,11 +734,19 @@ time.sleep(60)
 
     @staticmethod
     def alive(pid):
+        if Path('/proc').is_dir():
+            try:
+                state = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[0]
+            except (OSError, IndexError):
+                return False
+            return state not in ('Z', 'X')
         try:
-            state = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[0]
-        except (OSError, IndexError):
+            done = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)],
+                                  capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
             return False
-        return state not in ('Z', 'X')
+        state = done.stdout.strip()
+        return bool(state) and not state.startswith('Z')
 
     def test_a_handler_that_never_reads_its_input_still_works(self):
         self.set_handler(answer(dict(type='send', text='ok')))
