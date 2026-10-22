@@ -171,22 +171,26 @@ def parse_cpus(text):
     return cpus
 
 
-def fence(options, run=subprocess.run):
+def fence(options, run=subprocess.run, platform=None, setaffinity=getattr(os, 'sched_setaffinity', None)):
     """Confine this process, and so ffmpeg and whisper-cli, to its CPUs at
     nice 10 and best-effort I/O level 7. An explicitly configured CPU list
     that cannot be applied is an error; nice and ionice are best-effort
     only and never fail the transcription. A caller already nicer than 10
-    keeps its niceness."""
-    try:
-        if options.cpus:
-            os.sched_setaffinity(0, parse_cpus(options.cpus))
-    except (OSError, ValueError) as error:
-        raise TranscribeError('fence_failed', f'CPU affinity {options.cpus}: {error}') from None
+    keeps its niceness. On darwin there is no ionice to run."""
+    if options.cpus:
+        if setaffinity is None:
+            raise TranscribeError('fence_failed', 'CPU affinity is not available on this platform')
+        try:
+            setaffinity(0, parse_cpus(options.cpus))
+        except (OSError, ValueError) as error:
+            raise TranscribeError('fence_failed', f'CPU affinity {options.cpus}: {error}') from None
     try:
         if os.getpriority(os.PRIO_PROCESS, 0) < NICE:
             os.setpriority(os.PRIO_PROCESS, 0, NICE)
     except OSError:
         pass
+    if (host_platform() if platform is None else platform) == 'darwin':
+        return
     try:
         run(['ionice', *IONICE, '-p', str(os.getpid())], stdin=subprocess.DEVNULL,
             capture_output=True, text=True, timeout=10)
@@ -214,7 +218,7 @@ def _kill_check_group(proc):
         pass
 
 
-def run_gpu_check(options, popen=subprocess.Popen):
+def run_gpu_check(options, popen=subprocess.Popen, platform=None):
     """Run the method-auto GPU check once and return (device, reason).
 
     argv is the check alone, no shell, empty stdin, its own directory as the
@@ -224,7 +228,9 @@ def run_gpu_check(options, popen=subprocess.Popen):
     object with a reason that is not one of this module's own means the CPU
     with check-error. Nothing the check prints is returned beyond that."""
     check = str(Path(getattr(options, 'gpu_check', '') or '').expanduser())
-    env = {'PATH': GPU_CHECK_PATH, 'HOME': os.environ.get('HOME') or str(Path.home()),
+    resolved = host_platform() if platform is None else platform
+    path = GPU_CHECK_PATH + ':/usr/lib/wsl/lib' if resolved == 'wsl' else GPU_CHECK_PATH
+    env = {'PATH': path, 'HOME': os.environ.get('HOME') or str(Path.home()),
            'LANG': os.environ.get('LANG') or 'C.UTF-8',
            'GPU_MIN_FREE_MB': str(getattr(options, 'gpu_min_free_mb', GPU_MIN_FREE_MB))}
     try:

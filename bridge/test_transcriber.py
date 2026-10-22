@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import shutil
 import subprocess
@@ -21,6 +22,9 @@ TRANSCRIBER = PACK / 'transcriber'
 spec = importlib.util.spec_from_file_location('voice_transcribe', TRANSCRIBER / 'voice_transcribe.py')
 vt = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(vt)
+gpu_spec = importlib.util.spec_from_file_location('gpu_check', TRANSCRIBER / 'gpu_check.py')
+gpu_check = importlib.util.module_from_spec(gpu_spec)
+gpu_spec.loader.exec_module(gpu_check)
 
 # A fake whisper-cli: records its argv as one JSON line, then prints the next
 # queued answer (one per call; the last repeats), or exits 1 on "FAIL".
@@ -62,6 +66,33 @@ for last; do :; done
 case "$*" in *bad.ogg*) echo 'decode error' >&2; exit 1 ;; esac
 printf 'RIFF' >"$last"
 """
+
+
+def _recording_popen(captured, payload=b'{"gpu": false}\n', returncode=0):
+    """A fake Popen factory: records (argv, kwargs) and returns a process
+    whose stdout is a pipe already holding payload and which exits with
+    returncode."""
+    def popen(argv, **kwargs):
+        captured.append((argv, kwargs))
+        read_fd, write_fd = os.pipe()
+        if payload:
+            os.write(write_fd, payload)
+        os.close(write_fd)
+        stdout = os.fdopen(read_fd, 'rb')
+
+        class _Proc:
+            def __init__(self):
+                self.stdout, self.returncode, self.pid = stdout, None, 999999
+
+            def wait(self, timeout=None):
+                self.returncode = returncode
+                return returncode
+
+        return _Proc()
+
+    return popen
+
+
 # A fake nvidia-smi: counts its calls, prints FAKE_NVIDIA_SMI and exits with
 # FAKE_NVIDIA_SMI_EXIT.
 FAKE_NVIDIA_SMI = """#!/bin/sh
@@ -155,7 +186,7 @@ class TranscriberTests(FakeWhisperCase):
         mine = sorted(os.sched_getaffinity(0))
         cpus = mine[-2:] if len(mine) > 1 else mine
         self.env['VOICE_TRANSCRIBE_CPUS'] = ','.join(str(c) for c in cpus)
-        self.result('Fine.')
+        self.result('Fine.', extra_env={'TELEGRAM_PACK_PLATFORM': 'linux'})
         fence = json.loads(Path(str(self.log) + '.fence').read_text())
         self.assertEqual(fence['cpus'], cpus)
         self.assertEqual(fence['nice'], max(10, os.getpriority(os.PRIO_PROCESS, 0)))
@@ -180,19 +211,82 @@ class TranscriberTests(FakeWhisperCase):
     def test_transcription_succeeds_when_ionice_is_absent(self):
         bin_only = self.env['PATH'].split(os.pathsep)[0]
         self.assertFalse((Path(bin_only) / 'ionice').exists())
-        self.assertEqual(self.result('Fine.', extra_env={'PATH': bin_only}), {'text': 'Fine.'})
+        self.assertEqual(self.result('Fine.', extra_env={'PATH': bin_only, 'TELEGRAM_PACK_PLATFORM': 'linux'}),
+                         {'text': 'Fine.'})
 
     def test_nice_and_ionice_failures_never_fail_the_fence(self):
         options = vt.Options(environ={})
         def missing(*args, **kwargs):
             raise FileNotFoundError('ionice')
-        vt.fence(options, run=missing)
+        vt.fence(options, run=missing, platform='linux')
         def refused(*args, **kwargs):
             return subprocess.CompletedProcess(args, 1)
-        vt.fence(options, run=refused)
+        vt.fence(options, run=refused, platform='linux')
         with patch('os.getpriority', return_value=0), \
                 patch('os.setpriority', side_effect=PermissionError('nice')):
-            vt.fence(options, run=refused)
+            vt.fence(options, run=refused, platform='linux')
+
+    def test_fence_on_darwin_with_cpus_and_no_affinity_fails_and_runs_nothing(self):
+        calls = []
+
+        def run(*args, **kwargs):
+            calls.append((args, kwargs))
+            return subprocess.CompletedProcess(args, 0)
+
+        options = vt.Options(environ={'VOICE_TRANSCRIBE_CPUS': '0-1'})
+        with self.assertRaises(vt.TranscribeError) as caught:
+            vt.fence(options, run=run, platform='darwin', setaffinity=None)
+        self.assertEqual(caught.exception.code, 'fence_failed')
+        self.assertEqual(str(caught.exception), 'CPU affinity is not available on this platform')
+        self.assertEqual(calls, [])
+
+    def test_fence_on_darwin_without_cpus_runs_no_ionice_and_still_sets_nice(self):
+        calls = []
+
+        def run(*args, **kwargs):
+            calls.append((args, kwargs))
+            return subprocess.CompletedProcess(args, 0)
+
+        options = vt.Options(environ={})
+        with patch('os.getpriority', return_value=0), \
+                patch('os.setpriority') as setpriority:
+            vt.fence(options, run=run, platform='darwin')
+        self.assertEqual(calls, [])
+        setpriority.assert_called_once_with(os.PRIO_PROCESS, 0, 10)
+
+    def test_fence_on_linux_calls_ionice_exactly_as_before(self):
+        calls = []
+
+        def run(*args, **kwargs):
+            calls.append((args, kwargs))
+            return subprocess.CompletedProcess(args, 0)
+
+        options = vt.Options(environ={})
+        with patch('os.getpriority', return_value=10):
+            vt.fence(options, run=run, platform='linux')
+        self.assertEqual(len(calls), 1)
+        (argv,), kwargs = calls[0][0], calls[0][1]
+        self.assertEqual(argv, ['ionice', '-c', '2', '-n', '7', '-p', str(os.getpid())])
+        self.assertEqual(kwargs.get('timeout'), 10)
+
+    def test_run_gpu_check_on_wsl_appends_the_wsl_lib_path(self):
+        captured = []
+        options = vt.Options(environ={}, gpu_check=str(self.root / 'check.py'))
+        self.assertEqual(
+            vt.run_gpu_check(options, popen=_recording_popen(captured), platform='wsl'),
+            ('cpu', 'busy'))
+        self.assertEqual(captured[0][1]['env']['PATH'], vt.GPU_CHECK_PATH + ':/usr/lib/wsl/lib')
+        self.assertTrue(captured[0][1]['env']['PATH'].endswith(':/usr/lib/wsl/lib'))
+
+    def test_run_gpu_check_on_linux_and_darwin_keeps_the_check_path(self):
+        for plat in ('linux', 'darwin'):
+            with self.subTest(platform=plat):
+                captured = []
+                options = vt.Options(environ={}, gpu_check=str(self.root / 'check.py'))
+                self.assertEqual(
+                    vt.run_gpu_check(options, popen=_recording_popen(captured), platform=plat),
+                    ('cpu', 'busy'))
+                self.assertEqual(captured[0][1]['env']['PATH'], vt.GPU_CHECK_PATH)
 
     def test_unknown_language_is_matched_case_insensitively(self):
         def run(argv, **kwargs):
@@ -207,7 +301,8 @@ class TranscriberTests(FakeWhisperCase):
         for cpus in ('99999', '3-1', 'all'):
             with self.subTest(cpus=cpus):
                 self.env['VOICE_TRANSCRIBE_CPUS'] = cpus
-                self.assertEqual(self.result('unused'), {'error': 'fence_failed'})
+                self.assertEqual(self.result('unused', extra_env={'TELEGRAM_PACK_PLATFORM': 'linux'}),
+                                 {'error': 'fence_failed'})
         self.assertEqual(self.whisper_calls(), [])
 
     def test_the_model_argument_picks_the_model_file(self):
@@ -400,6 +495,9 @@ class GpuCheckMethodTests(FakeWhisperCase):
             self.assertEqual(vt.choose_device(options), ('cpu', 'check-error'))
         self.assertLess(time.monotonic() - started, 10)
 
+    @unittest.skipIf(sys.platform == 'darwin' and platform.machine() == 'arm64',
+                     'Apple Silicon answers for Metal without nvidia-smi; '
+                     'the default-check unknown case is Linux/Intel only')
     def test_method_auto_with_the_default_check_and_no_nvidia_smi_tries_the_gpu(self):
         # The default check (transcriber/gpu_check.py) run through
         # run_gpu_check's fixed environment, with GPU_CHECK_PATH narrowed to
@@ -478,6 +576,106 @@ class _patched_timeout:
         return False
 
 
+class GpuCheckAnswerTests(unittest.TestCase):
+    """gpu_check.answer() in process: Apple Silicon, Intel Macs and Linux."""
+
+    def test_apple_silicon_answers_gpu_without_running_anything(self):
+        calls = []
+
+        def which(name):
+            calls.append(('which', name))
+            return '/bin/nvidia-smi'
+
+        def popen(*args, **kwargs):
+            calls.append(('popen', args, kwargs))
+            raise AssertionError('popen must not run on Apple Silicon')
+
+        self.assertEqual(
+            gpu_check.answer(environ={}, which=which, popen=popen, system='darwin', machine='arm64'),
+            {'gpu': True})
+        self.assertEqual(calls, [])
+
+    def test_intel_mac_without_nvidia_smi_answers_unknown(self):
+        calls = []
+
+        def popen(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError('popen must not run without nvidia-smi')
+
+        self.assertEqual(
+            gpu_check.answer(environ={}, which=lambda name: None, popen=popen,
+                             system='darwin', machine='x86_64'),
+            {'gpu': True, 'reason': 'unknown'})
+        self.assertEqual(calls, [])
+
+    def test_nvidia_smi_on_linux_answers_from_free_memory(self):
+        captured = []
+        self.assertEqual(
+            gpu_check.answer(environ={'GPU_MIN_FREE_MB': '2048'}, which=lambda name: '/bin/nvidia-smi',
+                             popen=_recording_popen(captured, b'926, 16311\n'),
+                             system='linux', machine='x86_64'),
+            {'gpu': True})
+        self.assertEqual(captured[0][0], gpu_check.NVIDIA_SMI)
+
+    def test_nvidia_smi_on_linux_with_too_little_free_memory_means_vram_low(self):
+        for environ, payload in (({'GPU_MIN_FREE_MB': '2048'}, b'15000, 16311\n'),
+                                 ({'GPU_MIN_FREE_MB': '20000'}, b'926, 16311\n')):
+            with self.subTest(environ=environ, payload=payload):
+                self.assertEqual(
+                    gpu_check.answer(environ=environ, which=lambda name: '/bin/nvidia-smi',
+                                     popen=_recording_popen([], payload),
+                                     system='linux', machine='x86_64'),
+                    {'gpu': False, 'reason': 'vram-low'})
+
+    def test_a_missing_nvidia_smi_on_linux_means_try_the_gpu(self):
+        def popen(*args, **kwargs):
+            raise AssertionError('popen must not run without nvidia-smi')
+
+        self.assertEqual(
+            gpu_check.answer(environ={}, which=lambda name: None, popen=popen,
+                             system='linux', machine='x86_64'),
+            {'gpu': True, 'reason': 'unknown'})
+
+    def test_a_malformed_or_failing_nvidia_smi_on_linux_means_try_the_gpu(self):
+        for payload, returncode in ((b'N/A, 16311\n', 0), (b'', 0),
+                                    (b'926, 16311\n926, 16311\n', 0),
+                                    (b'926, 16311\n', 9)):
+            with self.subTest(payload=payload, returncode=returncode):
+                self.assertEqual(
+                    gpu_check.answer(environ={}, which=lambda name: '/bin/nvidia-smi',
+                                     popen=_recording_popen([], payload, returncode),
+                                     system='linux', machine='x86_64'),
+                    {'gpu': True, 'reason': 'unknown'})
+
+    def test_a_flooding_nvidia_smi_on_linux_is_capped_and_its_group_is_killed(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        marker = root / 'descendant-ran'
+        fake = root / 'fake-nvidia-smi'
+        fake.write_text(
+            f'#!{sys.executable}\nimport subprocess, sys, time\n'
+            f'subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.6); '
+            f'open({str(marker)!r}, \'w\').write(\'x\')"])\n'
+            'while True:\n'
+            '    sys.stdout.write("x" * 8192)\n'
+            '    sys.stdout.flush()\n')
+        fake.chmod(0o755)
+
+        def popen(argv, **kwargs):
+            return subprocess.Popen([sys.executable, str(fake)], **kwargs)
+
+        started = time.monotonic()
+        self.assertEqual(
+            gpu_check.answer(environ={}, which=lambda name: '/bin/nvidia-smi',
+                             popen=popen, system='linux', machine='x86_64'),
+            {'gpu': True, 'reason': 'unknown'})
+        self.assertLess(time.monotonic() - started, 4)
+        time.sleep(1)
+        self.assertFalse(marker.exists())
+
+
+@unittest.skipIf(sys.platform == 'darwin' and platform.machine() == 'arm64',
+                 'Apple Silicon answers for Metal without nvidia-smi; '
+                 'the nvidia-smi script cases pin linux in GpuCheckAnswerTests')
 class GpuCheckScriptTests(unittest.TestCase):
     """transcriber/gpu_check.py against a fake nvidia-smi (or none)."""
 
@@ -538,6 +736,20 @@ class GpuCheckScriptTests(unittest.TestCase):
         self.assertEqual(json.loads(done.stdout), {'gpu': True, 'reason': 'unknown'})
         time.sleep(1)
         self.assertFalse(marker.exists())  # the descendant died with its group
+
+
+@unittest.skipUnless(sys.platform == 'darwin' and platform.machine() == 'arm64',
+                     'Apple Silicon only')
+class GpuCheckAppleSiliconScriptTests(unittest.TestCase):
+    """The script answers for Metal on Apple Silicon without nvidia-smi."""
+
+    def test_the_script_answers_gpu_without_nvidia_smi(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        env = dict(PATH=str(root), HOME=str(root), GPU_MIN_FREE_MB='2048')
+        done = subprocess.run([sys.executable, str(TRANSCRIBER / 'gpu_check.py')],
+                              env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(json.loads(done.stdout), {'gpu': True})
 
 
 class QueueTests(FakeWhisperCase):

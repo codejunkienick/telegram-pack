@@ -6,12 +6,14 @@ GPU_MIN_FREE_MB MiB free (default 2048), {"gpu": false, "reason":
 "vram-low"} when it has less, and {"gpu": true, "reason": "unknown"} when it
 cannot tell, so the GPU is tried and a failing GPU run is retried on the
 CPU. It tells from nvidia-smi only when that is found on PATH, runs nothing
-else and contacts nothing. Standard library only, well inside 15 s.
+else and contacts nothing. On Apple Silicon Macs it answers {"gpu": true}
+for Metal without running anything. Standard library only, well inside 15 s.
 nvidia-smi runs in its own process group with a timeout, a capped output
 and a process-group kill on overrun, like every pack subprocess.
 """
 import json
 import os
+import platform
 import re
 import selectors
 import shutil
@@ -84,8 +86,11 @@ def _nvidia_smi_stdout(popen=subprocess.Popen):
     return bytes(out) if proc.returncode == 0 else None
 
 
-def answer(environ=None, which=shutil.which, popen=subprocess.Popen):
+def answer(environ=None, which=shutil.which, popen=subprocess.Popen, system=None, machine=None):
     """The check's answer object for the current host."""
+    if (sys.platform if system is None else system) == 'darwin' \
+            and (platform.machine() if machine is None else machine) == 'arm64':
+        return {'gpu': True}
     if which('nvidia-smi') is None:
         return {'gpu': True, 'reason': 'unknown'}
     stdout = _nvidia_smi_stdout(popen)
