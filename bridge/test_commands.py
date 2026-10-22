@@ -345,15 +345,19 @@ class CommandUnitTests(SettingsCase):
         path = self.settings(self.entry() + self.entry('report', url='http://127.0.0.1:8090/r'),
                              handler_write_paths=f'["{out}"]')
         settings = b.load_settings(path)
-        lines = dict((line, ok) for ok, line in b.install_problems(settings, which=lambda n: '/usr/bin/' + n))
-        self.assertTrue(lines[f"command /deploy handler {self.handler} (runs in the unit's sandbox)"])
+        suffix = ("runs with your user's full rights: no sandbox on macOS"
+                  if b.voice_transcribe.host_platform() == 'darwin' else "runs in the unit's sandbox")
+        lines = dict((line, ok) for ok, line in b.install_problems(
+            settings, which=lambda n, path=None: '/usr/bin/' + n))
+        self.assertTrue(lines[f"command /deploy handler {self.handler} ({suffix})"])
         self.assertTrue(lines["command /report handler http://127.0.0.1:8090/r (loopback; outside the unit's sandbox)"])
         self.assertFalse(lines[f'handler write path {out}'])
         out.mkdir()
         self.handler.chmod(0o600)
-        lines = dict((line, ok) for ok, line in b.install_problems(settings, which=lambda n: '/usr/bin/' + n))
+        lines = dict((line, ok) for ok, line in b.install_problems(
+            settings, which=lambda n, path=None: '/usr/bin/' + n))
         self.assertTrue(lines[f'handler write path {out}'])
-        self.assertFalse(lines[f"command /deploy handler {self.handler} (runs in the unit's sandbox)"])
+        self.assertFalse(lines[f"command /deploy handler {self.handler} ({suffix})"])
 
 
 class DispatchTests(CommandCase):
@@ -427,7 +431,7 @@ class DispatchTests(CommandCase):
         self.assertEqual(record['env']['TZ'], 'Asia/Tokyo')
         self.assertEqual(record['env']['LANG'], 'C.UTF-8')
         self.assertEqual(record['env']['HOME'], os.environ['HOME'])
-        self.assertEqual(record['cwd'], str(self.handlers))
+        self.assertEqual(record['cwd'], str(self.handlers.resolve()))
         self.assertEqual(record['argv'], [str(self.handler)])
         for secret in ('SECRET', 'CAPABILITY', '/srv/city'):
             self.assertNotIn(secret, json.dumps(record))

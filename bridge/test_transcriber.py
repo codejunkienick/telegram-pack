@@ -446,7 +446,11 @@ class GpuCheckMethodTests(FakeWhisperCase):
         [call] = self.check_calls()
         self.assertEqual(call['argv'], [])
         self.assertEqual(call['cwd'], str(self.check_dir))
-        self.assertEqual(set(call['env']), {'PATH', 'HOME', 'LANG', 'GPU_MIN_FREE_MB'})
+        observed = set(call['env'])
+        if vt.host_platform() == 'darwin':
+            # macOS itself adds this one variable to child processes.
+            observed.discard('__CF_USER_TEXT_ENCODING')
+        self.assertEqual(observed, {'PATH', 'HOME', 'LANG', 'GPU_MIN_FREE_MB'})
         self.assertEqual(call['env']['PATH'], '/usr/local/bin:/usr/bin:/bin')
         self.assertEqual(call['env']['GPU_MIN_FREE_MB'], '2048')
 
