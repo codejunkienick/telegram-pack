@@ -21,8 +21,9 @@ _cleanup_tmp() { if [ -n "$tmpfile" ]; then rm -f "$tmpfile"; fi; }
 trap _cleanup_tmp EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-# v1.8.3-120-g764482c3 (2026-02-09), the build the pack is tested with.
-WHISPER_REF=764482c3175d9c3bc6089c1ec84df7d1b9537d83
+# v1.9.5 (2026-10-06), the build the pack is tested with; it builds with
+# CUDA 13.4, which the earlier pin v1.8.3-120-g764482c3 does not.
+WHISPER_REF=d1be6fde11ac6e0407606b4e42fe72d34add8037
 pack=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd -P)
 bridge="$pack/bridge/bridge.py"
 sums_file=${TELEGRAM_PACK_MODELS_SHA256:-"$pack/transcriber/models.sha256"}

@@ -14,8 +14,8 @@ from test_bridge import write_settings  # noqa: E402
 PACK = Path(__file__).resolve().parents[1]
 SETUP = PACK / "transcriber" / "setup.sh"
 FAKE_BYTES = b"fake-model\n"
-DESCRIBE = "v1.8.3-120-g764482c3"
-PIN = "764482c3175d9c3bc6089c1ec84df7d1b9537d83"
+DESCRIBE = "v1.9.5"
+PIN = "d1be6fde11ac6e0407606b4e42fe72d34add8037"
 USAGE = "usage: transcriber/setup.sh --settings <file> [--dry-run] [--whisper-ref <ref>]"
 CPU_FALLBACK = (
     "ok    whisper-cli built for the CPU "
@@ -30,11 +30,11 @@ if [ "$1" = clone ]; then
   exit 0
 fi
 if [ "$1" = -C ] && [ "$3" = describe ]; then
-  printf '%s\\n' 'v1.8.3-120-g764482c3'
+  printf '%s\\n' 'v1.9.5'
   exit 0
 fi
 if [ "$1" = -C ] && [ "$3" = rev-parse ]; then
-  printf '%s\\n' "${FAKE_GIT_HEAD:-764482c3175d9c3bc6089c1ec84df7d1b9537d83}"
+  printf '%s\\n' "${FAKE_GIT_HEAD:-d1be6fde11ac6e0407606b4e42fe72d34add8037}"
   exit 0
 fi
 if [ "$1" = -C ] && [ "$3" = checkout ] && [ -n "${FAKE_GIT_FAIL_DETACH:-}" ]; then

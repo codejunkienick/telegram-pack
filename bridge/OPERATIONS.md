@@ -541,8 +541,8 @@ The checkout is the directory the `whisper_cli` layout names
 the whisper.cpp repository and moved to the pinned ref with a detached
 checkout; a present checkout is left exactly as it is (never reset or
 pulled) and reported with its describe string. The pinned default is the
-commit `764482c3175d9c3bc6089c1ec84df7d1b9537d83`
-(`v1.8.3-120-g764482c3`); a fresh clone that is not at that commit is
+commit `d1be6fde11ac6e0407606b4e42fe72d34add8037`
+(`v1.9.5`); a fresh clone that is not at that commit is
 removed and fails. `--whisper-ref` takes a tag or a commit instead.
 setup.sh runs curl with `-q`; when `TELEGRAM_PACK_MODELS_SHA256` (tests
 only) is set it prints a `note` line naming that list. `whisper-cli` is
