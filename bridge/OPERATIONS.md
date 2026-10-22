@@ -90,10 +90,10 @@ requests.
 whisper-cli, the models and their SHA-256), creates the callback secret and
 the transcription queue when they are missing, links
 `~/.local/bin/voice-transcribe`, and on Linux and WSL renders the systemd
-unit into `~/.config/systemd/user/<unit>`. On macOS it does not place the
-LaunchAgent; render it with
-`python3 <pack>/bridge/bridge.py --settings <settings> render-unit > ~/Library/LaunchAgents/<label>.plist`,
-where `<label>` is the `unit` name without its `.service` suffix. It is
+unit into `~/.config/systemd/user/<unit>`. On macOS it writes the
+LaunchAgent plist into `~/Library/LaunchAgents/<label>.plist`, where
+`<label>` is the `unit` name without its `.service` suffix, and prints
+the launchctl next line. It is
 idempotent, never starts or stops a service and never contacts Telegram;
 `--dry-run` only reports.
 Then, in the user's shell (an agent asks the user, or runs it only where

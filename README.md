@@ -127,10 +127,10 @@ with this pack at `<pack>`:
    `handler_write_paths`. Success: every check line says `ok`, and
    the last line is
    `next: python3 <pack>/bridge/bridge.py --settings <file> probe; systemctl --user daemon-reload; systemctl --user enable --now <unit>; python3 <pack>/bridge/bridge.py --settings <file> set-commands (README.md, "Adopt in a city", step 6)`.
-   On macOS `install.sh` does not place the LaunchAgent and its last line
-   still names the systemctl commands; render the agent instead with
-   `mkdir -p ~/Library/LaunchAgents && python3 <pack>/bridge/bridge.py --settings <file> render-unit > ~/Library/LaunchAgents/<label>.plist`,
-   where `<label>` is the unit name without its `.service` suffix.
+   On macOS it writes the LaunchAgent plist at
+   `~/Library/LaunchAgents/<label>.plist`, where `<label>` is the unit
+   name without its `.service` suffix, and its last line is
+   `next: python3 <pack>/bridge/bridge.py --settings <file> probe; launchctl bootout gui/$(id -u)/<label> 2>/dev/null; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<label>.plist; python3 <pack>/bridge/bridge.py --settings <file> set-commands (README.md, "Adopt in a city", step 6)`.
 6. (shell) `python3 <pack>/bridge/bridge.py --settings <file> probe`, then
    on Linux and WSL
    `systemctl --user daemon-reload && systemctl --user enable --now <city>-telegram.service`,

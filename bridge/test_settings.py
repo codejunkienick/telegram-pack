@@ -888,9 +888,12 @@ class InstallScriptTests(unittest.TestCase):
         self.secret = self.root / 'secrets' / 'telegram-callback-secret'  # outside state_dir and lock_dir
         self.path = write_settings(self.root, python=f'"{sys.executable}"', callback_secret_file=f'"{self.secret}"')
 
-    def install(self, *args):
+    def install(self, *args, platform='linux', extra_env=None):
         env = {k: v for k, v in os.environ.items() if not k.startswith('GC_') and k != b.SETTINGS_ENV}
-        env.update(HOME=str(self.home), XDG_CONFIG_HOME=str(self.home / '.config'), TELEGRAM_PACK_PLATFORM='linux')
+        env.update(HOME=str(self.home), XDG_CONFIG_HOME=str(self.home / '.config'),
+                   TELEGRAM_PACK_PLATFORM=platform)
+        if extra_env:
+            env.update(extra_env)
         return subprocess.run(['sh', str(PACK / 'install.sh'), '--settings', str(self.path), *args],
                               env=env, capture_output=True, text=True, timeout=60)
 
@@ -928,6 +931,72 @@ class InstallScriptTests(unittest.TestCase):
         self.assertNotIn('created callback secret', again.stdout)
         self.assertIn('is current', again.stdout)
         self.assertEqual(self.secret.read_text(), secret)
+
+    def test_install_on_darwin_writes_the_launchagent_plist(self):
+        if not shutil.which('curl', path=b.LAUNCHD_PATH):
+            self.skipTest('curl not on the launchd PATH')
+        plist = self.home / 'Library/LaunchAgents/test-city-telegram.plist'
+        bridge = PACK / 'bridge' / 'bridge.py'
+        next_line = (f'next: python3 {bridge} --settings {self.path} probe; '
+                     'launchctl bootout gui/$(id -u)/test-city-telegram 2>/dev/null; '
+                     f'launchctl bootstrap gui/$(id -u) {plist}; '
+                     f'python3 {bridge} --settings {self.path} set-commands '
+                     '(README.md, "Adopt in a city", step 6)')
+        dry = self.install('--dry-run', platform='darwin')
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertIn(f'would write {plist}:', dry.stdout)
+        self.assertEqual(dry.stdout.strip().splitlines()[-1], next_line)
+        self.assertFalse(plist.exists())
+        self.assertFalse(self.secret.parent.exists())
+        self.assertEqual(sorted(p.name for p in self.home.iterdir()), [])
+
+        done = self.install(platform='darwin')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn(f'wrote {plist}', done.stdout)
+        self.assertEqual(done.stdout.strip().splitlines()[-1], next_line)
+        self.assertEqual(plist.stat().st_mode & 0o777, 0o644)
+        settings = b.load_settings(self.path)
+        expected = b.render_service(settings, platform='darwin', home=self.home, bridge_path=bridge)
+        self.assertEqual(plistlib.loads(plist.read_bytes()), plistlib.loads(expected.encode()))
+        self.assertFalse((self.home / '.config/systemd').exists())
+
+        again = self.install(platform='darwin')
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertIn(f'unit {plist} is current', again.stdout)
+
+    def test_install_refuses_python3_older_than_311_before_creating_anything(self):
+        fake_bin = self.root / 'fake-bin'
+        fake_bin.mkdir()
+        fake = fake_bin / 'python3'
+        fake.write_text('#!/bin/sh\n'
+                        'case "$*" in *version_info*) exit 1;; esac\n'
+                        f'exec "{sys.executable}" "$@"\n')
+        fake.chmod(0o755)
+        result = self.install(extra_env={'PATH': f'{fake_bin}:{os.environ.get("PATH", "")}'})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stderr.strip(),
+                         'install.sh: python3 on PATH must be Python 3.11 or later (python3 --version)')
+        self.assertEqual(sorted(p.name for p in self.home.iterdir()), [])
+        self.assertFalse(self.secret.exists())
+
+    def test_install_on_wsl_matches_linux(self):
+        # check-install's WSL host probes are covered in InstallCheckTests
+        # with injected paths; this host is not WSL, so stub that one step
+        # and compare install.sh's own unit and next-line output.
+        fake_bin = self.root / 'fake-bin'
+        fake_bin.mkdir()
+        fake = fake_bin / 'python3'
+        fake.write_text('#!/bin/sh\n'
+                        'for a in "$@"; do [ "$a" = check-install ] && exit 0; done\n'
+                        f'exec "{sys.executable}" "$@"\n')
+        fake.chmod(0o755)
+        extra = {'PATH': f'{fake_bin}:{os.environ.get("PATH", "")}'}
+        linux = self.install('--dry-run', platform='linux', extra_env=extra)
+        self.assertEqual(linux.returncode, 0, linux.stderr)
+        wsl = self.install('--dry-run', platform='wsl', extra_env=extra)
+        self.assertEqual(wsl.returncode, 0, wsl.stderr)
+        self.assertEqual(wsl.stdout, linux.stdout)
+        self.assertEqual(wsl.stderr, linux.stderr)
 
     def test_install_with_unloadable_settings_creates_nothing(self):
         path = write_settings(self.root, python=f'"{sys.executable}"',
