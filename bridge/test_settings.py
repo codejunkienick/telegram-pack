@@ -322,6 +322,40 @@ class TranscribeSettingsTests(unittest.TestCase):
                 with self.assertRaisesRegex(b.SettingsError, 'transcribe.language must be a whisper language code'):
                     self.load(table)
 
+    def test_an_english_only_model_with_a_non_english_language_refuses(self):
+        with self.assertRaises(b.SettingsError) as caught:
+            self.load('enabled = true\nmodel = "medium.en"\nlanguage = "ru"\n')
+        self.assertEqual(str(caught.exception),
+                         'settings: transcribe.model "medium.en" is English-only and cannot decode '
+                         'transcribe.language "ru"; use a multilingual model '
+                         '(such as large-v3-turbo-q5_0) or set language = "en"')
+        with self.assertRaises(b.SettingsError) as caught:
+            self.load('enabled = true\nmodel = "base.en"\nlanguage = "auto"\n')
+        self.assertIn('"base.en"', str(caught.exception))
+        self.assertIn('"auto"', str(caught.exception))
+
+    def test_an_english_only_model_loads_with_english_or_when_disabled(self):
+        self.assertEqual(self.load('enabled = true\nmodel = "base.en"\nlanguage = "en"\n').model, 'base.en')
+        self.assertEqual(self.load('enabled = true\nmodel = "base.en"\n').model, 'base.en')
+        disabled = self.load('enabled = false\nmodel = "base.en"\nlanguage = "ru"\n')
+        self.assertIsNone(disabled.transcribe)
+        self.assertEqual(disabled.model, 'base.en')
+        self.assertEqual(self.load('enabled = true\nmodel = "large-v3-turbo-q5_0"\nlanguage = "ru"\n').model,
+                         'large-v3-turbo-q5_0')
+
+    def test_check_install_refuses_an_english_only_model_with_one_line_and_no_warn(self):
+        path = write_settings(self.root, python=f'"{sys.executable}"')
+        path.write_text(path.read_text() + '\n[transcribe]\nenabled = true\nmodel = "medium.en"\nlanguage = "ru"\n')
+        result = subprocess.run([sys.executable, str(PACK / 'bridge' / 'bridge.py'), '--settings', str(path),
+                                 'check-install'], capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, '')
+        self.assertEqual(result.stderr.strip().splitlines(), [
+            'settings: transcribe.model "medium.en" is English-only and cannot decode '
+            'transcribe.language "ru"; use a multilingual model '
+            '(such as large-v3-turbo-q5_0) or set language = "en"'])
+        self.assertNotIn('WARN', result.stdout + result.stderr)
+
     def test_bad_transcribe_values_refuse(self):
         for table, pattern in (('device = "cuda"\n', 'unknown key transcribe.device'),
                                ('enabled = "yes"\n', 'transcribe.enabled must be true or false'),
@@ -752,29 +786,12 @@ class InstallCheckTests(unittest.TestCase):
         self.assertIn((True, f'WARN  no linger for {user}: the bridge stops when your last WSL session ends '
                              f'(loginctl enable-linger {user})'), results)
 
-    def test_an_english_only_model_with_another_language_warns_and_still_passes(self):
-        sums = {**self.model('small.en', b'small'), **self.model('silero-v6.2.0', b'vad')}
-        settings = b.Settings(**dict(self.settings.__dict__, model='small.en', language='ru'))
-        results = b.install_problems(settings, which=lambda n: '/usr/bin/' + n, sums=sums, platform='linux')
-        self.assertEqual([line for ok, line in results if not ok], [])
-        warns = [line for ok, line in results if line.startswith('WARN')]
-        self.assertEqual(len(warns), 1)
-        self.assertIn('small.en', warns[0])
-        self.assertIn('"ru"', warns[0])
-        # en and auto do not warn.
-        for language in ('en', 'auto'):
-            with self.subTest(language=language):
-                other = b.Settings(**dict(self.settings.__dict__, model='small.en', language=language))
-                lines = [line for ok, line in b.install_problems(
-                    other, which=lambda n: '/usr/bin/' + n, sums=sums, platform='linux')]
-                self.assertFalse(any(line.startswith('WARN') for line in lines))
-
     def test_check_install_prints_the_warn_line_and_exits_0(self):
         import io
         from unittest.mock import patch
         from test_bridge import run_main
         path = write_settings(self.root, python=f'"{sys.executable}"')
-        path.write_text(path.read_text() + '\n[transcribe]\nenabled = true\nmodel = "small.en"\nlanguage = "ru"\n')
+        path.write_text(path.read_text() + '\n[transcribe]\nenabled = true\nmodel = "small.en"\n')
         warn = (True, 'WARN  transcribe model small.en is English-only (*.en) but transcribe.language is "ru"')
         with patch.object(b, 'install_problems', return_value=[(True, 'python'), warn]), \
                 patch('sys.stdout', new_callable=io.StringIO) as out:

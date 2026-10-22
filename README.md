@@ -16,6 +16,7 @@ itself.
 - When transcription is enabled, the mayor gets each voice and audio note
   transcribed on the host with whisper.cpp in the configured language, with
   no cloud service. With `method = "auto"`, it uses the GPU when one is free.
+  An English-only (`.en`) model requires `language = "en"`.
 - The mayor gets a delivery ledger that stops a retried send from posting
   twice and reports an unknown outcome instead of resending it.
 - The paired user gets a slash command menu, and a city adds commands

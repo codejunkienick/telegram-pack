@@ -10,6 +10,7 @@ The rows live only here; SKILL.md holds none.
 | pack | bridge/bridge.py | return f'[{kind} {duration} transcript (msg {mid}): {body}] (audio: {path})' | follow-up |
 | pack | bridge/bridge.py | body = transcript if reason is None else f'transcription failed: {reason}' | failure text |
 | pack | bridge/bridge.py | 'VOICE_TRANSCRIBE_LANGUAGE': language, | configured language reaches the transcriber |
+| pack | bridge/bridge.py | is English-only and cannot decode | English-only (.en) model requires language = "en" |
 | pack | transcriber/voice_transcribe.py | DEFAULT_LANGUAGE = 'en' | default language |
 | pack | transcriber/voice_transcribe.py | '-l', getattr(options, 'language', DEFAULT_LANGUAGE) | language passed to whisper-cli |
 | pack | transcriber/voice_transcribe.py | '--vad', '-vm' | Silero VAD |

@@ -2718,8 +2718,13 @@ def load_settings(path, home=None):
     if not isinstance(language, str) or not _LANGUAGE_RE.fullmatch(language):
         raise SettingsError('settings: transcribe.language must be a whisper language code '
                             '(short lowercase letters, such as "en" or "ru") or "auto"')
+    enabled = _bool_setting(found['enabled'], 'transcribe.enabled')
+    if enabled and language != 'en' and re.search(r'\.en(?:-|$)', model):
+        raise SettingsError(f'settings: transcribe.model "{model}" is English-only and cannot decode '
+                            f'transcribe.language "{language}"; use a multilingual model '
+                            f'(such as large-v3-turbo-q5_0) or set language = "en"')
     transcribe = None
-    if _bool_setting(found['enabled'], 'transcribe.enabled'):
+    if enabled:
         transcribe = dict(python=str(python), script=str(ADAPTER), model=model, timeout=timeout,
                           timeout_per_minute=per_minute, gpu=method in ('auto', 'gpu'), method=method,
                           language=language, env={
@@ -3057,10 +3062,6 @@ def install_problems(settings, which=shutil.which, sums=None, hasher=_sha256, pl
             check(False, f'model {path} is missing')
         else:
             check(hasher(path) == sums[file_name], f'model {path} SHA-256')
-    language = getattr(settings, 'language', 'en')
-    if isinstance(settings.model, str) and re.search(r'\.en(?:-|$)', settings.model) and language not in ('en', 'auto'):
-        warn(f'transcribe model {settings.model} is English-only (*.en) but transcribe.language is "{language}"; '
-             f'whisper will still run, but a multilingual model fits "{language}" better')
     return results
 
 

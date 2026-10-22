@@ -686,9 +686,9 @@ regular file, and otherwise fails an unlisted one with
 | `base.en` | `ggml-base.en.bin`, about 148 MB | not measured | English-only |
 | `small` | `ggml-small.bin`, about 488 MB | not measured | multilingual |
 
-An English-only model (`*.en`) with a `language` other than `en` or `auto`
-is reported by `check-install` as a `WARN` line naming the mismatch; it is
-never a failure and never a refusal at run time.
+An English-only model (`*.en`) requires `language = "en"`: `load_settings`
+refuses it with any other language (including `auto`) at startup, before
+any unit or Telegram contact.
 
 `install.sh` creates the queue directory and checks `whisper-cli` and both model
 files; a listed model's SHA-256 is checked against

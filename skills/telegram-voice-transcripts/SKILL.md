@@ -24,7 +24,8 @@ listen to it and ask for text.
 Transcription uses the one language the setup configures: whisper.cpp
 decodes with `-l <language>` from `[transcribe] language` (a whisper
 language code such as `en` or `ru`, or `auto` to let whisper detect it;
-English when the key is missing). No transcript is refused because of its
+English when the key is missing). An English-only (`.en`) model requires
+`language = "en"`. No transcript is refused because of its
 language or script. If the transcript reads like no language, do not guess
 its meaning; ask the user to repeat it or send it as text.
 
