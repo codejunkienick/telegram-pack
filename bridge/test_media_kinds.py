@@ -165,7 +165,7 @@ class MediaKindTests(BridgeTestCase):
 
 class MediaKindCliTests(unittest.TestCase):
     def setUp(self):
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
 
     def test_send_and_reply_current_accept_both_kinds(self):
         parser = b._build_parser()

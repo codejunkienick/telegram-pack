@@ -417,7 +417,11 @@ class DispatchTests(CommandCase):
     def test_the_handler_environment_is_fixed_and_carries_no_secret(self):
         self.drain(self.message('/deploy'))
         [record] = self.records()
-        self.assertEqual(set(record['env']), HANDLER_ENV)
+        observed = set(record['env'])
+        if b.voice_transcribe.host_platform() == 'darwin':
+            # macOS itself adds this one variable to child processes.
+            observed.discard('__CF_USER_TEXT_ENCODING')
+        self.assertEqual(observed, HANDLER_ENV)
         self.assertEqual(record['env']['PATH'], '/usr/local/bin:/usr/bin:/bin')
         self.assertEqual(record['env']['TELEGRAM_BRIDGE_COMMAND'], 'deploy')
         self.assertEqual(record['env']['TZ'], 'Asia/Tokyo')

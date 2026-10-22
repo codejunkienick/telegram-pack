@@ -2080,6 +2080,39 @@ class HeartbeatTests(BridgeTestCase):
         self.assertEqual(err.getvalue(), 'poll heartbeat not saved\n')
         self.assertEqual(os.listdir(outside.name), [])
 
+    # On darwin only the system's own aliases (/var -> /private/var and
+    # the like, patched here to this test's roots) may sit in front of the
+    # runtime: a heartbeat behind one is written, while a heartbeat behind
+    # a user-made ancestor link, or in a runtime that is itself a link,
+    # is refused and nothing is written through the link.
+    def test_on_darwin_a_heartbeat_behind_a_symlinked_ancestor_is_written(self):
+        base = Path(self.tmp.name).resolve()
+        private_root = base / 'private-var'
+        real_runtime = private_root / 'runtime'
+        real_runtime.mkdir(parents=True)
+        alias_root = base / 'var'
+        os.symlink(private_root, alias_root, target_is_directory=True)
+        path = alias_root / 'runtime' / 'telegram-bridge-heartbeat.json'
+        other_runtime = base / 'other' / 'runtime'
+        other_runtime.mkdir(parents=True)
+        user_alias = base / 'user-link'
+        os.symlink(other_runtime.parent, user_alias, target_is_directory=True)
+        bad_path = user_alias / 'runtime' / 'telegram-bridge-heartbeat.json'
+        aliases = {str(alias_root): str(private_root)}
+        with patch.dict(os.environ, {'TELEGRAM_PACK_PLATFORM': 'darwin'}), \
+                patch.object(b, 'DARWIN_SYSTEM_ALIASES', aliases):
+            b.Bridge._write_heartbeat(path, json.dumps(dict(last_poll_ok_at='2026-09-29T03:00:00Z', pid=os.getpid())))
+            self.assertEqual(json.loads(path.read_text())['pid'], os.getpid())
+            self.assertFalse(path.is_symlink())
+            self.assertTrue((real_runtime / 'telegram-bridge-heartbeat.json').exists())
+            with self.assertRaises(b.TransportError):
+                b.Bridge._write_heartbeat(bad_path, '{}')
+            self.assertFalse((other_runtime / 'telegram-bridge-heartbeat.json').exists())
+            linked = base / 'linked-runtime'
+            os.symlink(real_runtime, linked, target_is_directory=True)
+            with self.assertRaises(b.TransportError):
+                b.Bridge._write_heartbeat(linked / 'telegram-bridge-heartbeat.json', '{}')
+
     def test_write_failure_keeps_the_poll_loop_running(self):
         with patch.object(self.bridge, 'heartbeat_path', return_value=Path(self.tmp.name) / 'missing-dir' / 'hb.json'):
             self.poll_once((200, dict(ok=True, result=[self.update(10)])))

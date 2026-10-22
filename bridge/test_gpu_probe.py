@@ -26,7 +26,7 @@ CLIP = b'RIFF\x24\x00\x00\x00WAVEfmt '
 
 class ProbeFixture(unittest.TestCase):
     def setUp(self):
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         checkout = self.root / 'whisper.cpp'
         (checkout / 'build' / 'bin').mkdir(parents=True)
         (checkout / 'samples').mkdir()

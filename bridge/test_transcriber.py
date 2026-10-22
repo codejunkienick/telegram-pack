@@ -104,7 +104,7 @@ exit "${FAKE_NVIDIA_SMI_EXIT:-0}"
 
 class FakeWhisperCase(unittest.TestCase):
     def setUp(self):
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         bin_dir = self.root / 'bin'
         bin_dir.mkdir()
         self.cli = bin_dir / 'whisper-cli'

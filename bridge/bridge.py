@@ -69,6 +69,12 @@ _transcriber_spec.loader.exec_module(voice_transcribe)
 SETTINGS_ENV = 'TELEGRAM_BRIDGE_SETTINGS'
 SETTINGS_NAME = 'telegram-bridge.toml'
 LAUNCHD_PATH = '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
+# macOS maps these leading paths onto /private themselves (/var is a link
+# to /private/var, and the temporary directory lives under it); a runtime
+# reached through exactly that mapping is still its own directory. Any
+# other symlinked ancestor is a user-made link and is refused, on darwin
+# as on Linux. Tests patch this table to their own temporary roots.
+DARWIN_SYSTEM_ALIASES = {'/var': '/private/var', '/tmp': '/private/tmp', '/etc': '/private/etc'}
 
 
 NAME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}')
@@ -2021,15 +2027,35 @@ class Bridge:
     @staticmethod
     def _write_heartbeat(path, text):
         """The heartbeat's one writer, the same fence as _pending_write:
-        the runtime directory must be its
-        own canonical path (no symlink anywhere in it) and is pinned by an
+        the runtime directory is pinned by an
         O_NOFOLLOW descriptor; the temp file has an unpredictable name created
         with O_EXCL|O_NOFOLLOW in it, is written whole and fsynced, then
         renamed over the heartbeat there and the directory fsynced, so neither
         a planted temp link nor a swapped directory can send the write outside
-        the runtime. The bridge never reads the heartbeat back."""
+        the runtime. The bridge never reads the heartbeat back.
+
+        On Linux and WSL the runtime must be its own canonical path (no
+        symlink anywhere in it). On darwin the same rule holds except for
+        the system's own leading aliases in DARWIN_SYSTEM_ALIASES (/var,
+        /tmp or /etc mapped to /private/...), which is how the temporary
+        directory is reached there; any other symlinked ancestor, and a
+        runtime directory that is itself a link, are refused. The pinned
+        descriptor keeps every later step in the directory that was
+        opened."""
         runtime = path.parent
-        if os.path.realpath(runtime) != str(runtime):
+        if voice_transcribe.host_platform() == 'darwin':
+            if runtime.is_symlink():
+                raise TransportError('heartbeat directory is not its own canonical path')
+            resolved = os.path.realpath(runtime)
+            if resolved != str(runtime):
+                runtime_str = str(runtime)
+                tolerated = any(
+                    (runtime_str == alias or runtime_str.startswith(alias + '/'))
+                    and resolved == target + runtime_str[len(alias):]
+                    for alias, target in DARWIN_SYSTEM_ALIASES.items())
+                if not tolerated:
+                    raise TransportError('heartbeat directory is not its own canonical path')
+        elif os.path.realpath(runtime) != str(runtime):
             raise TransportError('heartbeat directory is not its own canonical path')
         dfd = Bridge._open_pinned_dir(runtime, 'heartbeat directory')
         try:
