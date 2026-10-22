@@ -202,6 +202,10 @@ table (and a `handler_write_paths` entry if it writes), then run
 `install.sh` again, `systemctl --user daemon-reload`, restart the unit, and run
 `set-commands`. Remove one: delete the table, delete the handler program if nothing else uses it, drop its `handler_write_paths` entry if no other handler writes there, run `install.sh` again, `systemctl --user daemon-reload`, restart the unit, then run `set-commands`. The menu loses the command only then.
 The handler protocol is in `bridge/OPERATIONS.md`, "City commands".
+One ready add-on is
+[telegram-quota](https://github.com/codejunkienick/telegram-quota). It adds
+a `/quota` command that shows how much of each AI subscription's usage
+windows is spent, with the time left until each reset.
 
 ## Example
 
