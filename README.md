@@ -45,6 +45,13 @@ itself.
 | `commands/reply-current/` | `gc telegram reply-current`: reply in the paired chat |
 | `skills/` | the shared skills: `telegram-formatting`, `telegram-attachments`, `telegram-voice-transcripts` |
 
+## Add-ons
+
+Separate repositories that build on this pack:
+
+- [telegram-quota](https://github.com/codejunkienick/telegram-quota): a `/quota` command that shows how much of each AI subscription's usage windows is spent.
+- [telegram-secret-drop](https://github.com/codejunkienick/telegram-secret-drop): a one-time form on the local network for handing a secret to an agent without it passing through the chat.
+
 ## Prerequisites
 
 On Linux:
