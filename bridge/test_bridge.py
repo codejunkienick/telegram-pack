@@ -22,6 +22,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bridge as b  # noqa: E402
+import testports  # noqa: E402
 
 
 def write_settings(root, body=None, mode=0o600, **replace):
@@ -919,7 +920,7 @@ class BridgeTests(BridgeTestCase):
         handler = b._callback_handler(bridge or self.bridge)
         if timeout is not None:
             handler.timeout = timeout
-        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+        server = testports.bind_test_server(handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         self.addCleanup(server.server_close)
@@ -1076,7 +1077,7 @@ class BridgeTests(BridgeTestCase):
             def log_message(self, *args):
                 pass
 
-        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        server = testports.bind_test_server(Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         self.addCleanup(server.shutdown)
@@ -1155,7 +1156,7 @@ class BridgeTests(BridgeTestCase):
             def log_message(self, *args):
                 pass
 
-        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        server = testports.bind_test_server(Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         self.addCleanup(server.shutdown)
@@ -2161,11 +2162,10 @@ class ConflictExitStatusTests(BridgeTestCase):
                 return 200, {}
             return self.transport(url, body, *args, **kwargs)
         self.bridge.request = transport
-        self.bridge.port = 0
         with patch.object(self.bridge, 'probe_with_retry', return_value=True), \
              patch('sys.stdout', new_callable=io.StringIO), patch('sys.stderr', new_callable=io.StringIO):
             with self.assertRaises(b.PollConflict):
-                self.bridge.run()
+                testports.run_bridge(self.bridge)
 
     def test_run_conflict_exit_status(self):
         with tempfile.TemporaryDirectory() as root:
@@ -2209,10 +2209,9 @@ class HeartbeatTests(BridgeTestCase):
                 return 200, {}
             return self.transport(url, body, *args, **kwargs)
         self.bridge.request = transport
-        self.bridge.port = 0
         with patch.object(self.bridge, 'probe_with_retry', return_value=True), \
              patch('sys.stdout', new_callable=io.StringIO), patch('sys.stderr', new_callable=io.StringIO):
-            self.bridge.run()
+            testports.run_bridge(self.bridge)
 
     def test_successful_poll_writes_the_heartbeat_with_time_and_pid(self):
         self.poll_once((200, dict(ok=True, result=[])))

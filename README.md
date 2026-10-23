@@ -37,7 +37,7 @@ itself.
 | --- | --- |
 | `bridge/bridge.py` | the bridge: `run`, `probe`, `send`, `reply-current`, `set-commands`, `render-unit`, `check-install` |
 | `bridge/OPERATIONS.md` | the operations guide: settings, launch, delivery recovery, transcription |
-| `bridge/test_*.py` | `sh scripts/test.sh` (fake Telegram, GC and whisper-cli; no network) |
+| `bridge/test_*.py` | `sh scripts/test.sh` (fake Telegram, GC and whisper-cli; no network). Set `TEST_PORT_RANGE=LOW-HIGH` to bind test servers inside that range. Pick a range that excludes ports the host's own services use. |
 | `settings.example.toml` | every settings key, with example values |
 | `install.sh` | checks a city's settings and host, links `voice-transcribe`, renders its service |
 | `systemd/telegram-bridge.service.in` | the Linux unit template; on macOS the agent is rendered by `bridge.py render-unit` |

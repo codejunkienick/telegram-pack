@@ -898,6 +898,12 @@ Validate locally with (fake Telegram, fake GC, fake whisper-cli; no network):
 sh scripts/test.sh
 ```
 
+Set `TEST_PORT_RANGE` to `LOW-HIGH` to bind test servers inside that
+range. Pick a range that excludes ports the host's own services use.
+A service that listens only on demand may otherwise find its port
+taken by a test run. With `TEST_PORT_RANGE` unset, tests bind port 0
+and the kernel picks a port.
+
 Wire references: [GC v1.4.1 adapter](https://github.com/gastownhall/gascity/blob/v1.4.1/internal/extmsg/http_adapter.go),
 [wire types](https://github.com/gastownhall/gascity/blob/v1.4.1/internal/extmsg/types.go),
 [HTTP API](https://github.com/gastownhall/gascity/blob/v1.4.1/internal/api/huma_types_extmsg.go).

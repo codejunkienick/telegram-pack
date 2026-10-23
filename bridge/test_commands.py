@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bridge as b  # noqa: E402
+import testports  # noqa: E402
 from test_bridge import MENU, write_settings  # noqa: E402
 
 INPUT_KEYS = {'kind', 'command', 'args', 'update_id', 'message_id', 'callback_data', 'callback_message_id',
@@ -489,7 +490,7 @@ class LoopbackHandler:
                 except OSError:
                     pass
 
-        self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        self.server = testports.bind_test_server(Handler)
         self.server.daemon_threads = True
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         case.addCleanup(self.server.server_close)
@@ -953,10 +954,10 @@ class NoCommandsTests(CommandCase):
                 self.bridge.stop.set()
                 return 200, dict(ok=True, result=[])
             return 200, {}
-        self.bridge.request, self.bridge.port = transport, 0
+        self.bridge.request = transport
         with patch.object(self.bridge, 'probe_with_retry', return_value=True), \
              patch('sys.stdout', new_callable=io.StringIO), patch('sys.stderr', new_callable=io.StringIO):
-            self.bridge.run()
+            testports.run_bridge(self.bridge)
         self.assertEqual(polls[0]['allowed_updates'], ['message', 'callback_query'])
 
 
