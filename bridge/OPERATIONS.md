@@ -387,19 +387,61 @@ send's idempotency key (the first 16 hex characters of its SHA-256), so one
 ask belongs to one logical send; each question of a multi-question ask goes
 out as its own message with its own key and keyboard.
 
+A1 A valid press names an existing ask, the message the ask was sent as, an
+authorised user and one of the ask's options; anything else keeps the
+drop-and-answer-empty behaviour and never reaches the mayor.
+
+A2 On the first valid press, in order: (1) answer the callback once (key
+`ask:<update_id>:answer`); (2) in one ledger write mark the ask answered with
+the choice and the update id; (3) relay exactly one durable inbound entry
+with provider message id `ask-<ask-id>` and the text
+`[ask answer | choice: <label> | message: <id>]`, then a newline and
+`question: ` followed by the visible question verbatim as the last field,
+and record the ask as relayed once GC confirms it; (4) only then attempt the
+edit that appends `\n✓ <label>` to the text or caption and removes the
+buttons, under the per-ask key `ask:<ask-id>:edit` (editMessageText for a
+text ask, editMessageCaption for a photo ask). Both edits carry an empty
+inline keyboard (`{"inline_keyboard": []}`). The offset advances once the
+relay is confirmed; the edit outcome (confirmed, rejected or ambiguous) never
+holds it, un-answers or relays again.
+
+A3 When GC does not confirm the relay the offset is retained and the retry
+relays once under the same provider id, records relayed, then edits; the
+callback is answered no second time and the edit happens at most once.
+
+A4 A later press on an answered and relayed ask runs the pending edit once
+before the already-answered answer (a no-op when the edit already ran, under
+the per-ask key); nothing is relayed again.
+
+A5 The send-time refusals: the ask id must be the send's derived id, two
+buttons may not share `callback_data`, no button label may hold `|`, `]`, a
+line break or a control character (refused when `label.splitlines() !=
+[label]` or any character has Unicode category Cc, Zl or Zp; Cf such as
+emoji ZWJ stays valid, and any would make the relayed answer's first line
+ambiguous). The ask question is free text and is never refused for its
+characters (newlines, tabs, `|` and `]` and every other character are valid;
+only the 4096-unit room rule below applies): it rides verbatim as the last
+field of the relayed answer, after a newline, so nothing in it can be
+confused with a field. The question must leave room
+for `\n✓ <label>` of its longest option within 4096 UTF-16 units of text, or
+1024 UTF-16 units of caption for a photo ask.
+
 P1 A keyboard may go with no attachment or with exactly one photo; any other
 attachment kind (or more than one) refuses the send as `invalid_keyboard`
 before anything is recorded or sent, through `publish()` and through `send`
-and `reply-current` with `--keyboard-file` plus `--attachment`. Every other
-attachment kind stays refused.
+and `reply-current` with `--keyboard-file` plus `--attachment`. A keyboard on
+a photo holds only ask buttons: any other callback data on a photo refuses
+the send as `invalid_keyboard` (a handler edit of that photo would go through
+editMessageText, which Telegram rejects for media). Every other attachment
+kind stays refused.
 
 P2 A photo ask's question is its caption. The A5 room rule for a photo ask
 uses 1024 UTF-16 units of caption. The ledger records each ask's kind, text or
 photo.
 
 P3 A2 step 4 for a photo ask is editMessageCaption (append `\n✓ <label>` to
-the caption, remove the buttons) under the same per-ask key; everything else
-of A1-A5 is unchanged: record, relay with provider message id
+the caption, send an empty inline keyboard) under the same per-ask key;
+everything else of A1-A5 is unchanged: record, relay with provider message id
 `ask-<ask-id>`, then edit; the edit outcome never holds the offset, never
 un-answers and never relays again.
 
@@ -409,40 +451,19 @@ without the photo, no `delivered`), so the ask is never recorded as sent
 without its buttons. The HTML parse-rejection fallback re-sends the photo
 once without `parse_mode`, keeping the keyboard (as for text).
 
-A1 A valid press names an existing ask, the message the ask was sent as, an
-authorised user and one of the ask's options; anything else keeps the
-drop-and-answer-empty behaviour and never reaches the mayor.
-
-A2 On the first valid press, in order: (1) answer the callback once (key
-`ask:<update_id>:answer`); (2) in one ledger write mark the ask answered with
-the choice and the update id; (3) relay exactly one durable inbound entry
-naming the question, the option and the original message id, with provider
-message id `ask-<ask-id>`, and record the ask as relayed once GC confirms it;
-(4) only then attempt the edit that appends `\n✓ <label>` to the text or
-caption and removes the buttons, under the per-ask key `ask:<ask-id>:edit`
-(editMessageText for a text ask, editMessageCaption for a photo ask). The
-offset advances once the relay is confirmed; the edit outcome (confirmed,
-rejected or ambiguous) never holds it, un-answers or relays again.
-
-A3 When GC does not confirm the relay the offset is retained and the retry
-relays once under the same provider id, records relayed, then edits; the
-callback is answered no second time and the edit happens at most once.
-
-A4 A later press on an answered ask (any other update id) gets only the
-already-answered answer; nothing is relayed or edited.
-
-A5 The send-time refusals: the ask id must be the send's derived id, two
-buttons may not share `callback_data`, and the question must leave room for
-`\n✓ <label>` of its longest option within 4096 UTF-16 units of text, or
-1024 UTF-16 units of caption for a photo ask.
-
 An ask button whose id is not the send's derived id refuses the send
 (`invalid_keyboard`), so a reused id can never silently rebind the first
 question, options and message to a second send. Two buttons sharing one
 `callback_data` refuse the send (`invalid_keyboard`): the press could only
-ever match the first, so the second label could never be relayed. A question
-with no room left for the appended choice refuses the send
-(`invalid_keyboard`), since no tap could complete it. The bridge records each
+ever match the first, so the second label could never be relayed. A label
+holding `|`, `]`, a line break or a control character refuses the send
+(`invalid_keyboard`), since the relayed answer's first line separates its
+fields with ` | ` inside `[...]`: refused when `label.splitlines() !=
+[label]` or any character has Unicode category Cc, Zl or Zp (Cf such as
+emoji ZWJ stays valid). An ask question is never refused for its characters:
+it rides verbatim after the first line's newline as the last field. A question with
+no room left for the appended choice refuses the send (`invalid_keyboard`),
+since no tap could complete it. The bridge records each
 ask in the ledger before the send is confirmed (ask id, question text or
 caption, ordered options, sent message id, answered flag, kind text or
 photo). A `[[command]]` `callback_prefix` equal to or overlapping `ask:`

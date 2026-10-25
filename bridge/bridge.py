@@ -33,6 +33,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from urllib.parse import quote, urlsplit
 import zoneinfo
 
@@ -430,17 +431,6 @@ class Store:
                        'answered INTEGER NOT NULL DEFAULT 0, answer TEXT, '
                        'update_id INTEGER, relayed INTEGER NOT NULL DEFAULT 0, '
                        "kind TEXT NOT NULL DEFAULT 'text')")
-            for migration in ('ALTER TABLE asks ADD COLUMN update_id INTEGER',
-                              'ALTER TABLE asks ADD COLUMN relayed INTEGER NOT NULL DEFAULT 0',
-                              "ALTER TABLE asks ADD COLUMN kind TEXT NOT NULL DEFAULT 'text'"):
-                try:
-                    db.execute(migration)
-                except sqlite3.OperationalError:
-                    pass  # the column already exists on an older ledger
-            try:
-                db.execute('ALTER TABLE asks DROP COLUMN is_media')
-            except sqlite3.OperationalError:
-                pass  # no media column to drop (new ledger) or SQLite too old to drop
 
     @contextlib.contextmanager
     def connect(self):
@@ -1650,6 +1640,20 @@ class Bridge:
         and reusing an ask id under another key is refused, never rebound."""
         return hashlib.sha256(key.encode()).hexdigest()[:16]
 
+    @staticmethod
+    def _ask_text_breaks_answer_line(text):
+        """True when a button label would split or blur the relayed answer.
+
+        The answer's first line separates its fields with ' | ' inside
+        '[...]': a label holding a line break or control character would
+        make it ambiguous. Refuse when splitlines would split it or any
+        character has Unicode category Cc, Zl or Zp; Cf (emoji ZWJ)
+        stays valid. The visible question is free text and is never
+        checked here: it rides verbatim as the last field, after a
+        newline, so nothing in it can blur a field."""
+        return (text.splitlines() != [text]
+                or any(unicodedata.category(ch) in ('Cc', 'Zl', 'Zp') for ch in text))
+
     def _handler_environment(self, name):
         return dict(PATH=self.COMMAND_PATH, HOME=os.environ.get('HOME') or str(Path.home()),
                     LANG=os.environ.get('LANG') or 'C.UTF-8', TZ=self.config.get('timezone') or 'UTC',
@@ -1844,6 +1848,13 @@ class Bridge:
                 seen.add(data)
                 if data.startswith(self.ASK_CALLBACK_PREFIX):
                     if self._ask_choice(data) is None:
+                        return None, 'invalid_keyboard'
+                    if ('|' in text or ']' in text
+                            or self._ask_text_breaks_answer_line(text)):
+                        # The relayed answer's first line separates its
+                        # fields with ' | ' inside '[...]': a label holding
+                        # '|', ']', a line break or a control character
+                        # would make that line ambiguous.
                         return None, 'invalid_keyboard'
                 elif self._callback_command(data) is None:
                     return None, 'foreign_callback_data'
@@ -2058,11 +2069,13 @@ class Bridge:
         A3 When GC does not confirm the relay the offset is retained and the
         retry relays once under the same provider id, records relayed, then
         edits; the callback is answered no second time and the edit happens
-        at most once. A4 A later press on an answered ask gets only the
-        already-answered answer; nothing is relayed or edited. A5 The
-        send-time refusals (derived ask id, no shared callback_data, room for
-        the choice suffix within 4096 units of text or 1024 units of photo
-        caption) stay, with the photo caption limit for photo asks."""
+        at most once. A4 A later press on an answered and relayed ask runs
+        the pending edit once before the already-answered answer (a no-op
+        when the edit already ran, under the per-ask key); nothing is
+        relayed again. A5 The send-time refusals (derived ask id, no shared
+        callback_data, room for the choice suffix within 4096 units of text
+        or 1024 units of photo caption, no ambiguous label) stay, with the
+        photo caption limit for photo asks."""
         answer_key = f'ask:{update_id}:answer'
         message = query.get('message')
         mid = message.get('message_id') if isinstance(message, dict) else None
@@ -2096,6 +2109,12 @@ class Bridge:
                 self._answer_callback(update_id, query['id'], key=answer_key)
                 self._relay_ask_answer(ask_id, ask, mid, update_id)
                 return
+            # An answered and relayed press runs the pending edit step
+            # once before the already-answered answer: after a restart
+            # between the relay record and the edit, any later authorised
+            # press (same or different update id) completes the edit. A
+            # no-op when it already ran, under the per-ask key.
+            self._edit_ask(ask_id, ask, mid, update_id)
             self._answer_callback(update_id, query['id'], text=self.ASK_ALREADY_ANSWERED, key=answer_key)
             return
         label = next((option['text'] for option in ask['options']
@@ -2115,20 +2134,36 @@ class Bridge:
         The relay uses provider message id ask-<ask-id> so an update id equal
         to an earlier relayed Telegram message id can never deduplicate it.
         GC confirmation records relayed; a GC failure raises and retains the
-        offset for the A3 retry. The edit runs at most once under the per-ask
-        key ask:<ask-id>:edit and never holds the offset or relays again: a
-        text ask edits its message text, a photo ask edits its caption."""
+        offset for the A3 retry. The edit is its own step (_edit_ask): it runs
+        at most once under the per-ask key ask:<ask-id>:edit and never holds
+        the offset or relays again. The answer is two parts: a first line
+        '[ask answer | choice: <label> | message: <id>]', then a newline and
+        'question: ' with the visible question verbatim as the last field,
+        so nothing in a free-text question can be confused with a field."""
         question, fmt = ask['question'], ask['format']
         label = ask['answer']
-        kind = ask.get('kind') or 'text'
         if fmt == 'html':
             visible, _ = html_visible_text(question)
         else:
             visible = question
         self._relay_to_gc(f'ask-{ask_id}',
-                          f'[ask answer | question: {visible} | choice: {label} | message: {mid}]')
+                          f'[ask answer | choice: {label} | message: {mid}]\nquestion: {visible}')
         self.store.mark_ask_relayed(ask_id)
+        self._edit_ask(ask_id, ask, mid, update_id)
+
+    def _edit_ask(self, ask_id, ask, mid, update_id):
+        """Run one answered ask's edit step once: append "\\n✓ <label>" to
+        the text or caption and remove the buttons, under the per-ask key
+        ask:<ask-id>:edit (editMessageText for a text ask,
+        editMessageCaption for a photo ask). A press whose edit key already
+        holds a receipt (confirmed, rejected or pending) never edits again;
+        the edit outcome never holds the offset, un-answers or relays again.
+        Both edits carry an empty inline keyboard."""
+        question, fmt = ask['question'], ask['format']
+        label = ask['answer']
+        kind = ask.get('kind') or 'text'
         if fmt == 'html':
+            visible, _ = html_visible_text(question)
             edit_text = question + '\n✓ ' + html_text(label)
             plain_edit = visible + '\n✓ ' + label
         else:
@@ -2143,7 +2178,9 @@ class Bridge:
                                              dict(type='edit', message_id=mid, text=edit_text, format=fmt),
                                              lambda pending: self._deliver_text(
                                                  edit_text, None, pending, plain_edit,
-                                                 method='editMessageText', extra={'message_id': mid}))
+                                                 method='editMessageText',
+                                                 extra={'message_id': mid,
+                                                        'reply_markup': {'inline_keyboard': []}}))
         if edit.get('delivered') is not True:
             self._log(f'ask edit not confirmed (update {update_id})')
 
@@ -2384,6 +2421,10 @@ class Bridge:
             # with another keyboard is idempotency_key_conflict.
             rows, error = self._publish_keyboard(request['keyboard'])
             if error:
+                if (error == 'foreign_callback_data'
+                        and isinstance(attachment, dict)
+                        and attachment.get('kind') == 'photo'):
+                    return self.receipt(reason='invalid_keyboard')
                 return self.receipt(reason=error)
             request = dict(request, keyboard=rows)
         ask_ids = [ask_id for row in rows or () for ask_id, _ in
@@ -2392,9 +2433,14 @@ class Bridge:
         ask_ids = list(dict.fromkeys(ask_ids))
         # P1: a keyboard may go with no attachment or with exactly one photo;
         # any other attachment kind (or more than one) refuses the send as
-        # invalid_keyboard before anything is recorded or sent.
+        # invalid_keyboard before anything is recorded or sent. A keyboard on
+        # a photo holds only ask: buttons: a handler edit of that photo would
+        # go through editMessageText, which Telegram rejects for media.
         if rows is not None and attachment is not None:
             if not (isinstance(attachment, dict) and attachment.get('kind') == 'photo'):
+                return self.receipt(reason='invalid_keyboard')
+            if any(self._ask_choice(button['callback_data']) is None
+                   for row in rows for button in row):
                 return self.receipt(reason='invalid_keyboard')
         if attachment is not None:
             error = self._attachment_error(attachment, text, visible)
@@ -2407,6 +2453,10 @@ class Bridge:
         if any(ask_id != self._ask_id_for_key(key) for ask_id in ask_ids):
             return self.receipt(reason='invalid_keyboard')
         if ask_ids:
+            # The question is free text and is never refused for its
+            # characters: it rides verbatim as the last field of the
+            # relayed answer, after a newline, so nothing in it can be
+            # confused with a field. Only the room rule below applies.
             # Answering appends '\n✓ <label>' to the question (the caption for
             # a photo ask), so a question already at the limit would make
             # every edit overlong and the ask unanswerable. Refuse while the

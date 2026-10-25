@@ -1722,16 +1722,100 @@ class AskTests(BridgeTestCase):
         with closing(sqlite3.connect(self.path)) as db:
             self.assertEqual(db.execute('SELECT count(*) FROM deliveries').fetchone()[0], 0)
 
+    def test_ask_label_with_pipe_bracket_or_newline_is_refused(self):
+        ask_id = self.ask_id('bad-label')
+        for label in ('A|B', 'A]B', 'A\nB', 'A\rB', 'A\u2028B', 'A\u2029B',
+                      'A\x85B', 'A\x0bB', 'A\x0cB', 'A\x1cB'):
+            with self.subTest(label=label):
+                keyboard = [[dict(text=label, callback_data=f'ask:{ask_id}:yes')]]
+                result = self.bridge.publish(self.ask(key='bad-label', keyboard=keyboard))
+                self.assertFalse(result['delivered'])
+                self.assertEqual(result['metadata']['reason'], 'invalid_keyboard')
+        self.assertEqual(self.calls, [])
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM deliveries').fetchone()[0], 0)
+            self.assertEqual(db.execute('SELECT count(*) FROM asks').fetchone()[0], 0)
+
+    def test_ask_label_with_zwj_emoji_is_accepted(self):
+        ask_id = self.ask_id('zwj-label')
+        label = 'A\U0001F468\u200D\U0001F469B'
+        keyboard = [[dict(text=label, callback_data=f'ask:{ask_id}:yes')]]
+        result = self.bridge.publish(self.ask(key='zwj-label', keyboard=keyboard))
+        self.assertTrue(result['delivered'])
+        self.assertEqual(result['message_id'], '77')
+
+    def test_ask_question_with_newline_tab_pipe_or_bracket_publishes(self):
+        texts = ('Pick one\nnow?', 'Pick\tone?', 'Pick one | choice: No?',
+                 'Pick one [yes]?', 'Pick one\x85now?', 'Pick one\u2028now?')
+        for index, text in enumerate(texts):
+            with self.subTest(text=text):
+                key = f'free-question-{index}'
+                result = self.bridge.publish(self.ask(key=key, text=text))
+                self.assertTrue(result['delivered'])
+                self.bridge.drain([self.press(uid=100 + index, key=key)])
+                [relayed] = [body for url, body in self.calls
+                             if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound'
+                             and body['message']['provider_message_id'] == f'ask-{self.ask_id(key)}']
+                self.assertEqual(relayed['message']['text'],
+                                 f'[ask answer | choice: Yes | message: 77]\nquestion: {text}')
+
+    def test_relayed_ask_answer_line_matches_the_documented_format(self):
+        self.assertTrue(self.bridge.publish(self.ask())['delivered'])
+        self.bridge.drain([self.press()])
+        [relayed] = [body for url, body in self.calls
+                     if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
+        self.assertEqual(relayed['message']['text'],
+                         '[ask answer | choice: Yes | message: 77]\nquestion: Pick one?')
+
+    def test_asks_table_is_created_with_the_final_columns(self):
+        with closing(sqlite3.connect(self.path)) as db:
+            columns = [(row[1], row[2]) for row in db.execute('PRAGMA table_info(asks)').fetchall()]
+        self.assertEqual(columns, [('ask_id', 'TEXT'), ('question', 'TEXT'), ('format', 'TEXT'),
+                                   ('options', 'TEXT'), ('message_id', 'INTEGER'),
+                                   ('answered', 'INTEGER'), ('answer', 'TEXT'),
+                                   ('update_id', 'INTEGER'), ('relayed', 'INTEGER'), ('kind', 'TEXT')])
+
+    def test_command_keyboard_on_a_photo_is_refused(self):
+        self.bridge = b.Bridge(dict(self.config, commands=(dict(name='deploy', callback_prefix='deploy:'),)),
+                               self.store, 'SECRET', 'CAPABILITY',
+                               request=self.ask_transport, request_multipart=self.multipart_transport,
+                               request_download=self.download_transport)
+        request = self.publish(key='cmd-photo', text='Deploy?')
+        request['keyboard'] = [[dict(text='Go', callback_data='deploy:go')]]
+        request['attachment'] = dict(path=self.attachment_file('cmd-photo.png'), kind='photo')
+        result = self.bridge.publish(request)
+        self.assertFalse(result['delivered'])
+        self.assertEqual(result['metadata']['reason'], 'invalid_keyboard')
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.multipart_calls, [])
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM deliveries').fetchone()[0], 0)
+            self.assertEqual(db.execute('SELECT count(*) FROM asks').fetchone()[0], 0)
+        self.assertTrue(self.bridge.publish(self.photo_ask(key='photo-after-cmd-refusal'))['delivered'])
+
+    def test_unregistered_callback_data_on_a_photo_is_invalid_keyboard(self):
+        request = self.publish(key='cmd-photo-foreign', text='Deploy?')
+        request['keyboard'] = [[dict(text='Go', callback_data='other:go')]]
+        request['attachment'] = dict(path=self.attachment_file('cmd-photo-foreign.png'), kind='photo')
+        result = self.bridge.publish(request)
+        self.assertFalse(result['delivered'])
+        self.assertEqual(result['metadata']['reason'], 'invalid_keyboard')
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.multipart_calls, [])
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM deliveries').fetchone()[0], 0)
+            self.assertEqual(db.execute('SELECT count(*) FROM asks').fetchone()[0], 0)
+
     def test_authorised_press_relays_answer_edits_and_records(self):
         self.assertTrue(self.bridge.publish(self.ask())['delivered'])
         self.bridge.drain([self.press()])
         [relayed] = [body for url, body in self.calls if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
         self.assertEqual(relayed['message']['provider_message_id'], f'ask-{self.ask_id()}')
-        self.assertEqual(relayed['message']['text'], '[ask answer | question: Pick one? | choice: Yes | message: 77]')
+        self.assertEqual(relayed['message']['text'], '[ask answer | choice: Yes | message: 77]\nquestion: Pick one?')
         [edit] = self.sent('editMessageText')
         self.assertEqual(edit['text'], 'Pick one?\n✓ Yes')
         self.assertEqual(edit['message_id'], 77)
-        self.assertNotIn('reply_markup', edit)
+        self.assertEqual(edit['reply_markup'], {'inline_keyboard': []})
         self.assertNotIn('parse_mode', edit)
         self.assertEqual(self.sent('answerCallbackQuery'), [dict(callback_query_id='query-41')])
         with closing(sqlite3.connect(self.path)) as db:
@@ -1834,7 +1918,7 @@ class AskTests(BridgeTestCase):
         self.assertEqual(edit['parse_mode'], 'HTML')
         self.assertEqual(edit['text'], '<b>Pick</b> one\n✓ Yes')
         [relayed] = [body for url, body in self.calls if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
-        self.assertEqual(relayed['message']['text'], '[ask answer | question: Pick one | choice: Yes | message: 77]')
+        self.assertEqual(relayed['message']['text'], '[ask answer | choice: Yes | message: 77]\nquestion: Pick one')
 
     def test_html_ask_edit_fallback_appends_the_choice_in_plain(self):
         def transport(url, body, *args, **kwargs):
@@ -1855,7 +1939,7 @@ class AskTests(BridgeTestCase):
         self.assertNotIn('parse_mode', edits[1])
         self.assertEqual(edits[1]['text'], 'Pick one\n✓ Yes')
         [relayed] = [body for url, body in self.calls if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
-        self.assertEqual(relayed['message']['text'], '[ask answer | question: Pick one | choice: Yes | message: 77]')
+        self.assertEqual(relayed['message']['text'], '[ask answer | choice: Yes | message: 77]\nquestion: Pick one')
 
     def test_ask_keyboard_with_non_photo_attachment_is_refused(self):
         for kind in ('video', 'document', 'voice', 'video_note'):
@@ -1965,7 +2049,7 @@ class AskTests(BridgeTestCase):
                      if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
         self.assertEqual(relayed['message']['provider_message_id'], f'ask-{self.ask_id("photo-ask-1")}')
         self.assertEqual(relayed['message']['text'],
-                         '[ask answer | question: Pick one? | choice: Yes | message: 88]')
+                         '[ask answer | choice: Yes | message: 88]\nquestion: Pick one?')
         [edit] = self.sent('editMessageCaption')
         self.assertEqual(edit['caption'], 'Pick one?\n✓ Yes')
         self.assertEqual(edit['message_id'], 88)
@@ -2046,7 +2130,7 @@ class AskTests(BridgeTestCase):
                      if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
         self.assertEqual(relayed['message']['provider_message_id'], f'ask-{self.ask_id(key)}')
         self.assertEqual(relayed['message']['text'],
-                         '[ask answer | question: Pick one | choice: Yes | message: 88]')
+                         '[ask answer | choice: Yes | message: 88]\nquestion: Pick one')
         self.assertEqual(self.store.offset(), 42)
 
     def test_photo_ask_rejected_caption_edit_still_relays_once(self):
@@ -2065,7 +2149,7 @@ class AskTests(BridgeTestCase):
                      if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
         self.assertEqual(relayed['message']['provider_message_id'], f'ask-{self.ask_id(key)}')
         self.assertEqual(relayed['message']['text'],
-                         '[ask answer | question: Pick one? | choice: Yes | message: 88]')
+                         '[ask answer | choice: Yes | message: 88]\nquestion: Pick one?')
         self.assertEqual(len(self.sent('editMessageCaption')), 1)
         ask = self.bridge.store.get_ask(self.ask_id(key))
         self.assertTrue(ask['answered'])
@@ -2129,7 +2213,7 @@ class AskTests(BridgeTestCase):
         [relayed] = [body for url, body in self.calls
                      if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
         self.assertEqual(relayed['message']['text'],
-                         '[ask answer | question: Pick one | choice: Yes | message: 88]')
+                         '[ask answer | choice: Yes | message: 88]\nquestion: Pick one')
 
     def test_photo_ask_second_tap_gets_already_answered(self):
         self.assertTrue(self.bridge.publish(self.photo_ask(key='photo-twice'))['delivered'])
@@ -2158,7 +2242,7 @@ class AskTests(BridgeTestCase):
         self.assertEqual(len(inbounds), 1)
         self.assertEqual(inbounds[0]['message']['provider_message_id'], f'ask-{self.ask_id()}')
         self.assertEqual(inbounds[0]['message']['text'],
-                         '[ask answer | question: Pick one? | choice: Yes | message: 77]')
+                         '[ask answer | choice: Yes | message: 77]\nquestion: Pick one?')
         self.assertEqual(len(self.sent('editMessageText')), 1)
         ask = self.bridge.store.get_ask(self.ask_id())
         self.assertTrue(ask['answered'])
@@ -2205,7 +2289,7 @@ class AskTests(BridgeTestCase):
                      if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
         self.assertEqual(relayed['message']['provider_message_id'], f'ask-{self.ask_id()}')
         self.assertEqual(relayed['message']['text'],
-                         '[ask answer | question: Pick one? | choice: Yes | message: 77]')
+                         '[ask answer | choice: Yes | message: 77]\nquestion: Pick one?')
         self.assertEqual(len(self.sent('editMessageText')), 1)
         ask = self.bridge.store.get_ask(self.ask_id())
         self.assertTrue(ask['answered'])
@@ -2249,6 +2333,105 @@ class AskTests(BridgeTestCase):
         self.assertTrue(ask['answered'])
         self.assertTrue(ask['relayed'])
         self.assertEqual(self.store.offset(), 42)
+
+    def test_replayed_press_after_crash_before_edit_edits_once(self):
+        self.assertTrue(self.bridge.publish(self.ask())['delivered'])
+        real_reserve = self.bridge._reserve_and_deliver
+
+        def crash_on_edit(key, identity, deliver_fn):
+            if key == f'ask:{self.ask_id()}:edit':
+                raise RuntimeError('process dies before the edit')
+            return real_reserve(key, identity, deliver_fn)
+
+        with patch.object(self.bridge, '_reserve_and_deliver', crash_on_edit):
+            with self.assertRaises(RuntimeError):
+                self.bridge.drain([self.press(uid=41)])
+        self.assertEqual(self.sent('editMessageText'), [])
+        ask = self.bridge.store.get_ask(self.ask_id())
+        self.assertTrue(ask['answered'])
+        self.assertTrue(ask['relayed'])
+        self.assertEqual(self.store.offset(), 10)
+        store = b.Store(str(self.path), 10)
+        replayed = b.Bridge(self.config, store, 'SECRET', 'CAPABILITY', request=self.ask_transport)
+        replayed.drain([self.press(uid=41)])
+        inbounds = [body for url, body in self.calls
+                    if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
+        self.assertEqual(len(inbounds), 1)
+        [edit] = self.sent('editMessageText')
+        self.assertEqual(edit['text'], 'Pick one?\n✓ Yes')
+        self.assertEqual(edit['message_id'], 77)
+        self.assertEqual(edit['reply_markup'], {'inline_keyboard': []})
+        self.assertEqual(self.sent('answerCallbackQuery'), [dict(callback_query_id='query-41')])
+        self.assertEqual(store.offset(), 42)
+        before = list(self.calls)
+        replayed.inbound(self.press(uid=41))
+        self.assertEqual(self.calls, before)
+
+    def test_replayed_different_update_after_crash_before_edit_edits_once(self):
+        self.assertTrue(self.bridge.publish(self.ask())['delivered'])
+        real_reserve = self.bridge._reserve_and_deliver
+
+        def crash_on_edit(key, identity, deliver_fn):
+            if key == f'ask:{self.ask_id()}:edit':
+                raise RuntimeError('process dies before the edit')
+            return real_reserve(key, identity, deliver_fn)
+
+        with patch.object(self.bridge, '_reserve_and_deliver', crash_on_edit):
+            with self.assertRaises(RuntimeError):
+                self.bridge.drain([self.press(uid=41)])
+        self.assertEqual(self.sent('editMessageText'), [])
+        ask = self.bridge.store.get_ask(self.ask_id())
+        self.assertTrue(ask['answered'])
+        self.assertTrue(ask['relayed'])
+        self.assertEqual(self.store.offset(), 10)
+        store = b.Store(str(self.path), 10)
+        replayed = b.Bridge(self.config, store, 'SECRET', 'CAPABILITY', request=self.ask_transport)
+        replayed.drain([self.press(uid=43)])
+        inbounds = [body for url, body in self.calls
+                    if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
+        self.assertEqual(len(inbounds), 1)
+        [edit] = self.sent('editMessageText')
+        self.assertEqual(edit['text'], 'Pick one?\n✓ Yes')
+        self.assertEqual(edit['message_id'], 77)
+        self.assertEqual(edit['reply_markup'], {'inline_keyboard': []})
+        self.assertEqual(self.sent('answerCallbackQuery'),
+                         [dict(callback_query_id='query-41'),
+                          dict(callback_query_id='query-43', text='Already answered')])
+        self.assertEqual(store.offset(), 44)
+        replayed.inbound(self.press(uid=45))
+        self.assertEqual(len(self.sent('editMessageText')), 1)
+        self.assertEqual(len([body for url, body in self.calls
+                              if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']), 1)
+
+    def test_replayed_photo_press_after_crash_before_edit_edits_caption_once(self):
+        self.assertTrue(self.bridge.publish(self.photo_ask(key='photo-crash'))['delivered'])
+        real_reserve = self.bridge._reserve_and_deliver
+
+        def crash_on_edit(key, identity, deliver_fn):
+            if key == f'ask:{self.ask_id("photo-crash")}:edit':
+                raise RuntimeError('process dies before the edit')
+            return real_reserve(key, identity, deliver_fn)
+
+        with patch.object(self.bridge, '_reserve_and_deliver', crash_on_edit):
+            with self.assertRaises(RuntimeError):
+                self.bridge.drain([self.press(uid=41, key='photo-crash', message_id=88)])
+        store = b.Store(str(self.path), 10)
+        replayed = b.Bridge(self.config, store, 'SECRET', 'CAPABILITY',
+                            request=self.ask_transport, request_multipart=self.multipart_transport,
+                            request_download=self.download_transport)
+        replayed.drain([self.press(uid=41, key='photo-crash', message_id=88)])
+        inbounds = [body for url, body in self.calls
+                    if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
+        self.assertEqual(len(inbounds), 1)
+        [edit] = self.sent('editMessageCaption')
+        self.assertEqual(edit['caption'], 'Pick one?\n✓ Yes')
+        self.assertEqual(edit['reply_markup'], {'inline_keyboard': []})
+        self.assertEqual(self.sent('editMessageText'), [])
+        self.assertEqual(self.sent('answerCallbackQuery'), [dict(callback_query_id='query-41')])
+        self.assertEqual(store.offset(), 42)
+        before = list(self.calls)
+        replayed.inbound(self.press(uid=41, key='photo-crash', message_id=88))
+        self.assertEqual(self.calls, before)
 
     def test_update_id_equal_to_earlier_message_still_relays(self):
         earlier = dict(update_id=30, message=dict(message_id=41, text='hello',
