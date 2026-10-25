@@ -425,6 +425,20 @@ class Store:
             db.execute('CREATE TABLE IF NOT EXISTS cursor (id INTEGER PRIMARY KEY, offset INTEGER NOT NULL)')
             db.execute('INSERT OR IGNORE INTO cursor VALUES (1, ?)', (initial_offset,))
             db.execute('CREATE TABLE IF NOT EXISTS deliveries (key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, receipt TEXT NOT NULL)')
+            db.execute('CREATE TABLE IF NOT EXISTS asks (ask_id TEXT PRIMARY KEY, question TEXT NOT NULL, '
+                       'format TEXT NOT NULL, options TEXT NOT NULL, message_id INTEGER, '
+                       'answered INTEGER NOT NULL DEFAULT 0, answer TEXT, '
+                       'update_id INTEGER, relayed INTEGER NOT NULL DEFAULT 0)')
+            for migration in ('ALTER TABLE asks ADD COLUMN update_id INTEGER',
+                              'ALTER TABLE asks ADD COLUMN relayed INTEGER NOT NULL DEFAULT 0'):
+                try:
+                    db.execute(migration)
+                except sqlite3.OperationalError:
+                    pass  # the column already exists on a ledger from before round 4
+            try:
+                db.execute('ALTER TABLE asks DROP COLUMN is_media')
+            except sqlite3.OperationalError:
+                pass  # no media column to drop (new ledger) or SQLite too old to drop
 
     @contextlib.contextmanager
     def connect(self):
@@ -465,6 +479,41 @@ class Store:
     def finish(self, key, receipt):
         with self.connect() as db:
             db.execute('UPDATE deliveries SET receipt=? WHERE key=?', (json.dumps(receipt), key))
+
+    def record_ask(self, ask_id, question, fmt, options):
+        """Remember one mayor ask button group: the first record wins, so a
+        repeated send of the same ask never resets its answered flag."""
+        with self.connect() as db:
+            db.execute('INSERT OR IGNORE INTO asks(ask_id, question, format, options)'
+                       ' VALUES (?,?,?,?)',
+                       (ask_id, question, fmt, json.dumps(options)))
+
+    def get_ask(self, ask_id):
+        with self.connect() as db:
+            row = db.execute('SELECT question, format, options, message_id, answered, answer, update_id, relayed'
+                             ' FROM asks WHERE ask_id=?', (ask_id,)).fetchone()
+        if row is None:
+            return None
+        question, fmt, options, message_id, answered, answer, update_id, relayed = row
+        return dict(ask_id=ask_id, question=question, format=fmt, options=json.loads(options),
+                    message_id=message_id, answered=bool(answered), answer=answer,
+                    update_id=update_id, relayed=bool(relayed))
+
+    def set_ask_message(self, ask_ids, message_id):
+        with self.connect() as db:
+            db.executemany('UPDATE asks SET message_id=? WHERE ask_id=? AND message_id IS NULL',
+                           [(message_id, ask_id) for ask_id in ask_ids])
+
+    def mark_ask_answered(self, ask_id, answer, update_id):
+        """In one ledger write mark the ask answered with the choice and update id."""
+        with self.connect() as db:
+            db.execute('UPDATE asks SET answered=1, answer=?, update_id=? WHERE ask_id=?',
+                       (answer, update_id, ask_id))
+
+    def mark_ask_relayed(self, ask_id):
+        """Record the ask as relayed once GC confirms the answer entry."""
+        with self.connect() as db:
+            db.execute('UPDATE asks SET relayed=1 WHERE ask_id=?', (ask_id,))
 
 
 def check_bridge_config(config, *, settings=False):
@@ -1547,6 +1596,11 @@ class Bridge:
     COMMAND_BUTTON_TEXT_MAX = 256
     COMMAND_ANSWER_MAX = 200
     CALLBACK_DATA_MAX_BYTES = 64
+    # The bridge-owned callback prefix for mayor ask buttons
+    # (callback_data ask:<ask-id>:<choice>). No [[command]] callback_prefix
+    # may equal or overlap it; no handler output may use it.
+    ASK_CALLBACK_PREFIX = 'ask:'
+    ASK_ALREADY_ANSWERED = 'Already answered'
     _COMMAND_ACTION_KEYS = {
         'send': ({'type', 'text'}, {'format', 'keyboard'}),
         'edit': ({'type', 'message_id', 'text'}, {'format', 'keyboard'}),
@@ -1572,6 +1626,24 @@ class Bridge:
             if data.startswith(command['callback_prefix']):
                 return command  # prefixes never start one another, so at most one matches
         return None
+
+    @classmethod
+    def _ask_choice(cls, data):
+        """(ask_id, choice) of bridge-owned callback_data ask:<ask-id>:<choice>,
+        or None when it is not that shape. The choice may itself hold colons."""
+        if not isinstance(data, str) or not data.startswith(cls.ASK_CALLBACK_PREFIX):
+            return None
+        ask_id, sep, choice = data[len(cls.ASK_CALLBACK_PREFIX):].partition(':')
+        if not sep or not ask_id or not choice:
+            return None
+        return ask_id, choice
+
+    @staticmethod
+    def _ask_id_for_key(key):
+        """The ask id of one keyboard send: the first 16 hex characters of the
+        SHA-256 of its idempotency key, so one ask belongs to one logical send
+        and reusing an ask id under another key is refused, never rebound."""
+        return hashlib.sha256(key.encode()).hexdigest()[:16]
 
     def _handler_environment(self, name):
         return dict(PATH=self.COMMAND_PATH, HOME=os.environ.get('HOME') or str(Path.home()),
@@ -1736,6 +1808,44 @@ class Bridge:
             rows.append(buttons)
         return rows
 
+    def _publish_keyboard(self, keyboard):
+        """(rows, None) for a valid publish() keyboard, (None, reason) otherwise.
+
+        The same row, button-count, text and size limits as a handler keyboard
+        apply. Every button must name a registered command prefix, except the
+        bridge-owned ask: buttons, whose ask:<ask-id>:<choice> shape is checked
+        here; handler output still refuses those as foreign. Reasons match the
+        handler failure codes, and reach publish() callers as receipts."""
+        if (not isinstance(keyboard, list) or not keyboard
+                or any(not isinstance(row, list) or not 1 <= len(row) <= self.COMMAND_KEYBOARD_MAX_PER_ROW
+                       for row in keyboard)
+                or sum(len(row) for row in keyboard) > self.COMMAND_KEYBOARD_MAX_BUTTONS):
+            return None, 'invalid_keyboard'
+        rows, seen = [], set()
+        for row in keyboard:
+            buttons = []
+            for button in row:
+                if not isinstance(button, dict) or set(button) != {'text', 'callback_data'}:
+                    return None, 'invalid_keyboard'
+                text, data = button['text'], button['callback_data']
+                if (not isinstance(text, str) or not text.strip() or len(text) > self.COMMAND_BUTTON_TEXT_MAX
+                        or not isinstance(data, str) or not 1 <= len(data.encode()) <= self.CALLBACK_DATA_MAX_BYTES):
+                    return None, 'invalid_keyboard'
+                if data in seen:
+                    # Two buttons sharing callback_data would answer the same:
+                    # inbound_ask matches the first, so the second label could
+                    # never be relayed. Refuse rather than mislabel an answer.
+                    return None, 'invalid_keyboard'
+                seen.add(data)
+                if data.startswith(self.ASK_CALLBACK_PREFIX):
+                    if self._ask_choice(data) is None:
+                        return None, 'invalid_keyboard'
+                elif self._callback_command(data) is None:
+                    return None, 'foreign_callback_data'
+                buttons.append(dict(text=text, callback_data=data))
+            rows.append(buttons)
+        return rows, None
+
     def parse_handler_output(self, raw, kind):
         """The validated action list of one handler answer, or _HandlerFailure.
         Exactly {"actions": [...]}, strict JSON (no duplicate keys, no NaN),
@@ -1819,14 +1929,15 @@ class Bridge:
         return self._reserve_and_deliver(key, identity, lambda pending: self._deliver_text(
             action['text'], None, pending, action['plain'], method=method, extra=extra))
 
-    def _answer_callback(self, update_id, query_id, text='', alert=False):
-        """Answer one callback query once, under command:<update_id>:answer."""
+    def _answer_callback(self, update_id, query_id, text='', alert=False, key=None):
+        """Answer one callback query once, under command:<update_id>:answer for
+        city commands and ask:<update_id>:answer for mayor asks."""
         body = dict(callback_query_id=query_id)
         if text:
             body['text'] = text
         if alert:
             body['show_alert'] = True
-        key = f'command:{update_id}:answer'
+        key = key or f'command:{update_id}:answer'
 
         def deliver(pending):
             receipt = pending
@@ -1899,7 +2010,12 @@ class Bridge:
                 or sender.get('is_bot') is not False or not isinstance(chat, dict) or type(chat.get('id')) is not int
                 or chat['id'] != self.config['chat_id']):
             reason = 'not_authorized'
-        elif not isinstance(data, str) or not data or (command := self._callback_command(data)) is None:
+        elif not isinstance(data, str) or not data:
+            reason = 'no_registered_prefix'
+        elif data.startswith(self.ASK_CALLBACK_PREFIX):
+            self.inbound_ask(update_id, query, data)
+            return
+        elif (command := self._callback_command(data)) is None:
             reason = 'no_registered_prefix'
         else:
             reason = None
@@ -1912,6 +2028,106 @@ class Bridge:
                        callback_data=data, callback_message_id=mid if type(mid) is int and mid > 0 else None,
                        received_at=self._received_at(), user_display_name=self.display_name)
         self.run_command(command, update_id, payload, query_id=query['id'])
+
+    def inbound_ask(self, update_id, query, data):
+        """One tap on a mayor ask button: record the answer, relay it once,
+        then edit the ask message to show the choice.
+
+        D1 Keyboards go on text sends only; there is no media-ask path.
+        A1 A valid press names an existing ask, the message the ask was sent
+        as, an authorised user and one of the ask's options; anything else
+        keeps the drop-and-answer-empty behaviour and never reaches the mayor.
+        A2 On the first valid press, in order: (1) answer the callback once
+        (key ask:<update_id>:answer); (2) in one ledger write mark the ask
+        answered with the choice and the update id; (3) relay exactly one
+        durable inbound entry naming the question, the option and the original
+        message id, with provider message id ask-<ask-id>, and record the ask
+        as relayed once GC confirms it; (4) only then attempt the edit that
+        appends "\\n✓ <label>" and removes the buttons, under the per-ask key
+        ask:<ask-id>:edit. The offset advances once the relay is confirmed;
+        the edit outcome never holds it, un-answers or relays again.
+        A3 When GC does not confirm the relay the offset is retained and the
+        retry relays once under the same provider id, records relayed, then
+        edits; the callback is answered no second time and the edit happens
+        at most once. A4 A later press on an answered ask gets only the
+        already-answered answer; nothing is relayed or edited. A5 The
+        send-time refusals (derived ask id, no shared callback_data, room for
+        the choice suffix within 4096 units) stay as they are for text."""
+        answer_key = f'ask:{update_id}:answer'
+        message = query.get('message')
+        mid = message.get('message_id') if isinstance(message, dict) else None
+        parsed = self._ask_choice(data)
+        if (type(mid) is not int or mid <= 0 or parsed is None
+                or len(data.encode()) > self.CALLBACK_DATA_MAX_BYTES):
+            self._log(f'callback dropped (update {update_id}): malformed')
+            self._answer_callback(update_id, query['id'], key=answer_key)
+            return
+        ask_id, _ = parsed
+        ask = self.store.get_ask(ask_id)
+        if ask is None:
+            self._log(f'callback dropped (update {update_id}): unknown_ask')
+            self._answer_callback(update_id, query['id'], key=answer_key)
+            return
+        # The press must name the message the ask was sent as: a forged
+        # message id would otherwise edit and relay the wrong message while
+        # marking the real ask answered. A send whose receipt is still
+        # ambiguous has no recorded message yet and cannot be checked.
+        if ask['message_id'] is not None and mid != ask['message_id']:
+            self._log(f'callback dropped (update {update_id}): message_mismatch')
+            self._answer_callback(update_id, query['id'], key=answer_key)
+            return
+        if ask['answered']:
+            if not ask.get('relayed'):
+                # A3: the first press answered but GC never confirmed the
+                # relay, so the offset was retained. The retry relays once
+                # under the same provider id, records relayed, then edits.
+                # The callback answer is saved under the same update key, so
+                # it sends no second time.
+                self._answer_callback(update_id, query['id'], key=answer_key)
+                self._relay_ask_answer(ask_id, ask, mid, update_id)
+                return
+            self._answer_callback(update_id, query['id'], text=self.ASK_ALREADY_ANSWERED, key=answer_key)
+            return
+        label = next((option['text'] for option in ask['options']
+                      if option.get('callback_data') == data), None)
+        if label is None:
+            self._log(f'callback dropped (update {update_id}): unknown_choice')
+            self._answer_callback(update_id, query['id'], key=answer_key)
+            return
+        self._answer_callback(update_id, query['id'], key=answer_key)
+        self.store.mark_ask_answered(ask_id, label, update_id)
+        ask = self.store.get_ask(ask_id)
+        self._relay_ask_answer(ask_id, ask, mid, update_id)
+
+    def _relay_ask_answer(self, ask_id, ask, mid, update_id):
+        """Relay one recorded ask answer, record it relayed, then edit once.
+
+        The relay uses provider message id ask-<ask-id> so an update id equal
+        to an earlier relayed Telegram message id can never deduplicate it.
+        GC confirmation records relayed; a GC failure raises and retains the
+        offset for the A3 retry. The edit runs at most once under the per-ask
+        key ask:<ask-id>:edit and never holds the offset or relays again."""
+        question, fmt = ask['question'], ask['format']
+        label = ask['answer']
+        if fmt == 'html':
+            visible, _ = html_visible_text(question)
+        else:
+            visible = question
+        self._relay_to_gc(f'ask-{ask_id}',
+                          f'[ask answer | question: {visible} | choice: {label} | message: {mid}]')
+        self.store.mark_ask_relayed(ask_id)
+        if fmt == 'html':
+            edit_text = question + '\n✓ ' + html_text(label)
+            plain_edit = visible + '\n✓ ' + label
+        else:
+            edit_text, plain_edit = question + '\n✓ ' + label, None
+        edit = self._reserve_and_deliver(f'ask:{ask_id}:edit',
+                                         dict(type='edit', message_id=mid, text=edit_text, format=fmt),
+                                         lambda pending: self._deliver_text(
+                                             edit_text, None, pending, plain_edit,
+                                             method='editMessageText', extra={'message_id': mid}))
+        if edit.get('delivered') is not True:
+            self._log(f'ask edit not confirmed (update {update_id})')
 
     def drain(self, updates):
         for update in updates:
@@ -2049,7 +2265,7 @@ class Bridge:
                     receipt['format_fallback_reason'] = 'telegram_html_parse_rejected_400'
                 return receipt
             if data.get('ok') is False and 400 <= data.get('error_code', 0) < 500:
-                # A stuck-report must not silently vanish: fall back to a text-only
+                # A stuck-report must not silently vanish: fall back to a text
                 # message carrying the same content plus the rejection reason.
                 # The fallback is always plain: the markup is unproven here.
                 reason = 'telegram_rejected_not_sent_' + str(data['error_code'])
@@ -2100,14 +2316,60 @@ class Bridge:
         reply = request.get('reply_to_message_id', '')
         if reply and (not isinstance(reply, str) or not reply.isdecimal() or int(reply) <= 0):
             return self.receipt(reason='invalid_reply_message_id')
+        rows = None
+        if 'keyboard' in request:
+            # Absent means byte-identical behaviour to today: the field joins
+            # the idempotency fingerprint like format does, so the same key
+            # with another keyboard is idempotency_key_conflict.
+            rows, error = self._publish_keyboard(request['keyboard'])
+            if error:
+                return self.receipt(reason=error)
+            request = dict(request, keyboard=rows)
         if attachment is not None:
             error = self._attachment_error(attachment, text, visible)
             if error:
                 return self.receipt(reason=error)
+        ask_ids = [ask_id for row in rows or () for ask_id, _ in
+                   (self._ask_choice(button['callback_data']) or (None, None) for button in row)
+                   if ask_id is not None]
+        ask_ids = list(dict.fromkeys(ask_ids))
+        # D1: keyboards go on text sends only. Any keyboard together with
+        # any attachment is refused before anything is recorded or sent.
+        if rows is not None and attachment is not None:
+            return self.receipt(reason='invalid_keyboard')
+        # Every ask button names the send's own derived id: a valid shape
+        # under another key (or another ask's id) is refused before anything
+        # is recorded, so a reused ask id can never silently rebind the
+        # first question, options and message to a second send.
+        if any(ask_id != self._ask_id_for_key(key) for ask_id in ask_ids):
+            return self.receipt(reason='invalid_keyboard')
+        if ask_ids:
+            # Answering appends '\n✓ <label>' to the question, so a question
+            # already at Telegram's 4096-unit text limit would make every edit
+            # overlong and the ask unanswerable. Refuse while the longest
+            # choice still fits nowhere, rather than send buttons no tap can
+            # complete.
+            longest = max((button['text'] for row in rows for button in row
+                           if (self._ask_choice(button['callback_data']) or (None,))[0] in ask_ids),
+                          default='')
+            if utf16_units(visible + '\n✓ ' + longest) > 4096:
+                return self.receipt(reason='invalid_keyboard')
         def deliver(pending):
+            if rows is not None:
+                # Recorded before Telegram is contacted, so a press can only
+                # ever resolve against a sent ask; the sent message id follows
+                # once the send is confirmed.
+                for ask_id in ask_ids:
+                    self.store.record_ask(ask_id, text, fmt, [button for row in rows for button in row
+                                                             if (self._ask_choice(button['callback_data']) or (None,))[0] == ask_id])
             if attachment is not None:
-                return self._deliver_attachment(attachment, text, reply, pending, plain)
-            return self._deliver_text(text, reply, pending, plain)
+                receipt = self._deliver_attachment(attachment, text, reply, pending, plain)
+            else:
+                extra = {'reply_markup': {'inline_keyboard': rows}} if rows is not None else None
+                receipt = self._deliver_text(text, reply, pending, plain, extra=extra)
+            if rows is not None and receipt.get('delivered') and receipt.get('message_id'):
+                self.store.set_ask_message(ask_ids, int(receipt['message_id']))
+            return receipt
         return self._reserve_and_deliver(key, request, deliver)
 
     # Poll heartbeat for a city's health check: proof that getUpdates is
@@ -2340,6 +2602,9 @@ def _build_parser():
                         help='absolute path of a file to send, the body as its caption')
     parser.add_argument('--attachment-kind', choices=tuple(Bridge.ATTACHMENT_KINDS),
                         help='voice and video_note are never inferred; video_note takes an empty body')
+    parser.add_argument('--keyboard-file', type=Path,
+                        help='file holding an inline keyboard as JSON rows (send, reply-current; '
+                             'a keyboard send publishes directly in this process, never through GC)')
     parser.add_argument('--format', choices=('plain', 'html'), default='plain',
                         help='html sends Telegram HTML (allowlisted tags, caller-escaped text)')
     parser.add_argument('--gpu-probe', action='store_true',
@@ -2428,16 +2693,38 @@ NOT_SENT_MESSAGE = ('Telegram could not be reached; nothing was sent '
                     f'({NOT_SENT_REASON}): send again with the same key and body')
 
 
+def _read_keyboard_file(path):
+    """The inline keyboard rows of a --keyboard-file: parsed before Telegram
+    is contacted, so a missing file or malformed JSON refuses the send."""
+    try:
+        raw = Path(path).read_text()
+    except OSError:
+        raise TransportError('keyboard file is missing or unreadable') from None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        raise TransportError('keyboard file is not valid JSON') from None
+
+
 def _dispatch_outbound(bridge, args, text):
-    if args.attachment or args.format == 'html':
+    keyboard = None
+    if getattr(args, 'keyboard_file', None) is not None:
+        keyboard = _read_keyboard_file(args.keyboard_file)
+        if keyboard is None:
+            # A JSON null is valid JSON but not rows: refusing beats falling
+            # through to GC's text-only relay and reporting buttons sent.
+            raise TransportError('keyboard file must hold JSON rows')
+    if args.attachment or args.format == 'html' or keyboard is not None:
         # GC's outbound relay accepts only session, conversation, text, key and
         # reply (HTTP 422 for any other property, e.g. 'body.attachment'), so
-        # its callback can never hand publish() an attachment or a format.
-        # Deliver directly in this process instead, sharing the daemon's
-        # idempotency store; GC keeps no transcript record of this send.
+        # its callback can never hand publish() an attachment, a format or a
+        # keyboard. Deliver directly in this process instead, sharing the
+        # daemon's idempotency store; GC keeps no transcript record of this send.
         request = dict(conversation=bridge.conversation, idempotency_key=args.idempotency_key, text=text)
         if args.format == 'html':
             request['format'] = 'html'
+        if keyboard is not None:
+            request['keyboard'] = keyboard
         if args.attachment:
             request['attachment'] = dict(path=str(args.attachment.resolve()),
                                          kind=args.attachment_kind or infer_attachment_kind(args.attachment))
@@ -2700,6 +2987,8 @@ def _command_settings(data, menu):
         for other in commands:
             if prefix.startswith(other['callback_prefix']) or other['callback_prefix'].startswith(prefix):
                 raise SettingsError(f"settings: {label} callback_prefix overlaps the one of /{other['name']}")
+        if prefix.startswith(Bridge.ASK_CALLBACK_PREFIX) or Bridge.ASK_CALLBACK_PREFIX.startswith(prefix):
+            raise SettingsError(f'settings: {label} callback_prefix overlaps the bridge-owned ask: prefix')
         command['callback_prefix'] = prefix
         commands.append(command)
     shown = len(menu) + sum(1 for command in commands if command['menu'])

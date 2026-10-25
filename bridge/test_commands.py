@@ -231,6 +231,14 @@ class CommandSettingsTests(SettingsCase):
              self.entry() + self.entry('other', callback_prefix='deploy:x')),
             (r'command entry 2 \(other\) callback_prefix overlaps the one of /deploy',
              self.entry() + self.entry('other', callback_prefix='dep')),
+            (r'command entry 1 \(deploy\) callback_prefix overlaps the bridge-owned ask: prefix',
+             self.entry(callback_prefix='ask:')),
+            (r'command entry 1 \(deploy\) callback_prefix overlaps the bridge-owned ask: prefix',
+             self.entry(callback_prefix='ask:x')),
+            (r'command entry 1 \(deploy\) callback_prefix overlaps the bridge-owned ask: prefix',
+             self.entry(callback_prefix='ask')),
+            (r'command entry 1 \(deploy\) callback_prefix overlaps the bridge-owned ask: prefix',
+             self.entry(callback_prefix='a')),
         ]
         for url in ('http://localhost:8090/x', 'https://127.0.0.1:8090/x', 'http://127.0.0.2:8090/x',
                     'http://127.0.0.1/x', 'http://127.0.0.1:8090', 'http://127.0.0.1:0/x', 'http://127.0.0.1:70000/x',
@@ -621,6 +629,10 @@ class FailureTests(CommandCase):
         self.assertNotIn(MARKER, log)
         self.assertEqual(list(self.ledger())[0], f'command:{uid}:notice')
         self.assertEqual(self.store.offset(), uid + 1)
+
+    def test_a_handler_keyboard_with_an_ask_button_is_a_failure(self):
+        self.assert_failure(answer(dict(type='send', text='Pick', keyboard=[[dict(
+            text='Yes', callback_data='ask:q1:yes')]])), 'foreign_callback_data')
 
     def test_32_actions_and_a_full_keyboard_are_accepted(self):
         button = dict(text='a', callback_data='deploy:a')

@@ -24,6 +24,9 @@ itself.
 - The paired user gets a slash command menu, and a city adds commands
   through its own handler programs that answer with text and inline
   buttons and need no enable flag.
+- The paired user answers a mayor ask by tapping one of its inline
+  buttons instead of typing: one tap reaches the mayor once as one
+  actionable message, and the ask message then shows the choice.
 - Each city gets its own bot, settings file, bridge process and delivery
   ledger on one host, and cities share one copy of the code and one
   whisper.cpp build.
@@ -42,7 +45,7 @@ itself.
 | `install.sh` | checks a city's settings and host, links `voice-transcribe`, renders its service |
 | `systemd/telegram-bridge.service.in` | the Linux unit template; on macOS the agent is rendered by `bridge.py render-unit` |
 | `transcriber/` | `voice_transcribe.py` (whisper.cpp, configured language), `adapter.py` (the bridge's contract), `models.sha256` |
-| `commands/reply-current/` | `gc telegram reply-current`: reply in the paired chat |
+| `commands/reply-current/` | `gc telegram reply-current`: reply in the paired chat, optionally with an inline keyboard (`--keyboard-file`) |
 | `skills/` | the shared skills: `telegram-formatting`, `telegram-attachments`, `telegram-voice-transcripts` |
 
 ## Add-ons

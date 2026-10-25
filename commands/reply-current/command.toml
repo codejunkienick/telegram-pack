@@ -1,1 +1,1 @@
-description = "Reply to the paired private Telegram chat; requires --body-file and --idempotency-key; --format html sends Telegram HTML"
+description = "Reply to the paired private chat; requires --body-file and --idempotency-key; --format html sends Telegram HTML; --keyboard-file <path> attaches an inline keyboard from JSON rows"

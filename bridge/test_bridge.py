@@ -1604,6 +1604,523 @@ class BridgeTests(BridgeTestCase):
         self.assertEqual(self.calls, [])
 
 
+class AskTests(BridgeTestCase):
+    """Mayor asks: publish() keyboards, the ask: ledger, and tap-to-answer."""
+
+    def setUp(self):
+        super().setUp()
+        self.bridge.request = self.ask_transport
+
+    def ask_transport(self, url, body, *args, **kwargs):
+        self.calls.append((url, body))
+        if url.endswith('/sendMessage'):
+            return 200, dict(ok=True, result=dict(message_id=77, chat=dict(id=123)))
+        if url.endswith('/editMessageText'):
+            return 200, dict(ok=True, result=dict(message_id=body['message_id'], chat=dict(id=123)))
+        if url.endswith('/answerCallbackQuery'):
+            return 200, dict(ok=True, result=True)
+        return 200, self.accepted(body['message'])
+
+    def ask_id(self, key='ask-send-1'):
+        return b.Bridge._ask_id_for_key(key)
+
+    def keyboard(self, key='ask-send-1'):
+        ask_id = self.ask_id(key)
+        return [[dict(text='Yes', callback_data=f'ask:{ask_id}:yes'),
+                 dict(text='No', callback_data=f'ask:{ask_id}:no')]]
+
+    def ask(self, key='ask-send-1', text='Pick one?', keyboard=None):
+        request = self.publish(key=key, text=text)
+        request['keyboard'] = self.keyboard(key) if keyboard is None else keyboard
+        return request
+
+    def press(self, uid=41, choice='yes', key='ask-send-1', data=None,
+              sender=123, chat=123, message_id=77):
+        if data is None:
+            data = f'ask:{self.ask_id(key)}:{choice}'
+        return dict(update_id=uid, callback_query=dict(
+            id=f'query-{uid}', data=data, chat_instance='x', **{'from': dict(id=sender, is_bot=False)},
+            message=dict(message_id=message_id, chat=dict(id=chat, type='private'))))
+
+    def sent(self, method):
+        return [body for url, body in self.calls if url.endswith('/' + method)]
+
+    def test_keyboard_send_attaches_reply_markup_and_is_idempotent(self):
+        request = self.ask()
+        result = self.bridge.publish(request)
+        self.assertTrue(result['delivered'])
+        self.assertEqual(result['message_id'], '77')
+        [body] = self.sent('sendMessage')
+        self.assertEqual(body['reply_markup'], {'inline_keyboard': self.keyboard()})
+        self.assertNotIn('parse_mode', body)
+        self.assertEqual(self.bridge.publish(request), result)
+        self.assertEqual(len(self.sent('sendMessage')), 1)
+        with closing(sqlite3.connect(self.path)) as db:
+            stored = db.execute('SELECT fingerprint FROM deliveries WHERE key=?', ('ask-send-1',)).fetchone()[0]
+        identity = dict(request, keyboard=self.keyboard())
+        self.assertEqual(stored, b.hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest())
+        ask = self.bridge.store.get_ask(self.ask_id())
+        self.assertEqual(ask['question'], 'Pick one?')
+        self.assertEqual(ask['options'], self.keyboard()[0])
+        self.assertEqual(ask['message_id'], 77)
+        self.assertFalse(ask['answered'])
+
+    def test_ask_id_must_derive_from_the_idempotency_key(self):
+        self.assertTrue(self.bridge.publish(self.ask())['delivered'])
+        foreign = self.ask(key='ask-send-2', keyboard=self.keyboard())
+        refused = self.bridge.publish(foreign)
+        self.assertFalse(refused['delivered'])
+        self.assertEqual(refused['metadata']['reason'], 'invalid_keyboard')
+        same_shape = self.ask(key='ask-send-2', text='Second?',
+                              keyboard=[[dict(text='Yes', callback_data=f'ask:{self.ask_id()}:yes')]])
+        rebound = self.bridge.publish(same_shape)
+        self.assertFalse(rebound['delivered'])
+        self.assertEqual(rebound['metadata']['reason'], 'invalid_keyboard')
+        self.assertEqual(len(self.sent('sendMessage')), 1)
+        ask = self.bridge.store.get_ask(self.ask_id())
+        self.assertEqual(ask['question'], 'Pick one?')
+        self.assertEqual(ask['options'], self.keyboard()[0])
+        self.bridge.drain([self.press()])
+        [relayed] = [body for url, body in self.calls if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
+        self.assertIn('question: Pick one?', relayed['message']['text'])
+
+    def test_same_key_with_another_keyboard_is_a_conflict(self):
+        self.assertTrue(self.bridge.publish(self.ask())['delivered'])
+        other = self.ask(keyboard=[[dict(text='Maybe',
+                                          callback_data=f'ask:{self.ask_id()}:maybe')]])
+        conflict = self.bridge.publish(other)
+        self.assertEqual(conflict['metadata']['reason'], 'idempotency_key_conflict')
+        self.assertEqual(len(self.sent('sendMessage')), 1)
+
+    def test_keyboard_validation_refuses_shapes_and_foreign_data(self):
+        button = dict(text='Yes', callback_data='ask:q1:yes')
+        cases = [
+            ('not-a-list', 'invalid_keyboard'),
+            ([], 'invalid_keyboard'),
+            ([[]], 'invalid_keyboard'),
+            ([[dict(button) for _ in range(9)]], 'invalid_keyboard'),
+            ([[dict(button)] for _ in range(101)], 'invalid_keyboard'),
+            ([[dict(text='Yes')]], 'invalid_keyboard'),
+            ([[dict(text='  ', callback_data='ask:q1:yes')]], 'invalid_keyboard'),
+            ([[dict(text='x' * 257, callback_data='ask:q1:yes')]], 'invalid_keyboard'),
+            ([[dict(text='Yes', callback_data='')]], 'invalid_keyboard'),
+            ([[dict(text='Yes', callback_data='x' * 65)]], 'invalid_keyboard'),
+            ([[dict(text='Yes', callback_data='other:yes')]], 'foreign_callback_data'),
+            ([[dict(text='Yes', callback_data='ask:')]], 'invalid_keyboard'),
+            ([[dict(text='Yes', callback_data='ask:q1')]], 'invalid_keyboard'),
+            ([[dict(text='Yes', callback_data='ask::yes')]], 'invalid_keyboard'),
+            ([[dict(text='Yes', callback_data='ask:q1:')]], 'invalid_keyboard'),
+        ]
+        for index, (keyboard, reason) in enumerate(cases):
+            with self.subTest(keyboard=keyboard):
+                result = self.bridge.publish(self.ask(key=f'bad-{index}', keyboard=keyboard))
+                self.assertFalse(result['delivered'])
+                self.assertEqual(result['metadata']['reason'], reason)
+        self.assertEqual(self.calls, [])
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM deliveries').fetchone()[0], 0)
+
+    def test_authorised_press_relays_answer_edits_and_records(self):
+        self.assertTrue(self.bridge.publish(self.ask())['delivered'])
+        self.bridge.drain([self.press()])
+        [relayed] = [body for url, body in self.calls if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
+        self.assertEqual(relayed['message']['provider_message_id'], f'ask-{self.ask_id()}')
+        self.assertEqual(relayed['message']['text'], '[ask answer | question: Pick one? | choice: Yes | message: 77]')
+        [edit] = self.sent('editMessageText')
+        self.assertEqual(edit['text'], 'Pick one?\n✓ Yes')
+        self.assertEqual(edit['message_id'], 77)
+        self.assertNotIn('reply_markup', edit)
+        self.assertNotIn('parse_mode', edit)
+        self.assertEqual(self.sent('answerCallbackQuery'), [dict(callback_query_id='query-41')])
+        with closing(sqlite3.connect(self.path)) as db:
+            keys = sorted(key for (key,) in db.execute('SELECT key FROM deliveries').fetchall())
+        self.assertEqual(keys, ['ask-send-1', 'ask:41:answer', f'ask:{self.ask_id()}:edit'])
+        ask = self.bridge.store.get_ask(self.ask_id())
+        self.assertTrue(ask['answered'])
+        self.assertTrue(ask['relayed'])
+        self.assertEqual(ask['answer'], 'Yes')
+        self.assertEqual(ask['update_id'], 41)
+        self.assertEqual(self.store.offset(), 42)
+
+    def test_replayed_update_relays_edits_and_answers_no_second_time(self):
+        self.assertTrue(self.bridge.publish(self.ask())['delivered'])
+        self.bridge.drain([self.press()])
+        before = list(self.calls)
+        self.bridge.inbound(self.press())  # the same update after a lost acknowledgement
+        self.assertEqual(self.calls, before)
+        self.assertEqual(self.bridge.store.get_ask(self.ask_id())['answer'], 'Yes')
+
+    def test_second_tap_gets_only_an_already_answered_answer(self):
+        self.assertTrue(self.bridge.publish(self.ask())['delivered'])
+        self.bridge.drain([self.press(uid=41)])
+        self.bridge.drain([self.press(uid=43, choice='no')])
+        inbounds = [body for url, body in self.calls
+                    if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
+        self.assertEqual(len(inbounds), 1)
+        self.assertEqual(len(self.sent('editMessageText')), 1)
+        self.assertEqual(self.sent('answerCallbackQuery'),
+                         [dict(callback_query_id='query-41'),
+                          dict(callback_query_id='query-43', text='Already answered')])
+        self.assertEqual(self.bridge.store.get_ask(self.ask_id())['answer'], 'Yes')
+        self.assertEqual(self.store.offset(), 44)
+
+    def test_press_naming_another_message_is_dropped(self):
+        self.assertTrue(self.bridge.publish(self.ask())['delivered'])
+        with patch('sys.stderr', new_callable=io.StringIO) as log:
+            self.bridge.drain([self.press(uid=41, message_id=999)])
+        self.assertEqual(self.sent('answerCallbackQuery'), [dict(callback_query_id='query-41')])
+        self.assertNotIn('inbound', [url.rsplit('/', 1)[1] for url, _ in self.calls
+                                     if url.startswith(self.bridge.base)])
+        self.assertEqual(self.sent('editMessageText'), [])
+        self.assertEqual(log.getvalue().splitlines(), ['callback dropped (update 41): message_mismatch'])
+        self.assertFalse(self.bridge.store.get_ask(self.ask_id())['answered'])
+        self.assertEqual(self.store.offset(), 42)
+        self.bridge.drain([self.press(uid=43)])
+        [relayed] = [body for url, body in self.calls if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
+        self.assertIn('message: 77', relayed['message']['text'])
+
+    def test_unknown_malformed_or_unauthorised_presses_are_dropped(self):
+        self.assertTrue(self.bridge.publish(self.ask())['delivered'])
+        no_message = self.press(uid=51)
+        del no_message['callback_query']['message']
+        updates = [self.press(uid=41, sender=124),
+                   self.press(uid=43, chat=124),
+                   self.press(uid=45, data='ask:qx:yes'),
+                   self.press(uid=47, data='ask:'),
+                   self.press(uid=49, data=f'ask:{self.ask_id()}:maybe'),
+                   no_message]
+        with patch('sys.stderr', new_callable=io.StringIO) as log:
+            self.bridge.drain(updates)
+        self.assertEqual(self.sent('answerCallbackQuery'),
+                         [dict(callback_query_id=f'query-{uid}') for uid in (41, 43, 45, 47, 49, 51)])
+        self.assertNotIn('inbound', [url.rsplit('/', 1)[1] for url, _ in self.calls
+                                     if url.startswith(self.bridge.base)])
+        self.assertEqual(self.sent('editMessageText'), [])
+        self.assertEqual(log.getvalue().splitlines(), [
+            'callback dropped (update 41): not_authorized',
+            'callback dropped (update 43): not_authorized',
+            'callback dropped (update 45): unknown_ask',
+            'callback dropped (update 47): malformed',
+            'callback dropped (update 49): unknown_choice',
+            'callback dropped (update 51): not_authorized'])
+        self.assertFalse(self.bridge.store.get_ask(self.ask_id())['answered'])
+
+    def test_html_ask_keeps_keyboard_on_plain_fallback_and_edits_in_html(self):
+        state = dict(left=1)
+
+        def transport(url, body, *args, **kwargs):
+            if url.endswith('/sendMessage') and body.get('parse_mode') == 'HTML' and state['left'] > 0:
+                self.calls.append((url, body))
+                state['left'] -= 1
+                return 400, dict(ok=False, error_code=400,
+                                 description="Bad Request: can't parse entities: x")
+            return self.ask_transport(url, body)
+
+        self.bridge.request = transport
+        request = self.ask(text='<b>Pick</b> one')
+        request['format'] = 'html'
+        result = self.bridge.publish(request)
+        self.assertTrue(result['delivered'])
+        self.assertEqual(result['format_fallback_reason'], 'telegram_html_parse_rejected_400')
+        self.assertEqual(len(self.sent('sendMessage')), 2)
+        self.assertEqual(self.sent('sendMessage')[0]['parse_mode'], 'HTML')
+        self.assertNotIn('parse_mode', self.sent('sendMessage')[1])
+        for body in self.sent('sendMessage'):
+            self.assertEqual(body['reply_markup'], {'inline_keyboard': self.keyboard()})
+        self.bridge.drain([self.press()])
+        [edit] = self.sent('editMessageText')
+        self.assertEqual(edit['parse_mode'], 'HTML')
+        self.assertEqual(edit['text'], '<b>Pick</b> one\n✓ Yes')
+        [relayed] = [body for url, body in self.calls if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
+        self.assertEqual(relayed['message']['text'], '[ask answer | question: Pick one | choice: Yes | message: 77]')
+
+    def test_html_ask_edit_fallback_appends_the_choice_in_plain(self):
+        def transport(url, body, *args, **kwargs):
+            if url.endswith('/editMessageText') and body.get('parse_mode') == 'HTML':
+                self.calls.append((url, body))
+                return 400, dict(ok=False, error_code=400,
+                                 description="Bad Request: can't parse entities: x")
+            return self.ask_transport(url, body)
+        self.bridge.request = transport
+        request = self.ask(text='<b>Pick</b> one')
+        request['format'] = 'html'
+        self.assertTrue(self.bridge.publish(request)['delivered'])
+        self.bridge.drain([self.press()])
+        edits = self.sent('editMessageText')
+        self.assertEqual(len(edits), 2)
+        self.assertEqual(edits[0]['parse_mode'], 'HTML')
+        self.assertEqual(edits[0]['text'], '<b>Pick</b> one\n✓ Yes')
+        self.assertNotIn('parse_mode', edits[1])
+        self.assertEqual(edits[1]['text'], 'Pick one\n✓ Yes')
+        [relayed] = [body for url, body in self.calls if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
+        self.assertEqual(relayed['message']['text'], '[ask answer | question: Pick one | choice: Yes | message: 77]')
+
+    def test_ask_keyboard_with_any_attachment_is_refused(self):
+        for kind in ('photo', 'video', 'document', 'voice', 'video_note'):
+            with self.subTest(kind=kind):
+                calls_before = len(self.calls)
+                multipart_before = len(self.multipart_calls)
+                key = f'd1-{kind}'
+                text = '' if kind == 'video_note' else 'Pick one?'
+                request = self.ask(key=key, text=text)
+                request['attachment'] = dict(path=self.attachment_file(f'd1-{kind}.bin'), kind=kind)
+                result = self.bridge.publish(request)
+                self.assertFalse(result['delivered'])
+                self.assertEqual(result['metadata']['reason'], 'invalid_keyboard')
+                self.assertEqual(len(self.calls), calls_before)
+                self.assertEqual(len(self.multipart_calls), multipart_before)
+                self.assertIsNone(self.bridge.store.get_ask(b.Bridge._ask_id_for_key(key)))
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM deliveries').fetchone()[0], 0)
+            self.assertEqual(db.execute('SELECT count(*) FROM asks').fetchone()[0], 0)
+
+    def test_command_keyboard_with_any_attachment_is_refused(self):
+        self.bridge = b.Bridge(dict(self.config, commands=(dict(name='deploy', callback_prefix='deploy:'),)),
+                               self.store, 'SECRET', 'CAPABILITY',
+                               request=self.transport, request_multipart=self.multipart_transport,
+                               request_download=self.download_transport)
+        command_keyboard = [[dict(text='Go', callback_data='deploy:go')]]
+        for kind in ('photo', 'video', 'document', 'voice', 'video_note'):
+            with self.subTest(kind=kind):
+                calls_before = len(self.calls)
+                multipart_before = len(self.multipart_calls)
+                key = f'd1-cmd-{kind}'
+                text = '' if kind == 'video_note' else 'Deploy?'
+                request = self.publish(key=key, text=text)
+                request['keyboard'] = command_keyboard
+                request['attachment'] = dict(path=self.attachment_file(f'd1-cmd-{kind}.bin'), kind=kind)
+                result = self.bridge.publish(request)
+                self.assertFalse(result['delivered'])
+                self.assertEqual(result['metadata']['reason'], 'invalid_keyboard')
+                self.assertEqual(len(self.calls), calls_before)
+                self.assertEqual(len(self.multipart_calls), multipart_before)
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM deliveries').fetchone()[0], 0)
+            self.assertEqual(db.execute('SELECT count(*) FROM asks').fetchone()[0], 0)
+
+    def test_keyboard_file_with_attachment_refuses_ask_before_telegram(self):
+        keyboard_path = Path(self.tmp.name) / 'd1-keyboard.json'
+        keyboard_path.write_text(json.dumps(self.keyboard('d1-kb')))
+        attachment_path = self.attachment_file('d1-photo.bin')
+        parser = b._build_parser()
+        args = parser.parse_args(['send', '--body-file', 'x.txt', '--idempotency-key', 'd1-kb',
+                                  '--keyboard-file', str(keyboard_path),
+                                  '--attachment', attachment_path])
+        with patch.object(self.bridge, 'gc') as gc_mock, \
+                patch('sys.stderr', new_callable=io.StringIO):
+            with self.assertRaisesRegex(b.TransportError, 'invalid_keyboard'):
+                b._dispatch_outbound(self.bridge, args, 'Pick one?')
+        gc_mock.assert_not_called()
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.multipart_calls, [])
+        self.assertIsNone(self.bridge.store.get_ask(b.Bridge._ask_id_for_key('d1-kb')))
+
+    def test_duplicate_callback_data_is_refused(self):
+        ask_id = self.ask_id('dup-key')
+        keyboard = [[dict(text='Yes', callback_data=f'ask:{ask_id}:yes'),
+                     dict(text='Yeah', callback_data=f'ask:{ask_id}:yes')]]
+        result = self.bridge.publish(self.ask(key='dup-key', keyboard=keyboard))
+        self.assertFalse(result['delivered'])
+        self.assertEqual(result['metadata']['reason'], 'invalid_keyboard')
+        self.assertEqual(self.calls, [])
+
+    def test_ask_with_no_room_for_the_choice_suffix_is_refused(self):
+        refused = self.bridge.publish(self.ask(key='long-ask', text='q' * 4094))
+        self.assertFalse(refused['delivered'])
+        self.assertEqual(refused['metadata']['reason'], 'invalid_keyboard')
+        fitting = self.bridge.publish(self.ask(key='room-ask', text='q' * 4080))
+        self.assertTrue(fitting['delivered'])
+
+    def test_ambiguous_ask_edit_still_relays_once_timeout(self):
+        def transport(url, body, *args, **kwargs):
+            if url.endswith('/editMessageText'):
+                self.calls.append((url, body))
+                raise b.TransportError('timeout after send; outcome unconfirmed')
+            return self.ask_transport(url, body)
+        self.bridge.request = transport
+        self.assertTrue(self.bridge.publish(self.ask())['delivered'])
+        with patch('sys.stderr', new_callable=io.StringIO):
+            self.bridge.drain([self.press(uid=41)])
+        inbounds = [body for url, body in self.calls
+                    if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
+        self.assertEqual(len(inbounds), 1)
+        self.assertEqual(inbounds[0]['message']['provider_message_id'], f'ask-{self.ask_id()}')
+        self.assertEqual(inbounds[0]['message']['text'],
+                         '[ask answer | question: Pick one? | choice: Yes | message: 77]')
+        self.assertEqual(len(self.sent('editMessageText')), 1)
+        ask = self.bridge.store.get_ask(self.ask_id())
+        self.assertTrue(ask['answered'])
+        self.assertTrue(ask['relayed'])
+        self.assertEqual(ask['answer'], 'Yes')
+        self.assertEqual(self.store.offset(), 42)
+        before = list(self.calls)
+        self.bridge.inbound(self.press(uid=41))
+        self.assertEqual(self.calls, before)
+
+    def test_ambiguous_ask_edit_still_relays_once_5xx(self):
+        def transport(url, body, *args, **kwargs):
+            if url.endswith('/editMessageText'):
+                self.calls.append((url, body))
+                return 500, dict(ok=False, error_code=500, description='Internal Server Error')
+            return self.ask_transport(url, body)
+        self.bridge.request = transport
+        self.assertTrue(self.bridge.publish(self.ask())['delivered'])
+        with patch('sys.stderr', new_callable=io.StringIO):
+            self.bridge.drain([self.press(uid=41)])
+        inbounds = [body for url, body in self.calls
+                    if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
+        self.assertEqual(len(inbounds), 1)
+        self.assertEqual(inbounds[0]['message']['provider_message_id'], f'ask-{self.ask_id()}')
+        ask = self.bridge.store.get_ask(self.ask_id())
+        self.assertTrue(ask['answered'])
+        self.assertTrue(ask['relayed'])
+        self.assertEqual(self.store.offset(), 42)
+        before = list(self.calls)
+        self.bridge.inbound(self.press(uid=41))
+        self.assertEqual(self.calls, before)
+
+    def test_rejected_ask_edit_still_relays_once(self):
+        def transport(url, body, *args, **kwargs):
+            if url.endswith('/editMessageText'):
+                self.calls.append((url, body))
+                return 400, dict(ok=False, error_code=400, description='Bad Request: message to edit not found')
+            return self.ask_transport(url, body)
+        self.bridge.request = transport
+        self.assertTrue(self.bridge.publish(self.ask())['delivered'])
+        with patch('sys.stderr', new_callable=io.StringIO):
+            self.bridge.drain([self.press(uid=41)])
+        [relayed] = [body for url, body in self.calls
+                     if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
+        self.assertEqual(relayed['message']['provider_message_id'], f'ask-{self.ask_id()}')
+        self.assertEqual(relayed['message']['text'],
+                         '[ask answer | question: Pick one? | choice: Yes | message: 77]')
+        self.assertEqual(len(self.sent('editMessageText')), 1)
+        ask = self.bridge.store.get_ask(self.ask_id())
+        self.assertTrue(ask['answered'])
+        self.assertTrue(ask['relayed'])
+        self.assertEqual(self.store.offset(), 42)
+        before = list(self.calls)
+        self.bridge.inbound(self.press(uid=41))
+        self.assertEqual(self.calls, before)
+
+    def test_gc_unavailable_at_relay_retries_once(self):
+        delivered = []
+
+        def transport(url, body, *args, **kwargs):
+            if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound':
+                delivered.append(body['message'])
+                if len(delivered) == 1:
+                    raise b.TransportError('GC unavailable')
+                return 200, self.accepted(body['message'])
+            return self.ask_transport(url, body)
+        self.bridge.request = transport
+        self.assertTrue(self.bridge.publish(self.ask())['delivered'])
+        with self.assertRaises(b.TransportError):
+            self.bridge.drain([self.press(uid=41)])
+        self.assertEqual(self.store.offset(), 10)
+        ask = self.bridge.store.get_ask(self.ask_id())
+        self.assertTrue(ask['answered'])
+        self.assertFalse(ask['relayed'])
+        self.assertEqual(ask['answer'], 'Yes')
+        self.assertEqual(ask['update_id'], 41)
+        self.assertEqual(len(self.sent('answerCallbackQuery')), 1)
+        self.assertEqual(self.sent('editMessageText'), [])
+        self.bridge.drain([self.press(uid=41)])
+        self.assertEqual(len(delivered), 2)
+        self.assertEqual(delivered[0]['provider_message_id'], delivered[1]['provider_message_id'])
+        self.assertEqual(delivered[0]['provider_message_id'], f'ask-{self.ask_id()}')
+        self.assertEqual(self.sent('answerCallbackQuery'), [dict(callback_query_id='query-41')])
+        self.assertEqual(len(self.sent('editMessageText')), 1)
+        [edit] = self.sent('editMessageText')
+        self.assertEqual(edit['text'], 'Pick one?\n✓ Yes')
+        ask = self.bridge.store.get_ask(self.ask_id())
+        self.assertTrue(ask['answered'])
+        self.assertTrue(ask['relayed'])
+        self.assertEqual(self.store.offset(), 42)
+
+    def test_update_id_equal_to_earlier_message_still_relays(self):
+        earlier = dict(update_id=30, message=dict(message_id=41, text='hello',
+                       chat=dict(id=123, type='private'), **{'from': dict(id=123, is_bot=False)}))
+        self.bridge.drain([earlier])
+        [first] = [body for url, body in self.calls
+                   if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
+        self.assertEqual(first['message']['provider_message_id'], '41')
+        self.assertEqual(self.store.offset(), 31)
+        self.assertTrue(self.bridge.publish(self.ask())['delivered'])
+        self.bridge.drain([self.press(uid=41)])
+        inbounds = [body for url, body in self.calls
+                    if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
+        self.assertEqual(len(inbounds), 2)
+        self.assertEqual(inbounds[1]['message']['provider_message_id'], f'ask-{self.ask_id()}')
+        self.assertIn('choice: Yes', inbounds[1]['message']['text'])
+        ask = self.bridge.store.get_ask(self.ask_id())
+        self.assertTrue(ask['answered'])
+        self.assertTrue(ask['relayed'])
+        self.assertEqual(self.store.offset(), 42)
+
+    def test_command_buttons_still_send_through_publish(self):
+        self.bridge = b.Bridge(dict(self.config, commands=(dict(name='deploy', callback_prefix='deploy:'),)),
+                               self.store, 'SECRET', 'CAPABILITY', request=self.ask_transport)
+        request = self.ask(keyboard=[[dict(text='Go', callback_data='deploy:go')]])
+        self.assertTrue(self.bridge.publish(request)['delivered'])
+        [body] = self.sent('sendMessage')
+        self.assertEqual(body['reply_markup'], {'inline_keyboard': request['keyboard']})
+        self.assertIsNone(self.bridge.store.get_ask('deploy'))
+
+    def test_keyboard_file_send_publishes_directly_not_through_gc(self):
+        path = Path(self.tmp.name) / 'keyboard.json'
+        path.write_text(json.dumps(self.keyboard('k-kb')))
+        parser = b._build_parser()
+        args = parser.parse_args(['send', '--body-file', 'x.txt', '--idempotency-key', 'k-kb',
+                                  '--keyboard-file', str(path)])
+        with patch.object(self.bridge, 'gc') as gc_mock:
+            message_id = b._dispatch_outbound(self.bridge, args, 'Pick one?')
+        gc_mock.assert_not_called()
+        self.assertEqual(message_id, '77')
+        [body] = self.sent('sendMessage')
+        self.assertEqual(body['reply_markup'], {'inline_keyboard': self.keyboard('k-kb')})
+
+    def test_keyboard_file_with_a_null_shape_refuses_before_telegram(self):
+        path = Path(self.tmp.name) / 'null.json'
+        path.write_text('null')
+        parser = b._build_parser()
+        args = parser.parse_args(['send', '--body-file', 'x.txt', '--idempotency-key', 'k-null',
+                                  '--keyboard-file', str(path)])
+        with patch.object(self.bridge, 'gc') as gc_mock, \
+                patch('sys.stderr', new_callable=io.StringIO):
+            with self.assertRaisesRegex(b.TransportError, 'keyboard file must hold JSON rows'):
+                b._dispatch_outbound(self.bridge, args, 'Pick one?')
+        gc_mock.assert_not_called()
+        self.assertEqual(self.calls, [])
+
+    def test_keyboard_file_missing_and_malformed_refuse_before_telegram(self):
+        parser = b._build_parser()
+        missing = parser.parse_args(['send', '--body-file', 'x.txt', '--idempotency-key', 'k-miss',
+                                     '--keyboard-file', str(Path(self.tmp.name) / 'missing.json')])
+        with self.assertRaisesRegex(b.TransportError, 'keyboard file is missing or unreadable'):
+            b._dispatch_outbound(self.bridge, missing, 'Pick one?')
+        bad = Path(self.tmp.name) / 'bad.json'
+        bad.write_text('not json')
+        malformed = parser.parse_args(['send', '--body-file', 'x.txt', '--idempotency-key', 'k-bad',
+                                       '--keyboard-file', str(bad)])
+        with self.assertRaisesRegex(b.TransportError, 'keyboard file is not valid JSON'):
+            b._dispatch_outbound(self.bridge, malformed, 'Pick one?')
+        self.assertEqual(self.calls, [])
+
+    def test_keyboard_file_with_an_invalid_shape_refuses_before_telegram(self):
+        path = Path(self.tmp.name) / 'shape.json'
+        path.write_text(json.dumps([[dict(text='Yes')]]))
+        parser = b._build_parser()
+        args = parser.parse_args(['reply-current', '--body-file', 'x.txt', '--idempotency-key', 'k-shape',
+                                  '--keyboard-file', str(path)])
+        with patch.object(self.bridge, 'gc') as gc_mock, \
+                patch('sys.stderr', new_callable=io.StringIO):
+            with self.assertRaisesRegex(b.TransportError, 'invalid_keyboard'):
+                b._dispatch_outbound(self.bridge, args, 'Pick one?')
+        gc_mock.assert_not_called()
+        self.assertEqual(self.calls, [])
+
+
 class VoiceTranscriptionTests(BridgeTestCase):
     """Voice notes: saved through the fenced download path, then transcribed by a
     fake transcriber subprocess (no network, no real whisper)."""

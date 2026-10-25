@@ -253,9 +253,11 @@ Adding or removing an add-on follows the procedure in `README.md`,
 that command's handler and never to GC. The bridge polls for `message` and
 `callback_query` updates. A button press from the paired user (`from.id` is
 `user_id`, not a bot, in the paired chat) whose `callback_data` starts with a
-registered prefix goes to that prefix's handler. Any other press is answered
+registered prefix goes to that prefix's handler. A press under the
+bridge-owned `ask:` prefix is a mayor ask answer ("Mayor asks" below), never
+a command. Any other press is answered
 empty, logged as `callback dropped (update <id>): <reason>` and dropped; it
-never reaches the mayor. With no `[[command]]` every press is dropped so.
+never reaches the mayor. With no `[[command]]` every non-ask press is dropped so.
 Handlers run one at a time in the poll loop: a slow handler holds the next
 update for up to its `timeout`. A `timeout` above the unit's
 `TimeoutStopSec` (45 s) can outlive a stop or restart: the bridge is killed
@@ -360,9 +362,83 @@ description = "Deploy a branch"
 handler = "/home/alex/example-city/bin/telegram-deploy"
 ```
 
+## Mayor asks
+
+A mayor ask is a message with tap-to-answer buttons: the paired user taps
+instead of typing, one tap reaches the mayor at most once as one actionable
+message, and the ask message then shows the choice.
+
+**Sending.** `publish()` accepts an optional `keyboard`: rows of
+`{"text": ..., "callback_data": ...}` with the row, button-count, text and
+size limits of a handler keyboard. The keyboard joins the idempotency
+fingerprint like `format` does: the same key with another keyboard is
+`idempotency_key_conflict`, and no `keyboard` field sends byte-identically to
+before. `send` and `reply-current` take `--keyboard-file <path>` holding the
+rows as JSON; a keyboard send publishes directly in this process through the
+shared ledger, never through GC's relay (like an attachment or HTML send).
+
+Ask buttons use the one bridge-owned prefix `ask:`, with `callback_data`
+`ask:<ask-id>:<choice>` within 64 bytes. `<ask-id>` is derived from the
+send's idempotency key (the first 16 hex characters of its SHA-256), so one
+ask belongs to one logical send; each question of a multi-question ask goes
+out as its own message with its own key and keyboard.
+
+D1 Keyboards go on text sends only: a keyboard together with any attachment
+(photo, video, document, voice, video note) refuses the send as
+`invalid_keyboard` before anything is recorded or sent, through `publish()`
+and through `send` and `reply-current` with `--keyboard-file` plus
+`--attachment`. There is no media-ask path.
+
+A1 A valid press names an existing ask, the message the ask was sent as, an
+authorised user and one of the ask's options; anything else keeps the
+drop-and-answer-empty behaviour and never reaches the mayor.
+
+A2 On the first valid press, in order: (1) answer the callback once (key
+`ask:<update_id>:answer`); (2) in one ledger write mark the ask answered with
+the choice and the update id; (3) relay exactly one durable inbound entry
+naming the question, the option and the original message id, with provider
+message id `ask-<ask-id>`, and record the ask as relayed once GC confirms it;
+(4) only then attempt the edit that appends `\n✓ <label>` and removes the
+buttons, under the per-ask key `ask:<ask-id>:edit`. The offset advances once
+the relay is confirmed; the edit outcome (confirmed, rejected or ambiguous)
+never holds it, un-answers or relays again.
+
+A3 When GC does not confirm the relay the offset is retained and the retry
+relays once under the same provider id, records relayed, then edits; the
+callback is answered no second time and the edit happens at most once.
+
+A4 A later press on an answered ask (any other update id) gets only the
+already-answered answer; nothing is relayed or edited.
+
+A5 The send-time refusals stay as they are for text: the ask id must be the
+send's derived id, two buttons may not share `callback_data`, and the question
+must leave room for `\n✓ <label>` of its longest option within 4096 UTF-16
+units.
+
+An ask button whose id is not the send's derived id refuses the send
+(`invalid_keyboard`), so a reused id can never silently rebind the first
+question, options and message to a second send. Two buttons sharing one
+`callback_data` refuse the send (`invalid_keyboard`): the press could only
+ever match the first, so the second label could never be relayed. A question
+with no room left for the appended choice refuses the send
+(`invalid_keyboard`), since no tap could complete it. The bridge records each
+ask in the ledger before the send is confirmed (ask id, question text,
+ordered options, sent message id, answered flag). A `[[command]]`
+`callback_prefix` equal to or overlapping `ask:` refuses at load, and handler
+output using `ask:` data is a `foreign_callback_data` failure: no press,
+handler output or settings value can send a second copy of an answer.
+
+A replayed update changes nothing: saved receipts stand. Unregistered,
+malformed or unauthorised presses keep the drop-and-answer-empty behaviour
+and never reach the mayor. The HTML parse-rejection fallback re-sends once
+without `parse_mode` under the same key and keeps the keyboard; an ask edit
+rejected the same way falls back to the plain question with the choice
+appended.
+
 ## Send and receive
 
 Use `gc telegram reply-current --body-file <path> --idempotency-key <stable-key>`.
+`--keyboard-file <path>` attaches an inline keyboard ("Mayor asks" above).
 Optional `--conversation-id` must match the private configured chat. The native
 controller reminder omits the mandatory idempotency flag; add it. This pack
 command delegates to the same transport CLI and native GC outbound endpoint.
@@ -433,7 +509,7 @@ settings file, the bot token, the callback secret, the GC API token
 file or the ledger is refused before Telegram is contacted
 (`attachment_path_is_a_bridge_credential`). A file Telegram rejects falls back to one
 plain text message carrying the caption (if any) and
-`[attachment rejected: <reason>]`.
+`[attachment rejected: <reason>]`; the send carries no keyboard (D1).
 
 Inbound must receive a matching durable native GC transcript entry and a route
 to the configured `agent` (default `mayor`) before advancing the SQLite offset.
@@ -835,8 +911,10 @@ GC entry rather than a second follow-up.
 ## Delivery recovery
 
 `<state_dir>/telegram-bridge.sqlite3` stores the inbound offset and outbound
-fingerprints/receipts, without message bodies. Keep it across restarts and back it
-up privately. A token-wide `flock` (`<lock_dir>/telegram-bot-<bot_id>.lock`)
+fingerprints/receipts, without message bodies. The one exception is the
+mayor-ask table, which keeps an ask's question text, ordered options and
+answer so one tap answers, edits and relays exactly once. Keep it across
+restarts and back it up privately. A token-wide `flock` (`<lock_dir>/telegram-bot-<bot_id>.lock`)
 prevents two copies of this adapter consuming one bot even with different state
 directories. It cannot exclude unrelated bot clients.
 
