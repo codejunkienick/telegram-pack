@@ -77,4 +77,45 @@ Without the flag the body is sent as plain text, tags and all.
   `format_fallback_reason`. A formatted send is not in GC's transcript; the
   delivery ledger records it.
 
+## Asks with buttons
+
+A mayor ask is a question with two to four fixed options, answered by
+tapping a button instead of typing (`bridge/OPERATIONS.md`, "Mayor
+asks", is the authority behind every rule below). One question per
+message: each question of a multi-question ask goes out as its own
+message with its own idempotency key and keyboard.
+
+Save the buttons as JSON rows and pass them with `--keyboard-file`:
+
+```json
+[
+  [{"text": "Yes", "callback_data": "ask:cad903a6a137a717:yes"},
+   {"text": "No", "callback_data": "ask:cad903a6a137a717:no"}]
+]
+```
+
+```sh
+gc telegram reply-current --conversation-id <configured-chat-id> --body-file <question-file> \
+  --idempotency-key ask-demo-2026-10-25-01 --keyboard-file <rows-file>
+```
+
+- The ask id is the first 16 hex characters of the SHA-256 of the
+  send's idempotency key (`ask-demo-2026-10-25-01` gives
+  `cad903a6a137a717`); every button's `callback_data` is
+  `ask:<ask-id>:<choice>` with that id. An id from another key is
+  refused.
+- At most 8 buttons per row and 100 in total. A label holds no `|`,
+  `]`, line break or control character, and every `callback_data` fits
+  in 64 bytes. Two buttons never share one `callback_data`.
+- The question (or the photo caption) plus `\n✓ <longest label>` fits
+  within 4096 UTF-16 units of text, 1024 of caption for a photo ask.
+  The question itself is free text and is never refused for its
+  characters.
+- Text or one photo only: a keyboard goes with no attachment or with
+  exactly one photo, whose caption is the question; a photo keyboard
+  holds only ask buttons. Any other attachment refuses the send.
+- After the tap you receive
+  `[ask answer | choice: <label> | message: <id>]` on the first line,
+  then `question: ` with the visible question verbatim.
+
 The source file and symbol behind each claim in this skill are in `citations.md`, next to this file; open it only when you need them.

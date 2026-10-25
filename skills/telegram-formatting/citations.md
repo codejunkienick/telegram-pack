@@ -6,6 +6,23 @@ The rows live only here; SKILL.md holds none.
 ```text
 <!-- citations -->
 | kind | path | symbol | note |
+| pack | bridge/OPERATIONS.md | "Mayor asks" | asks with buttons follow this section |
+| pack | bridge/OPERATIONS.md | each question of a multi-question ask goes out as its own message with its own key and keyboard | one message per question |
+| pack | bridge/OPERATIONS.md | --keyboard-file <path> holding the rows as JSON | keyboard file rows |
+| pack | bridge/bridge.py | _ask_id_for_key | first 16 hex of the SHA-256 of the key |
+| pack | bridge/OPERATIONS.md | ask:<ask-id>:<choice> within 64 bytes | callback data shape |
+| pack | bridge/OPERATIONS.md | Every ask button names the send's own derived id | id from another key refused |
+| pack | bridge/OPERATIONS.md | at most 8 buttons per row and at most 100 buttons in total | keyboard size limits |
+| pack | bridge/bridge.py | CALLBACK_DATA_MAX_BYTES = 64 | 64-byte callback data |
+| pack | bridge/bridge.py | '|' in text or ']' in text | label holds no pipe or bracket |
+| pack | bridge/bridge.py | _ask_text_breaks_answer_line | no line break or control in a label |
+| pack | bridge/OPERATIONS.md | Two buttons sharing one callback_data refuse the send | no shared callback data |
+| pack | bridge/bridge.py | utf16_units(visible + '\n✓ ' + longest) > limit | room for the choice suffix |
+| pack | bridge/OPERATIONS.md | 1024 UTF-16 units of caption for a photo ask | photo room limit |
+| pack | bridge/OPERATIONS.md | An ask question is never refused for its characters | free-text question |
+| pack | bridge/OPERATIONS.md | a keyboard may go with no attachment or with exactly one photo | text or one photo only |
+| pack | bridge/OPERATIONS.md | A keyboard on a photo holds only ask buttons | photo keyboard ask-only |
+| pack | bridge/bridge.py | f'[ask answer \| choice: {label} \| message: {mid}]\nquestion: {visible}' | relayed answer shape |
 | pack | commands/reply-current/command.toml | requires --body-file and --idempotency-key | reply command |
 | pack | bridge/OPERATIONS.md | controller reminder omits the mandatory idempotency flag | always add the key |
 | pack | bridge/bridge.py | idempotency key reused for a different request | same key, same body |
