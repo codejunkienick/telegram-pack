@@ -428,13 +428,15 @@ class Store:
             db.execute('CREATE TABLE IF NOT EXISTS asks (ask_id TEXT PRIMARY KEY, question TEXT NOT NULL, '
                        'format TEXT NOT NULL, options TEXT NOT NULL, message_id INTEGER, '
                        'answered INTEGER NOT NULL DEFAULT 0, answer TEXT, '
-                       'update_id INTEGER, relayed INTEGER NOT NULL DEFAULT 0)')
+                       'update_id INTEGER, relayed INTEGER NOT NULL DEFAULT 0, '
+                       "kind TEXT NOT NULL DEFAULT 'text')")
             for migration in ('ALTER TABLE asks ADD COLUMN update_id INTEGER',
-                              'ALTER TABLE asks ADD COLUMN relayed INTEGER NOT NULL DEFAULT 0'):
+                              'ALTER TABLE asks ADD COLUMN relayed INTEGER NOT NULL DEFAULT 0',
+                              "ALTER TABLE asks ADD COLUMN kind TEXT NOT NULL DEFAULT 'text'"):
                 try:
                     db.execute(migration)
                 except sqlite3.OperationalError:
-                    pass  # the column already exists on a ledger from before round 4
+                    pass  # the column already exists on an older ledger
             try:
                 db.execute('ALTER TABLE asks DROP COLUMN is_media')
             except sqlite3.OperationalError:
@@ -480,24 +482,27 @@ class Store:
         with self.connect() as db:
             db.execute('UPDATE deliveries SET receipt=? WHERE key=?', (json.dumps(receipt), key))
 
-    def record_ask(self, ask_id, question, fmt, options):
+    def record_ask(self, ask_id, question, fmt, options, kind='text'):
         """Remember one mayor ask button group: the first record wins, so a
-        repeated send of the same ask never resets its answered flag."""
+        repeated send of the same ask never resets its answered flag. Kind is
+        'text' or 'photo': the question is the message text or the photo caption."""
+        if kind not in ('text', 'photo'):
+            raise ValueError('ask kind must be text or photo')
         with self.connect() as db:
-            db.execute('INSERT OR IGNORE INTO asks(ask_id, question, format, options)'
-                       ' VALUES (?,?,?,?)',
-                       (ask_id, question, fmt, json.dumps(options)))
+            db.execute('INSERT OR IGNORE INTO asks(ask_id, question, format, options, kind)'
+                       ' VALUES (?,?,?,?,?)',
+                       (ask_id, question, fmt, json.dumps(options), kind))
 
     def get_ask(self, ask_id):
         with self.connect() as db:
-            row = db.execute('SELECT question, format, options, message_id, answered, answer, update_id, relayed'
+            row = db.execute('SELECT question, format, options, message_id, answered, answer, update_id, relayed, kind'
                              ' FROM asks WHERE ask_id=?', (ask_id,)).fetchone()
         if row is None:
             return None
-        question, fmt, options, message_id, answered, answer, update_id, relayed = row
+        question, fmt, options, message_id, answered, answer, update_id, relayed, kind = row
         return dict(ask_id=ask_id, question=question, format=fmt, options=json.loads(options),
                     message_id=message_id, answered=bool(answered), answer=answer,
-                    update_id=update_id, relayed=bool(relayed))
+                    update_id=update_id, relayed=bool(relayed), kind=kind or 'text')
 
     def set_ask_message(self, ask_ids, message_id):
         with self.connect() as db:
@@ -2033,7 +2038,9 @@ class Bridge:
         """One tap on a mayor ask button: record the answer, relay it once,
         then edit the ask message to show the choice.
 
-        D1 Keyboards go on text sends only; there is no media-ask path.
+        P1 A keyboard goes with no attachment or with exactly one photo; any
+        other attachment kind (or more than one) refuses the send as
+        invalid_keyboard. D1's text-only rule is widened to one photo.
         A1 A valid press names an existing ask, the message the ask was sent
         as, an authorised user and one of the ask's options; anything else
         keeps the drop-and-answer-empty behaviour and never reaches the mayor.
@@ -2043,16 +2050,19 @@ class Bridge:
         durable inbound entry naming the question, the option and the original
         message id, with provider message id ask-<ask-id>, and record the ask
         as relayed once GC confirms it; (4) only then attempt the edit that
-        appends "\\n✓ <label>" and removes the buttons, under the per-ask key
-        ask:<ask-id>:edit. The offset advances once the relay is confirmed;
-        the edit outcome never holds it, un-answers or relays again.
+        appends "\\n✓ <label>" to the text or caption and removes the buttons,
+        under the per-ask key ask:<ask-id>:edit (editMessageText for a text
+        ask, editMessageCaption for a photo ask). The offset advances once the
+        relay is confirmed; the edit outcome never holds it, un-answers or
+        relays again.
         A3 When GC does not confirm the relay the offset is retained and the
         retry relays once under the same provider id, records relayed, then
         edits; the callback is answered no second time and the edit happens
         at most once. A4 A later press on an answered ask gets only the
         already-answered answer; nothing is relayed or edited. A5 The
         send-time refusals (derived ask id, no shared callback_data, room for
-        the choice suffix within 4096 units) stay as they are for text."""
+        the choice suffix within 4096 units of text or 1024 units of photo
+        caption) stay, with the photo caption limit for photo asks."""
         answer_key = f'ask:{update_id}:answer'
         message = query.get('message')
         mid = message.get('message_id') if isinstance(message, dict) else None
@@ -2106,9 +2116,11 @@ class Bridge:
         to an earlier relayed Telegram message id can never deduplicate it.
         GC confirmation records relayed; a GC failure raises and retains the
         offset for the A3 retry. The edit runs at most once under the per-ask
-        key ask:<ask-id>:edit and never holds the offset or relays again."""
+        key ask:<ask-id>:edit and never holds the offset or relays again: a
+        text ask edits its message text, a photo ask edits its caption."""
         question, fmt = ask['question'], ask['format']
         label = ask['answer']
+        kind = ask.get('kind') or 'text'
         if fmt == 'html':
             visible, _ = html_visible_text(question)
         else:
@@ -2121,13 +2133,49 @@ class Bridge:
             plain_edit = visible + '\n✓ ' + label
         else:
             edit_text, plain_edit = question + '\n✓ ' + label, None
-        edit = self._reserve_and_deliver(f'ask:{ask_id}:edit',
-                                         dict(type='edit', message_id=mid, text=edit_text, format=fmt),
-                                         lambda pending: self._deliver_text(
-                                             edit_text, None, pending, plain_edit,
-                                             method='editMessageText', extra={'message_id': mid}))
+        if kind == 'photo':
+            edit = self._reserve_and_deliver(f'ask:{ask_id}:edit',
+                                             dict(type='edit', message_id=mid, text=edit_text, format=fmt),
+                                             lambda pending: self._deliver_caption_edit(
+                                                 edit_text, pending, plain_edit, mid))
+        else:
+            edit = self._reserve_and_deliver(f'ask:{ask_id}:edit',
+                                             dict(type='edit', message_id=mid, text=edit_text, format=fmt),
+                                             lambda pending: self._deliver_text(
+                                                 edit_text, None, pending, plain_edit,
+                                                 method='editMessageText', extra={'message_id': mid}))
         if edit.get('delivered') is not True:
             self._log(f'ask edit not confirmed (update {update_id})')
+
+    def _deliver_caption_edit(self, caption, pending, plain=None, message_id=None):
+        """Edit a photo ask caption; mirrors _deliver_text with editMessageCaption.
+
+        `plain` is the visible caption for an HTML ask, retried once without
+        parse_mode when Telegram rejects the markup. A 4xx rejection is final;
+        an unconfirmed send returns pending and never holds the offset. The
+        edit carries an empty inline keyboard so the answered ask's buttons
+        are removed."""
+        body = dict(chat_id=self.config['chat_id'], message_id=message_id, caption=caption,
+                    reply_markup={'inline_keyboard': []})
+        if plain is not None:
+            body['parse_mode'] = 'HTML'
+        try:
+            status, data = self._send('editMessageCaption',
+                                      lambda timeout: self.telegram('editMessageCaption', body, timeout))
+            if self._confirmed(status, data):
+                return self.receipt(True, message_id=str(data['result']['message_id']))
+            if plain is not None and self._html_rejected(data):
+                receipt = self._deliver_caption_edit(plain, pending, None, message_id)
+                if receipt is not pending:
+                    receipt['format_fallback_reason'] = 'telegram_html_parse_rejected_400'
+                return receipt
+            if data.get('ok') is False and 400 <= data.get('error_code', 0) < 500:
+                return self.receipt(reason='telegram_rejected_not_sent_' + str(data['error_code']))
+            return pending
+        except RequestNotSent:
+            return self.not_sent()
+        except TransportError:
+            return pending
 
     def drain(self, updates):
         for update in updates:
@@ -2244,7 +2292,12 @@ class Bridge:
         except TransportError:
             return pending
 
-    def _deliver_attachment(self, attachment, text, reply, pending, plain=None):
+    def _deliver_attachment(self, attachment, text, reply, pending, plain=None, extra=None):
+        """Send one attachment; `extra` carries the keyboard reply_markup for a
+        photo ask. The HTML parse-rejection fallback re-sends the same file once
+        without markup, keeping the keyboard. A keyboard send never falls back
+        to a text message: a rejected photo ask fails instead, so the ask is
+        never recorded as sent without its buttons."""
         method, field, _ = self.ATTACHMENT_KINDS[attachment['kind']]
         fields = {'chat_id': str(self.config['chat_id'])}
         if attachment['kind'] not in self.CAPTIONLESS_KINDS:
@@ -2253,18 +2306,26 @@ class Bridge:
                 fields['parse_mode'] = 'HTML'
         if reply:
             fields['reply_parameters'] = json.dumps({'message_id': int(reply)})
+        if extra and 'reply_markup' in extra:
+            fields['reply_markup'] = json.dumps(extra['reply_markup'])
         try:
             status, data = self._send(method, lambda timeout: self.telegram_multipart(
                 method, fields, field, attachment['path'], timeout))
             if self._confirmed(status, data):
                 return self.receipt(True, message_id=str(data['result']['message_id']))
             if plain is not None and self._html_rejected(data):
-                # Same file, same caption text without markup, once.
-                receipt = self._deliver_attachment(attachment, plain, reply, pending)
+                # Same file, same caption text without markup, once, keeping
+                # the keyboard for a photo ask.
+                receipt = self._deliver_attachment(attachment, plain, reply, pending, extra=extra)
                 if receipt is not pending:
                     receipt['format_fallback_reason'] = 'telegram_html_parse_rejected_400'
                 return receipt
             if data.get('ok') is False and 400 <= data.get('error_code', 0) < 500:
+                if extra and 'reply_markup' in extra:
+                    # A photo ask never falls back to a text message: the
+                    # buttons would be lost and a text copy would duplicate
+                    # the ask. Fail instead with no delivered copy.
+                    return self.receipt(reason='telegram_rejected_not_sent_' + str(data['error_code']))
                 # A stuck-report must not silently vanish: fall back to a text
                 # message carrying the same content plus the rejection reason.
                 # The fallback is always plain: the markup is unproven here.
@@ -2325,18 +2386,20 @@ class Bridge:
             if error:
                 return self.receipt(reason=error)
             request = dict(request, keyboard=rows)
-        if attachment is not None:
-            error = self._attachment_error(attachment, text, visible)
-            if error:
-                return self.receipt(reason=error)
         ask_ids = [ask_id for row in rows or () for ask_id, _ in
                    (self._ask_choice(button['callback_data']) or (None, None) for button in row)
                    if ask_id is not None]
         ask_ids = list(dict.fromkeys(ask_ids))
-        # D1: keyboards go on text sends only. Any keyboard together with
-        # any attachment is refused before anything is recorded or sent.
+        # P1: a keyboard may go with no attachment or with exactly one photo;
+        # any other attachment kind (or more than one) refuses the send as
+        # invalid_keyboard before anything is recorded or sent.
         if rows is not None and attachment is not None:
-            return self.receipt(reason='invalid_keyboard')
+            if not (isinstance(attachment, dict) and attachment.get('kind') == 'photo'):
+                return self.receipt(reason='invalid_keyboard')
+        if attachment is not None:
+            error = self._attachment_error(attachment, text, visible)
+            if error:
+                return self.receipt(reason=error)
         # Every ask button names the send's own derived id: a valid shape
         # under another key (or another ask's id) is refused before anything
         # is recorded, so a reused ask id can never silently rebind the
@@ -2344,26 +2407,32 @@ class Bridge:
         if any(ask_id != self._ask_id_for_key(key) for ask_id in ask_ids):
             return self.receipt(reason='invalid_keyboard')
         if ask_ids:
-            # Answering appends '\n✓ <label>' to the question, so a question
-            # already at Telegram's 4096-unit text limit would make every edit
-            # overlong and the ask unanswerable. Refuse while the longest
-            # choice still fits nowhere, rather than send buttons no tap can
-            # complete.
+            # Answering appends '\n✓ <label>' to the question (the caption for
+            # a photo ask), so a question already at the limit would make
+            # every edit overlong and the ask unanswerable. Refuse while the
+            # longest choice still fits nowhere, rather than send buttons no
+            # tap can complete: 1024 units of caption for a photo ask, 4096
+            # units of text otherwise.
             longest = max((button['text'] for row in rows for button in row
                            if (self._ask_choice(button['callback_data']) or (None,))[0] in ask_ids),
                           default='')
-            if utf16_units(visible + '\n✓ ' + longest) > 4096:
+            limit = 1024 if attachment is not None else 4096
+            if utf16_units(visible + '\n✓ ' + longest) > limit:
                 return self.receipt(reason='invalid_keyboard')
         def deliver(pending):
             if rows is not None:
                 # Recorded before Telegram is contacted, so a press can only
                 # ever resolve against a sent ask; the sent message id follows
-                # once the send is confirmed.
+                # once the send is confirmed. A photo ask records kind photo
+                # with its caption as the question.
+                kind = 'photo' if attachment is not None else 'text'
                 for ask_id in ask_ids:
                     self.store.record_ask(ask_id, text, fmt, [button for row in rows for button in row
-                                                             if (self._ask_choice(button['callback_data']) or (None,))[0] == ask_id])
+                                                             if (self._ask_choice(button['callback_data']) or (None,))[0] == ask_id],
+                                          kind)
             if attachment is not None:
-                receipt = self._deliver_attachment(attachment, text, reply, pending, plain)
+                extra = {'reply_markup': {'inline_keyboard': rows}} if rows is not None else None
+                receipt = self._deliver_attachment(attachment, text, reply, pending, plain, extra=extra)
             else:
                 extra = {'reply_markup': {'inline_keyboard': rows}} if rows is not None else None
                 receipt = self._deliver_text(text, reply, pending, plain, extra=extra)

@@ -1617,6 +1617,8 @@ class AskTests(BridgeTestCase):
             return 200, dict(ok=True, result=dict(message_id=77, chat=dict(id=123)))
         if url.endswith('/editMessageText'):
             return 200, dict(ok=True, result=dict(message_id=body['message_id'], chat=dict(id=123)))
+        if url.endswith('/editMessageCaption'):
+            return 200, dict(ok=True, result=dict(message_id=body['message_id'], chat=dict(id=123)))
         if url.endswith('/answerCallbackQuery'):
             return 200, dict(ok=True, result=True)
         return 200, self.accepted(body['message'])
@@ -1855,8 +1857,8 @@ class AskTests(BridgeTestCase):
         [relayed] = [body for url, body in self.calls if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
         self.assertEqual(relayed['message']['text'], '[ask answer | question: Pick one | choice: Yes | message: 77]')
 
-    def test_ask_keyboard_with_any_attachment_is_refused(self):
-        for kind in ('photo', 'video', 'document', 'voice', 'video_note'):
+    def test_ask_keyboard_with_non_photo_attachment_is_refused(self):
+        for kind in ('video', 'document', 'voice', 'video_note'):
             with self.subTest(kind=kind):
                 calls_before = len(self.calls)
                 multipart_before = len(self.multipart_calls)
@@ -1874,13 +1876,13 @@ class AskTests(BridgeTestCase):
             self.assertEqual(db.execute('SELECT count(*) FROM deliveries').fetchone()[0], 0)
             self.assertEqual(db.execute('SELECT count(*) FROM asks').fetchone()[0], 0)
 
-    def test_command_keyboard_with_any_attachment_is_refused(self):
+    def test_command_keyboard_with_non_photo_attachment_is_refused(self):
         self.bridge = b.Bridge(dict(self.config, commands=(dict(name='deploy', callback_prefix='deploy:'),)),
                                self.store, 'SECRET', 'CAPABILITY',
                                request=self.transport, request_multipart=self.multipart_transport,
                                request_download=self.download_transport)
         command_keyboard = [[dict(text='Go', callback_data='deploy:go')]]
-        for kind in ('photo', 'video', 'document', 'voice', 'video_note'):
+        for kind in ('video', 'document', 'voice', 'video_note'):
             with self.subTest(kind=kind):
                 calls_before = len(self.calls)
                 multipart_before = len(self.multipart_calls)
@@ -1898,10 +1900,10 @@ class AskTests(BridgeTestCase):
             self.assertEqual(db.execute('SELECT count(*) FROM deliveries').fetchone()[0], 0)
             self.assertEqual(db.execute('SELECT count(*) FROM asks').fetchone()[0], 0)
 
-    def test_keyboard_file_with_attachment_refuses_ask_before_telegram(self):
+    def test_keyboard_file_with_non_photo_attachment_refuses_ask_before_telegram(self):
         keyboard_path = Path(self.tmp.name) / 'd1-keyboard.json'
         keyboard_path.write_text(json.dumps(self.keyboard('d1-kb')))
-        attachment_path = self.attachment_file('d1-photo.bin')
+        attachment_path = self.attachment_file('d1-document.bin')
         parser = b._build_parser()
         args = parser.parse_args(['send', '--body-file', 'x.txt', '--idempotency-key', 'd1-kb',
                                   '--keyboard-file', str(keyboard_path),
@@ -1930,6 +1932,216 @@ class AskTests(BridgeTestCase):
         self.assertEqual(refused['metadata']['reason'], 'invalid_keyboard')
         fitting = self.bridge.publish(self.ask(key='room-ask', text='q' * 4080))
         self.assertTrue(fitting['delivered'])
+
+    def photo_ask(self, key='photo-ask-1', caption='Pick one?', keyboard=None):
+        request = self.publish(key=key, text=caption)
+        request['keyboard'] = self.keyboard(key) if keyboard is None else keyboard
+        request['attachment'] = dict(path=self.attachment_file(f'{key}.png'), kind='photo')
+        return request
+
+    def test_photo_ask_records_kind_photo_and_sends_reply_markup_with_photo(self):
+        request = self.photo_ask()
+        result = self.bridge.publish(request)
+        self.assertTrue(result['delivered'])
+        self.assertEqual(result['message_id'], '88')
+        self.assertEqual(len(self.multipart_calls), 1)
+        url, fields, file_field, file_path = self.multipart_calls[0]
+        self.assertTrue(url.endswith('/sendPhoto'))
+        self.assertEqual(file_field, 'photo')
+        self.assertEqual(fields['caption'], 'Pick one?')
+        self.assertEqual(json.loads(fields['reply_markup']), {'inline_keyboard': self.keyboard('photo-ask-1')})
+        self.assertEqual(self.calls, [])
+        ask = self.bridge.store.get_ask(self.ask_id('photo-ask-1'))
+        self.assertEqual(ask['kind'], 'photo')
+        self.assertEqual(ask['question'], 'Pick one?')
+        self.assertEqual(ask['options'], self.keyboard('photo-ask-1')[0])
+        self.assertEqual(ask['message_id'], 88)
+        self.assertFalse(ask['answered'])
+
+    def test_photo_ask_tap_edits_caption_and_relays_once(self):
+        self.assertTrue(self.bridge.publish(self.photo_ask())['delivered'])
+        self.bridge.drain([self.press(uid=41, key='photo-ask-1', message_id=88)])
+        [relayed] = [body for url, body in self.calls
+                     if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
+        self.assertEqual(relayed['message']['provider_message_id'], f'ask-{self.ask_id("photo-ask-1")}')
+        self.assertEqual(relayed['message']['text'],
+                         '[ask answer | question: Pick one? | choice: Yes | message: 88]')
+        [edit] = self.sent('editMessageCaption')
+        self.assertEqual(edit['caption'], 'Pick one?\n✓ Yes')
+        self.assertEqual(edit['message_id'], 88)
+        self.assertEqual(edit['reply_markup'], {'inline_keyboard': []})
+        self.assertEqual(self.sent('editMessageText'), [])
+        self.assertEqual(self.sent('answerCallbackQuery'), [dict(callback_query_id='query-41')])
+        ask = self.bridge.store.get_ask(self.ask_id('photo-ask-1'))
+        self.assertTrue(ask['answered'])
+        self.assertTrue(ask['relayed'])
+        self.assertEqual(ask['answer'], 'Yes')
+        self.assertEqual(ask['kind'], 'photo')
+        self.assertEqual(self.store.offset(), 42)
+
+    def test_photo_ask_ambiguous_caption_edit_still_relays_once(self):
+        for mode in ('timeout', '5xx'):
+            with self.subTest(mode=mode):
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                path = Path(tmp.name) / 'state.sqlite3'
+                store = b.Store(str(path), 10)
+                bridge = b.Bridge(self.config, store, 'SECRET', 'CAPABILITY',
+                                  request=self.ask_transport, request_multipart=self.multipart_transport,
+                                  request_download=self.download_transport)
+
+                def transport(url, body, *args, _mode=mode, _bridge=bridge, **kwargs):
+                    if url.endswith('/editMessageCaption'):
+                        self.calls.append((url, body))
+                        if _mode == 'timeout':
+                            raise b.TransportError('timeout after send; outcome unconfirmed')
+                        return 500, dict(ok=False, error_code=500, description='Internal Server Error')
+                    return self.ask_transport(url, body)
+                bridge.request = transport
+                calls_before = len(self.calls)
+                multipart_before = len(self.multipart_calls)
+                key = f'photo-ambiguous-{mode}'
+                request = self.publish(key=key, text='Pick one?')
+                request['keyboard'] = self.keyboard(key)
+                attachment_path = self.attachment_file(f'{key}.png')
+                request['attachment'] = dict(path=attachment_path, kind='photo')
+                self.assertTrue(bridge.publish(request)['delivered'])
+                with patch('sys.stderr', new_callable=io.StringIO):
+                    bridge.drain([self.press(uid=41, key=key, message_id=88)])
+                inbounds = [body for url, body in self.calls[calls_before:]
+                            if url == bridge.base + '/v0/city/test-city/extmsg/inbound']
+                self.assertEqual(len(inbounds), 1)
+                self.assertEqual(inbounds[0]['message']['provider_message_id'], f'ask-{self.ask_id(key)}')
+                ask = store.get_ask(self.ask_id(key))
+                self.assertTrue(ask['answered'])
+                self.assertTrue(ask['relayed'])
+                self.assertEqual(store.offset(), 42)
+                before = list(self.calls)
+                bridge.inbound(self.press(uid=41, key=key, message_id=88))
+                self.assertEqual(self.calls, before)
+                self.assertEqual(len(self.multipart_calls), multipart_before + 1)
+
+    def test_photo_ask_html_caption_edit_fallback_appends_choice_in_plain(self):
+        def transport(url, body, *args, **kwargs):
+            if url.endswith('/editMessageCaption') and body.get('parse_mode') == 'HTML':
+                self.calls.append((url, body))
+                return 400, dict(ok=False, error_code=400,
+                                 description="Bad Request: can't parse entities: x")
+            return self.ask_transport(url, body)
+        self.bridge.request = transport
+        key = 'photo-html-edit'
+        request = self.photo_ask(key=key, caption='<b>Pick</b> one')
+        request['format'] = 'html'
+        self.assertTrue(self.bridge.publish(request)['delivered'])
+        self.bridge.drain([self.press(uid=41, key=key, message_id=88)])
+        edits = self.sent('editMessageCaption')
+        self.assertEqual(len(edits), 2)
+        self.assertEqual(edits[0]['parse_mode'], 'HTML')
+        self.assertEqual(edits[0]['caption'], '<b>Pick</b> one\n✓ Yes')
+        self.assertEqual(edits[0]['reply_markup'], {'inline_keyboard': []})
+        self.assertNotIn('parse_mode', edits[1])
+        self.assertEqual(edits[1]['caption'], 'Pick one\n✓ Yes')
+        self.assertEqual(edits[1]['reply_markup'], {'inline_keyboard': []})
+        [relayed] = [body for url, body in self.calls
+                     if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
+        self.assertEqual(relayed['message']['provider_message_id'], f'ask-{self.ask_id(key)}')
+        self.assertEqual(relayed['message']['text'],
+                         '[ask answer | question: Pick one | choice: Yes | message: 88]')
+        self.assertEqual(self.store.offset(), 42)
+
+    def test_photo_ask_rejected_caption_edit_still_relays_once(self):
+        def transport(url, body, *args, **kwargs):
+            if url.endswith('/editMessageCaption'):
+                self.calls.append((url, body))
+                return 400, dict(ok=False, error_code=400,
+                                 description='Bad Request: message to edit not found')
+            return self.ask_transport(url, body)
+        self.bridge.request = transport
+        key = 'photo-rejected-edit'
+        self.assertTrue(self.bridge.publish(self.photo_ask(key=key))['delivered'])
+        with patch('sys.stderr', new_callable=io.StringIO):
+            self.bridge.drain([self.press(uid=41, key=key, message_id=88)])
+        [relayed] = [body for url, body in self.calls
+                     if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
+        self.assertEqual(relayed['message']['provider_message_id'], f'ask-{self.ask_id(key)}')
+        self.assertEqual(relayed['message']['text'],
+                         '[ask answer | question: Pick one? | choice: Yes | message: 88]')
+        self.assertEqual(len(self.sent('editMessageCaption')), 1)
+        ask = self.bridge.store.get_ask(self.ask_id(key))
+        self.assertTrue(ask['answered'])
+        self.assertTrue(ask['relayed'])
+        self.assertEqual(ask['answer'], 'Yes')
+        self.assertEqual(self.store.offset(), 42)
+        before = list(self.calls)
+        self.bridge.inbound(self.press(uid=41, key=key, message_id=88))
+        self.assertEqual(self.calls, before)
+
+    def test_photo_ask_caption_without_room_for_choice_refuses(self):
+        refused = self.bridge.publish(self.photo_ask(key='photo-long', caption='q' * 1022))
+        self.assertFalse(refused['delivered'])
+        self.assertEqual(refused['metadata']['reason'], 'invalid_keyboard')
+        self.assertEqual(self.multipart_calls, [])
+        self.assertIsNone(self.bridge.store.get_ask(self.ask_id('photo-long')))
+        fitting = self.bridge.publish(self.photo_ask(key='photo-room', caption='q' * 1000))
+        self.assertTrue(fitting['delivered'])
+
+    def test_photo_ask_rejected_photo_fails_without_text_fallback(self):
+        def multipart_reject(url, fields, file_field, file_path, timeout=20):
+            self.multipart_calls.append((url, fields, file_field, file_path))
+            return 400, dict(ok=False, error_code=400, description='Bad Request: PHOTO_INVALID_DIMENSIONS')
+        self.bridge.request_multipart = multipart_reject
+        result = self.bridge.publish(self.photo_ask(key='photo-reject'))
+        self.assertFalse(result['delivered'])
+        self.assertEqual(result['metadata']['reason'], 'telegram_rejected_not_sent_400')
+        self.assertEqual(len(self.multipart_calls), 1)
+        self.assertEqual(self.calls, [])
+        ask = self.bridge.store.get_ask(self.ask_id('photo-reject'))
+        self.assertIsNotNone(ask)
+        self.assertIsNone(ask['message_id'])
+        self.assertEqual(ask['kind'], 'photo')
+
+    def test_photo_ask_html_fallback_keeps_keyboard(self):
+        state = dict(left=1)
+
+        def multipart(url, fields, file_field, file_path, timeout=20):
+            self.multipart_calls.append((url, fields, file_field, file_path))
+            if fields.get('parse_mode') == 'HTML' and state['left'] > 0:
+                state['left'] -= 1
+                return 400, dict(ok=False, error_code=400,
+                                 description="Bad Request: can't parse entities: x")
+            return 200, dict(ok=True, result=dict(message_id=88, chat=dict(id=123)))
+        self.bridge.request_multipart = multipart
+        key = 'photo-html'
+        request = self.photo_ask(key=key, caption='<b>Pick</b> one')
+        request['format'] = 'html'
+        result = self.bridge.publish(request)
+        self.assertTrue(result['delivered'])
+        self.assertEqual(result['format_fallback_reason'], 'telegram_html_parse_rejected_400')
+        self.assertEqual(len(self.multipart_calls), 2)
+        for _, fields, _, _ in self.multipart_calls:
+            self.assertEqual(json.loads(fields['reply_markup']), {'inline_keyboard': self.keyboard(key)})
+        self.assertEqual(self.multipart_calls[0][1]['parse_mode'], 'HTML')
+        self.assertNotIn('parse_mode', self.multipart_calls[1][1])
+        self.bridge.drain([self.press(uid=41, key=key, message_id=88)])
+        [edit] = self.sent('editMessageCaption')
+        self.assertEqual(edit['parse_mode'], 'HTML')
+        self.assertEqual(edit['caption'], '<b>Pick</b> one\n✓ Yes')
+        [relayed] = [body for url, body in self.calls
+                     if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
+        self.assertEqual(relayed['message']['text'],
+                         '[ask answer | question: Pick one | choice: Yes | message: 88]')
+
+    def test_photo_ask_second_tap_gets_already_answered(self):
+        self.assertTrue(self.bridge.publish(self.photo_ask(key='photo-twice'))['delivered'])
+        self.bridge.drain([self.press(uid=41, key='photo-twice', message_id=88)])
+        self.bridge.drain([self.press(uid=43, key='photo-twice', choice='no', message_id=88)])
+        inbounds = [body for url, body in self.calls
+                    if url == self.bridge.base + '/v0/city/test-city/extmsg/inbound']
+        self.assertEqual(len(inbounds), 1)
+        self.assertEqual(len(self.sent('editMessageCaption')), 1)
+        self.assertEqual(self.sent('answerCallbackQuery'),
+                         [dict(callback_query_id='query-41'),
+                          dict(callback_query_id='query-43', text='Already answered')])
 
     def test_ambiguous_ask_edit_still_relays_once_timeout(self):
         def transport(url, body, *args, **kwargs):

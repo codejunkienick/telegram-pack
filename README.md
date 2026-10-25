@@ -24,7 +24,8 @@ itself.
 - The paired user gets a slash command menu, and a city adds commands
   through its own handler programs that answer with text and inline
   buttons and need no enable flag.
-- The paired user answers a mayor ask by tapping one of its inline
+- The paired user answers a mayor ask on a text message or on one photo
+  message (the caption is the question) by tapping one of its inline
   buttons instead of typing: one tap reaches the mayor once as one
   actionable message, and the ask message then shows the choice.
 - Each city gets its own bot, settings file, bridge process and delivery

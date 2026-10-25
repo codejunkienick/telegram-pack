@@ -377,17 +377,37 @@ before. `send` and `reply-current` take `--keyboard-file <path>` holding the
 rows as JSON; a keyboard send publishes directly in this process through the
 shared ledger, never through GC's relay (like an attachment or HTML send).
 
+A mayor ask may be one photo whose caption is the question, with the same
+buttons; a tap answers it exactly as a text ask is answered, and the caption
+then shows the choice.
+
 Ask buttons use the one bridge-owned prefix `ask:`, with `callback_data`
 `ask:<ask-id>:<choice>` within 64 bytes. `<ask-id>` is derived from the
 send's idempotency key (the first 16 hex characters of its SHA-256), so one
 ask belongs to one logical send; each question of a multi-question ask goes
 out as its own message with its own key and keyboard.
 
-D1 Keyboards go on text sends only: a keyboard together with any attachment
-(photo, video, document, voice, video note) refuses the send as
-`invalid_keyboard` before anything is recorded or sent, through `publish()`
-and through `send` and `reply-current` with `--keyboard-file` plus
-`--attachment`. There is no media-ask path.
+P1 A keyboard may go with no attachment or with exactly one photo; any other
+attachment kind (or more than one) refuses the send as `invalid_keyboard`
+before anything is recorded or sent, through `publish()` and through `send`
+and `reply-current` with `--keyboard-file` plus `--attachment`. Every other
+attachment kind stays refused.
+
+P2 A photo ask's question is its caption. The A5 room rule for a photo ask
+uses 1024 UTF-16 units of caption. The ledger records each ask's kind, text or
+photo.
+
+P3 A2 step 4 for a photo ask is editMessageCaption (append `\n✓ <label>` to
+the caption, remove the buttons) under the same per-ask key; everything else
+of A1-A5 is unchanged: record, relay with provider message id
+`ask-<ask-id>`, then edit; the edit outcome never holds the offset, never
+un-answers and never relays again.
+
+P4 A photo ask never falls back to a text message: when Telegram rejects the
+photo for anything but an HTML parse error, the send fails (no sendMessage
+without the photo, no `delivered`), so the ask is never recorded as sent
+without its buttons. The HTML parse-rejection fallback re-sends the photo
+once without `parse_mode`, keeping the keyboard (as for text).
 
 A1 A valid press names an existing ask, the message the ask was sent as, an
 authorised user and one of the ask's options; anything else keeps the
@@ -398,10 +418,11 @@ A2 On the first valid press, in order: (1) answer the callback once (key
 the choice and the update id; (3) relay exactly one durable inbound entry
 naming the question, the option and the original message id, with provider
 message id `ask-<ask-id>`, and record the ask as relayed once GC confirms it;
-(4) only then attempt the edit that appends `\n✓ <label>` and removes the
-buttons, under the per-ask key `ask:<ask-id>:edit`. The offset advances once
-the relay is confirmed; the edit outcome (confirmed, rejected or ambiguous)
-never holds it, un-answers or relays again.
+(4) only then attempt the edit that appends `\n✓ <label>` to the text or
+caption and removes the buttons, under the per-ask key `ask:<ask-id>:edit`
+(editMessageText for a text ask, editMessageCaption for a photo ask). The
+offset advances once the relay is confirmed; the edit outcome (confirmed,
+rejected or ambiguous) never holds it, un-answers or relays again.
 
 A3 When GC does not confirm the relay the offset is retained and the retry
 relays once under the same provider id, records relayed, then edits; the
@@ -410,10 +431,10 @@ callback is answered no second time and the edit happens at most once.
 A4 A later press on an answered ask (any other update id) gets only the
 already-answered answer; nothing is relayed or edited.
 
-A5 The send-time refusals stay as they are for text: the ask id must be the
-send's derived id, two buttons may not share `callback_data`, and the question
-must leave room for `\n✓ <label>` of its longest option within 4096 UTF-16
-units.
+A5 The send-time refusals: the ask id must be the send's derived id, two
+buttons may not share `callback_data`, and the question must leave room for
+`\n✓ <label>` of its longest option within 4096 UTF-16 units of text, or
+1024 UTF-16 units of caption for a photo ask.
 
 An ask button whose id is not the send's derived id refuses the send
 (`invalid_keyboard`), so a reused id can never silently rebind the first
@@ -422,17 +443,19 @@ question, options and message to a second send. Two buttons sharing one
 ever match the first, so the second label could never be relayed. A question
 with no room left for the appended choice refuses the send
 (`invalid_keyboard`), since no tap could complete it. The bridge records each
-ask in the ledger before the send is confirmed (ask id, question text,
-ordered options, sent message id, answered flag). A `[[command]]`
-`callback_prefix` equal to or overlapping `ask:` refuses at load, and handler
-output using `ask:` data is a `foreign_callback_data` failure: no press,
-handler output or settings value can send a second copy of an answer.
+ask in the ledger before the send is confirmed (ask id, question text or
+caption, ordered options, sent message id, answered flag, kind text or
+photo). A `[[command]]` `callback_prefix` equal to or overlapping `ask:`
+refuses at load, and handler output using `ask:` data is a
+`foreign_callback_data` failure: no press, handler output or settings value
+can send a second copy of an answer.
 
 A replayed update changes nothing: saved receipts stand. Unregistered,
 malformed or unauthorised presses keep the drop-and-answer-empty behaviour
 and never reach the mayor. The HTML parse-rejection fallback re-sends once
-without `parse_mode` under the same key and keeps the keyboard; an ask edit
-rejected the same way falls back to the plain question with the choice
+without `parse_mode` under the same key and keeps the keyboard (the photo
+once without `parse_mode`, keeping the keyboard, for a photo ask); an ask
+edit rejected the same way falls back to the plain question with the choice
 appended.
 
 ## Send and receive
@@ -509,7 +532,9 @@ settings file, the bot token, the callback secret, the GC API token
 file or the ledger is refused before Telegram is contacted
 (`attachment_path_is_a_bridge_credential`). A file Telegram rejects falls back to one
 plain text message carrying the caption (if any) and
-`[attachment rejected: <reason>]`; the send carries no keyboard (D1).
+`[attachment rejected: <reason>]`; the send carries no keyboard (P1). A photo
+ask with a keyboard never takes this fallback: a rejected photo fails the
+send instead, so the ask is never recorded as sent without its buttons.
 
 Inbound must receive a matching durable native GC transcript entry and a route
 to the configured `agent` (default `mayor`) before advancing the SQLite offset.
