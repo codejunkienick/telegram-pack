@@ -44,7 +44,9 @@ Which command: `gc telegram reply-current` once the city imports this pack and i
   `telegram-formatting` skill, "Topics"): `--conversation-id` exactly as
   the notice names it answers in that message's topic, `--topic <name>`
   posts into a project's topic, and neither sends to the main chat. A
-  rejected file's text fallback lands in the same topic.
+  rejected file's text fallback lands in the same topic; in a topic the user
+  created a rejected file or album has no text fallback and just comes back
+  rejected.
 
 ## Files the user sends
 

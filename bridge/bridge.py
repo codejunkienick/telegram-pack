@@ -3113,14 +3113,16 @@ class Bridge:
         except TransportError:
             return pending
 
-    def _deliver_attachment(self, attachment, text, reply, pending, plain=None, extra=None):
+    def _deliver_attachment(self, attachment, text, reply, pending, plain=None, extra=None, text_fallback=True):
         """Send one attachment; `extra` carries the keyboard reply_markup for a
         photo ask, a silent send's disable_notification and a topic's
         message_thread_id, which both fallbacks keep. The HTML parse-rejection
         fallback re-sends the same file once without markup, keeping the
         keyboard. A keyboard send never
         falls back to a text message: a rejected photo ask fails instead, so
-        the ask is never recorded as sent without its buttons."""
+        the ask is never recorded as sent without its buttons. Without
+        `text_fallback` (a topic the user created, which may be deleted)
+        no rejected file falls back to a text message either."""
         method, field, _ = self.ATTACHMENT_KINDS[attachment['kind']]
         fields = {'chat_id': str(self.config['chat_id'])}
         if attachment['kind'] not in self.CAPTIONLESS_KINDS:
@@ -3143,15 +3145,18 @@ class Bridge:
             if plain is not None and self._html_rejected(data):
                 # Same file, same caption text without markup, once, keeping
                 # the keyboard for a photo ask.
-                receipt = self._deliver_attachment(attachment, plain, reply, pending, extra=extra)
+                receipt = self._deliver_attachment(attachment, plain, reply, pending, extra=extra,
+                                                   text_fallback=text_fallback)
                 if receipt is not pending:
                     receipt['format_fallback_reason'] = 'telegram_html_parse_rejected_400'
                 return receipt
             if data.get('ok') is False and 400 <= data.get('error_code', 0) < 500:
-                if extra and 'reply_markup' in extra:
+                if (extra and 'reply_markup' in extra) or not text_fallback:
                     # A photo ask never falls back to a text message: the
                     # buttons would be lost and a text copy would duplicate
-                    # the ask. Fail instead with no delivered copy.
+                    # the ask. Fail instead with no delivered copy. Nor does a
+                    # send into a user-created topic: a deleted one rejects
+                    # every send, so the text would be a second request into it.
                     return self.receipt(reason='telegram_rejected_not_sent_' + str(data['error_code']))
                 # A stuck-report must not silently vanish: fall back to a text
                 # message carrying the same content plus the rejection reason.
@@ -3188,14 +3193,16 @@ class Bridge:
                 return error
         return None
 
-    def _deliver_album(self, attachments, text, reply, pending, plain=None, extra=None):
+    def _deliver_album(self, attachments, text, reply, pending, plain=None, extra=None, text_fallback=True):
         """Send 2-10 files as one sendMediaGroup album, the body as the first
         item's caption (none when empty). Confirmed only by one Message per
         file, each in the paired chat; the receipt names the first message
         and all of them in order. The HTML parse-rejection fallback re-sends
         the album once with the plain caption; any other 4xx falls back to
-        one plain text message, like a rejected attachment. `extra` carries
-        a silent send's disable_notification and a topic's message_thread_id."""
+        one plain text message, like a rejected attachment, except without
+        `text_fallback` (a user-created topic), where it fails. `extra`
+        carries a silent send's disable_notification and a topic's
+        message_thread_id."""
         media, files = [], []
         for index, item in enumerate(attachments):
             entry = {'type': item['kind'], 'media': f'attach://file{index}'}
@@ -3223,12 +3230,15 @@ class Bridge:
                 ids = [str(message['message_id']) for message in sent]
                 return self.receipt(True, message_id=ids[0], message_ids=ids)
             if plain is not None and self._html_rejected(data):
-                receipt = self._deliver_album(attachments, plain, reply, pending, extra=extra)
+                receipt = self._deliver_album(attachments, plain, reply, pending, extra=extra,
+                                              text_fallback=text_fallback)
                 if receipt is not pending:
                     receipt['format_fallback_reason'] = 'telegram_html_parse_rejected_400'
                 return receipt
             if data.get('ok') is False and 400 <= data.get('error_code', 0) < 500:
                 reason = 'telegram_rejected_not_sent_' + str(data['error_code'])
+                if not text_fallback:
+                    return self.receipt(reason=reason)
                 return self._fallback_to_text(text if plain is None else plain, reply, reason, pending,
                                               extra=extra, what='album')
             return pending
@@ -3238,20 +3248,24 @@ class Bridge:
             return pending
 
     def publish(self, request):
-        """Send one request on the paired chat's conversation or on a
-        configured, recorded topic's (OPERATIONS.md, "Topics"); any other
-        conversation is recipient_not_authorized. In a topic every Telegram
-        request of the send carries the topic's message_thread_id, and the
-        receipt names the topic's conversation."""
+        """Send one request on the paired chat's conversation, on a
+        configured, recorded topic's or on a served auto topic's, bound or
+        not (OPERATIONS.md, "Topics"); any other conversation is
+        recipient_not_authorized. In a topic every Telegram request of the
+        send carries the topic's message_thread_id, and the receipt names the
+        topic's conversation. In an auto topic a rejected file or album
+        fails with no text fallback: the user may have deleted the topic."""
         conversation = request.get('conversation')
         if conversation == self.conversation:
             return self._publish(request)
-        topic = next((topic for topic in self._recorded_topics() if topic['conversation'] == conversation), None)
+        topic = next((topic for topic in self._sendable_topics() if topic['conversation'] == conversation), None)
         if topic is None:
             return self.receipt(reason='recipient_not_authorized')
-        return dict(self._publish(request, topic['thread_id']), conversation=topic['conversation'])
+        # Only served auto topics carry a display_name.
+        receipt = self._publish(request, topic['thread_id'], text_fallback='display_name' not in topic)
+        return dict(receipt, conversation=topic['conversation'])
 
-    def _publish(self, request, thread_id=None):
+    def _publish(self, request, thread_id=None, text_fallback=True):
         key, text = request.get('idempotency_key'), request.get('text')
         if not isinstance(key, str) or not key.strip() or len(key) > 256:
             return self.receipt(reason='stable_idempotency_key_required')
@@ -3382,9 +3396,11 @@ class Bridge:
             if thread_id is not None:
                 extra['message_thread_id'] = thread_id
             if attachments is not None:
-                receipt = self._deliver_album(attachments, text, reply, pending, plain, extra=extra or None)
+                receipt = self._deliver_album(attachments, text, reply, pending, plain, extra=extra or None,
+                                              text_fallback=text_fallback)
             elif attachment is not None:
-                receipt = self._deliver_attachment(attachment, text, reply, pending, plain, extra=extra or None)
+                receipt = self._deliver_attachment(attachment, text, reply, pending, plain, extra=extra or None,
+                                                   text_fallback=text_fallback)
             else:
                 receipt = self._deliver_text(text, reply, pending, plain, extra=extra or None)
             if rows is not None and receipt.get('delivered') and receipt.get('message_id'):
@@ -3611,6 +3627,14 @@ class Bridge:
         return [dict(topic, thread_id=rows[topic['name']], conversation=self.topic_conversation(rows[topic['name']]))
                 for topic in self.topic_settings if topic['name'] in rows]
 
+    def _sendable_topics(self):
+        """The topics a send may name, each with thread_id and conversation:
+        the configured, recorded topics, then the served auto topics (none
+        with [auto_topics] off), read lazily so a match among the first
+        reads no auto row."""
+        yield from self._recorded_topics()
+        yield from self.served_auto_topics()
+
     def topic_by_thread(self, thread_id):
         """The configured, recorded topic with this thread id, or None."""
         return next((topic for topic in self._recorded_topics() if topic['thread_id'] == thread_id), None)
@@ -3651,8 +3675,8 @@ class Bridge:
 
     def conversation_for_id(self, conversation_id):
         """The ref of a conversation id this bridge serves: the paired chat's
-        own ref for <chat_id>, a configured, recorded topic's ref for
-        <chat_id>:topic:<thread_id>, else None."""
+        own ref for <chat_id>, a configured, recorded topic's or a served auto
+        topic's ref for <chat_id>:topic:<thread_id>, else None."""
         chat = str(self.config['chat_id'])
         if conversation_id == chat:
             return self.conversation
@@ -3660,7 +3684,8 @@ class Bridge:
         if isinstance(conversation_id, str) and conversation_id.startswith(prefix):
             thread = conversation_id[len(prefix):]
             if self._THREAD_ID_RE.fullmatch(thread):
-                topic = self.topic_by_thread(int(thread))
+                thread_id = int(thread)
+                topic = next((topic for topic in self._sendable_topics() if topic['thread_id'] == thread_id), None)
                 return topic['conversation'] if topic else None
         return None
 
@@ -4268,9 +4293,9 @@ def _read_keyboard_file(path):
 
 def _outbound_conversation(bridge, args):
     """The conversation a send, reply-current or react goes to: the paired
-    chat's without --conversation-id and --topic, else the configured,
-    recorded topic's or the paired chat's they name (OPERATIONS.md,
-    "Topics")."""
+    chat's without --conversation-id and --topic, else the one they name:
+    --topic a configured, recorded topic's only, --conversation-id also the
+    paired chat's or a served auto topic's (OPERATIONS.md, "Topics")."""
     if args.topic is not None:
         topic = bridge.topic_by_name(args.topic)
         if topic is None:

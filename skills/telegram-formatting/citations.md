@@ -15,6 +15,10 @@ The rows live only here; SKILL.md holds none.
 | pack | bridge/OPERATIONS.md | not bound: reply lands in the main chat | not bound answers in the main chat |
 | pack | bridge/OPERATIONS.md | not configured: reply lands in the main chat | not configured answers in the main chat |
 | pack | bridge/bridge.py | is not configured or not created (run gc telegram topics) | an uncreated topic is refused |
+| pack | bridge/OPERATIONS.md | ### Topics the user creates | topics the user created follow this section |
+| pack | bridge/bridge.py | or f"thread {row['thread_id']}" | an unnamed topic is thread <id> |
+| pack | bridge/OPERATIONS.md | `--topic` names only `[[topic]]` tables | --topic names configured topics only |
+| pack | bridge/OPERATIONS.md | retried and never resent into General | a deleted topic's send is rejected |
 | pack | bridge/OPERATIONS.md | send there, through GC's relay or directly (HTML, silent, a keyboard, | every send kind takes the flags |
 | pack | bridge/OPERATIONS.md | the `[topic: <name>]` line comes before the `[ask answer \| ...]` | a topic ask's answer keeps its line |
 | pack | commands/reply-current/command.toml | --topic <name> sends into a configured topic | reply command flag |

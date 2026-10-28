@@ -655,6 +655,8 @@ plain text message carrying the caption (if any) and
 `[attachment rejected: <reason>]`; the send carries no keyboard (P1). A photo
 ask with a keyboard never takes this fallback: a rejected photo fails the
 send instead, so the ask is never recorded as sent without its buttons.
+Nor does a file sent into a topic the user created ("Renamed and deleted
+topics").
 
 **Albums.** `--attachment` given 2-10 times (on `send` and `reply-current`)
 sends the files as one Telegram album (sendMediaGroup) under one idempotency
@@ -691,7 +693,8 @@ applies to every file; otherwise each kind is inferred per file.
   caption inside the same reservation
   (`format_fallback_reason: telegram_html_parse_rejected_400`); any other
   4xx falls back to one plain text message with the caption and
-  `[album rejected: <reason>]` under the same key. A 5xx, a timeout, a short
+  `[album rejected: <reason>]` under the same key (not in a topic the user
+  created: "Renamed and deleted topics"). A 5xx, a timeout, a short
   or foreign answer stays ambiguous and is never resent; an album that never
   left this host follows the not-sent rule ("Delivery recovery").
 - One attempt has the 20 s send limit, and an upload still running past it
@@ -969,9 +972,10 @@ in a topic, the line after the topic line:
   message ids are unique in a chat, so a fallback relay on the paired chat's
   conversation never meets a General message's id.
 
-**Outbound.** `publish()` accepts the paired chat's conversation or a
-configured topic's with a ledger row, its six fields exactly as above. Any
-other conversation (a thread with no ledger row, one whose name left the
+**Outbound.** `publish()` accepts the paired chat's conversation, a
+configured topic's with a ledger row and, with `[auto_topics]` on, a served
+topic the user created ("Topics the user creates"), its six fields exactly as
+above. Any other conversation (a thread with no row, one whose name left the
 settings, another chat, another kind) is `recipient_not_authorized`, and
 nothing is sent. Every Telegram request of a send on a topic's conversation
 carries the topic's `message_thread_id`: an integer in the JSON body of
@@ -987,8 +991,9 @@ identity, so one key in two conversations is `idempotency_key_conflict`.
   `--conversation-id <chat_id>:topic:<thread_id>`, exactly as the agent's
   notice names it, or `--topic <name>`, a `[[topic]]`'s exact name, and
   send there, through GC's relay or directly (HTML, silent, a keyboard,
-  attachments) alike; `--session` keeps its default. A topic with no ledger
-  row is refused before anything is sent:
+  attachments) alike; `--session` keeps its default. `--conversation-id`
+  also takes a served topic the user created; `--topic` names only a
+  `[[topic]]`. A topic with no ledger row is refused before anything is sent:
   `conversation ID is not the paired private chat or a configured topic`, or
   `topic <name> is not configured or not created (run gc telegram topics)`.
   The two flags together, or `--topic` on another command, is a usage error
@@ -1082,12 +1087,13 @@ stays that target's. GC v1.5.0: the input is
 `internal/api/huma_types_extmsg.go:58-72`; the handler
 (`internal/api/huma_handlers_extmsg.go:211-286`) wants `agent_name` to name a
 configured named-session agent (228-242) and answers a conflict with 409
-(253-262); a bind to the agent already bound is an idempotent rebind
-(`internal/extmsg/binding_service.go:154-156`); the reply is a
-SessionBindingRecord with PascalCase fields (`internal/extmsg/types.go:90-96,
-111-123`). The bind is confirmed only by HTTP 2xx with `AgentName` the agent,
-`SessionID` empty or absent and `Status` `active`; the row's `bound_at` is
-then set. Anything else is not bound for this pass and logs
+(253-262); the bind itself is `internal/extmsg/binding_service.go:101-166`,
+where a bind to the agent already bound is an idempotent rebind (154-156);
+the reply is a SessionBindingRecord with PascalCase fields
+(`internal/extmsg/types.go:90-96, 111-123`). The bind is confirmed only by
+HTTP 2xx with `AgentName` the agent, `SessionID` empty or absent and
+`Status` `active`; the row's `bound_at` is then set. Anything else is not
+bound for this pass and logs
 `auto topic thread <id> not bound (<category>)`:
 
 | category | GC's answer |
@@ -1121,6 +1127,47 @@ settings topic. Voice transcripts, ask answers and city commands in such a
 topic follow "Inbound" with no rule of their own beyond the binding above;
 an ask answer recorded on its conversation relays there under its topic
 line.
+
+**Outbound.** A served topic's conversation, bound or not bound yet, is one
+`publish()` accepts, with the six fields of every topic:
+`<chat_id>:topic:<thread_id>`, parent `<chat_id>`, kind `thread`. Everything
+"Outbound" in "Topics" says of a send in a topic holds for it with no rule
+of its own: every Telegram request carries its `message_thread_id` (text,
+the HTML plain fallback, an ask with buttons, which records its
+conversation, a file, an album, a silent send), the receipt names its
+conversation, the quota notice follows a message accepted on it, typing
+shows in its thread, a city command answers in it, and a pinned slot's
+message stays in General. `send`, `reply-current` and `react` take
+`--conversation-id <chat_id>:topic:<thread_id>` of a served topic, exactly
+as its notice names it. A direct send needs no binding; GC's relay sends
+only on a conversation the sending session is bound to
+(`internal/extmsg/outbound.go:76-99`), which the binding above gives the
+row's agent. `--topic` names only `[[topic]]` tables: a display name is
+refused like any other unknown name. A thread a `topics` row holds follows
+that row's rules. With `[auto_topics]` off, and for a thread with no row,
+nothing changes: the id is refused (`conversation ID is not the paired
+private chat or a configured topic`; `recipient_not_authorized` on the
+callback) and nothing is sent. General, the settings topics and a file
+without `[auto_topics]` send the same request bodies, with the same ledger
+fingerprints and receipts, as before.
+
+**Renamed and deleted topics.** A rename changes only the display name
+(Naming above); the conversation, its binding and the row's agent stay.
+Telegram documents no update for a deleted topic, so the bridge keeps its
+row and binding and serves it as before. A send into it that Telegram
+answers with a 4xx is `telegram_rejected_not_sent_<code>`: not sent, never
+retried and never resent into General; the agent answers in the main chat
+instead. A file or album rejected there therefore takes no text fallback
+("Outbound attachments"): it fails the same way, with one request to Telegram.
+Only the HTML parse fallback, a 400 "can't parse entities", re-sends there.
+
+**Adopting and switching off.** `gc telegram topics --record <name>
+--thread-id <id>` on a served topic's thread adopts it as that `[[topic]]`
+(above): it then relays under the `[[topic]]`'s name and `--topic <name>`
+reaches it, and its auto row stays, unserved. Switching `[auto_topics]` off
+restores the behaviour without it: the threads relay as not configured,
+their conversations are refused for sends, and the bridge binds nothing. The
+rows and bindings stay, unused, and switching it on serves them again.
 
 At daemon start with `[auto_topics]` on, when the start probe's getMe
 reports `allows_users_to_create_topics` or `has_topics_enabled` not true,
@@ -1260,12 +1307,13 @@ row keeps its meaning: the newest accepted message in any conversation). That
 conversation is a topic's `<chat_id>:topic:<thread_id>`, or `<chat_id>` for
 General and for a topic message relayed on the paired chat's conversation
 (not bound, not configured), the conversation its notice names. `react
---conversation-id <id>` (the paired chat's id, or a configured topic's with
-a ledger row) or `react --topic <name>` targets that conversation's last
-accepted message, so an agent answering in a topic reacts to that topic's
-message even when a newer one arrived in another; it refuses with `no
-accepted message to react to in that conversation` when none is recorded,
-and an id or name no configured topic has refuses as `send` does; an empty
+--conversation-id <id>` (the paired chat's id, a configured topic's with
+a ledger row, or a served topic the user created) or `react --topic <name>`
+targets that conversation's last accepted message, so an agent answering in
+a topic reacts to that topic's message even when a newer one arrived in
+another; it refuses with `no accepted message to react to in that
+conversation` when none is recorded, and an id or name `send` refuses is
+refused the same way; an empty
 `--conversation-id`, which `send` reads as the paired chat, refuses as an id
 no configured topic has, so a reaction never guesses its conversation.
 `--message-id`, `--conversation-id` and `--topic` are exclusive (exit 2).

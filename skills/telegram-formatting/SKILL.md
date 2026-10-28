@@ -56,13 +56,17 @@ Which command: `gc telegram reply-current` once the city imports this pack and i
 
 The chat may have topics, one per project, beside General, the main chat
 (`bridge/OPERATIONS.md`, "Topics"). A message written in a topic reaches you
-with `[topic: <name>]` as its first line.
+with `[topic: <name>]` as its first line. A topic the user created in the
+chat reaches you the same way (`[topic: thread <id>]` when Telegram gave it
+no name), when the city serves such topics.
 
 - Answer a message with `--conversation-id` exactly as its notice names it:
   a topic's id (`<chat id>:topic:<thread id>`) answers in that topic, the
   chat id in the main chat.
 - To post unprompted into a project's topic (news, a status, an ask), pass
   `--topic <name>` with the topic's exact name instead; never both flags.
+  `--topic` names only the city's configured topics: answer in a topic the
+  user created with `--conversation-id`.
 - With neither flag the message goes to the main chat (General).
 - A message labelled `not bound` or `not configured`
   (`[topic: <name> | not bound: reply lands in the main chat]`,
@@ -71,6 +75,9 @@ with `[topic: <name>]` as its first line.
   in the main chat.
 - A topic that is not configured or not created yet is refused before
   anything is sent (`topic <name> is not configured or not created`).
+- A send into a topic the user deleted comes back rejected
+  (`telegram_rejected_not_sent_400`) and is not sent anywhere else: answer
+  in the main chat instead.
 - Formatting, silent sends, asks with buttons and files take the same
   flags; the answer to an ask sent in a topic comes back with its topic line.
 

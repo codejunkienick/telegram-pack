@@ -196,7 +196,10 @@ with this pack at `<pack>`:
    `[[topic]]` table per topic to the settings (`settings.example.toml`),
    run `gc telegram topics`, and run each `bind:` line it prints, before
    anyone writes in that topic. Success: a `topic <name>: thread <id>` line
-   for every topic and exit status 0. See `bridge/OPERATIONS.md`, "Topics".
+   for every topic and exit status 0. When the user may create topics too,
+   leave that BotFather setting on and add `[auto_topics]` with
+   `enabled = true`: the bridge then binds and serves each topic the user
+   creates, with no step per topic. See `bridge/OPERATIONS.md`, "Topics".
 5. (shell) `<pack>/install.sh --settings ~/.config/<city>/telegram-bridge.toml`: it
    creates the callback secret and the shared queue directory if they are
    missing. On Linux and WSL 2 it renders
