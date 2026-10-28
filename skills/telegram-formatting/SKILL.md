@@ -83,10 +83,13 @@ reply (`bridge/OPERATIONS.md`, "Reactions").
   received, not read. The bridge sets it by itself when the city turned it on;
   you never need to.
 - Once the work a message asked for is finished or answered, run
-  `gc telegram react --reaction done` (👌 by default). Add
-  `--message-id <id>` when you know the message's id; without it the
-  reaction goes on the user's last message the bridge accepted, so react
-  before the user sends another.
+  `gc telegram react --reaction done` (👌 by default) with
+  `--conversation-id` exactly as the message's notice names it, so the
+  reaction lands on that conversation's last message (a topic's, or the
+  main chat's) even when the user wrote in another topic since. Use
+  `--message-id <id>` instead when you know the message's id; never both
+  flags. With neither, the reaction goes on the user's last message the
+  bridge accepted anywhere, so react before the user sends another.
 - ✅ is not available: Telegram's reaction list has no check mark, and an
   emoji outside it is refused (`telegram_rejected_not_sent_400`).
   `--reaction none` clears the reaction.

@@ -979,6 +979,9 @@ identity, so one key in two conversations is `idempotency_key_conflict`.
 - A pinned slot's message stays in General ("Pinned messages"). Edits,
   reactions, callback answers, pins and unpins act by message id and take no
   thread.
+- `react --conversation-id <id>` or `--topic <name>` reacts to the last
+  message accepted on that conversation ("Reactions"), and "typing..."
+  shows in the thread the user wrote in ("Typing").
 
 Logs name the thread and message ids, never a topic's name or any text.
 
@@ -1100,6 +1103,8 @@ the reaction; it is cosmetic and never retried.
 ```sh
 gc telegram react --reaction done
 python3 <pack>/bridge/bridge.py --settings <settings> react [--message-id <id>] --reaction seen|done|none|<emoji>
+python3 <pack>/bridge/bridge.py --settings <settings> react --conversation-id <id> --reaction done
+python3 <pack>/bridge/bridge.py --settings <settings> react --topic <name> --reaction done
 ```
 
 `seen` and `done` resolve from the settings, `none` clears the reaction (an
@@ -1115,6 +1120,26 @@ outside Telegram's list is a 400), a not-sent call with the not-sent message
 of "Send and receive", each with the `GC_RECEIPT` line on stderr. The pack
 command honours `TELEGRAM_BRIDGE_SETTINGS` like `reply-current`. Reaction
 updates from the user are not polled.
+
+**Reactions in topics** ("Topics"). The accept point also records the
+message as the last accepted message of the conversation GC accepted it on,
+in the ledger table `accepted_conversations` (a conversation id, its newest
+message id and when; an existing ledger gains the table, and its `accepted`
+row keeps its meaning: the newest accepted message in any conversation). That
+conversation is a topic's `<chat_id>:topic:<thread_id>`, or `<chat_id>` for
+General and for a topic message relayed on the paired chat's conversation
+(not bound, not configured), the conversation its notice names. `react
+--conversation-id <id>` (the paired chat's id, or a configured topic's with
+a ledger row) or `react --topic <name>` targets that conversation's last
+accepted message, so an agent answering in a topic reacts to that topic's
+message even when a newer one arrived in another; it refuses with `no
+accepted message to react to in that conversation` when none is recorded,
+and an id or name no configured topic has refuses as `send` does; an empty
+`--conversation-id`, which `send` reads as the paired chat, refuses as an id
+no configured topic has, so a reaction never guesses its conversation.
+`--message-id`, `--conversation-id` and `--topic` are exclusive (exit 2).
+The key, the `setMessageReaction` body and the output line are unchanged,
+and without the two flags `react` is exactly as above.
 
 ## Typing
 
@@ -1163,9 +1188,23 @@ text:
 - `typing_worker_unavailable`: the worker thread could not start when the
   daemon began; the bridge runs without typing until it restarts.
 
-A message accepted after its window ended begins a new window, which logs its
-own first failure. A send seen late can leave "typing..." up to 5 seconds
+A message accepted before its window's end extends it, even while the worker
+is ending the window at that end; one accepted after the window ended begins a
+new window, which logs its own first failure. A send seen late can leave "typing..." up to 5 seconds
 after the reply, until Telegram clears it.
+
+**Typing in topics** ("Topics"). Typing shows where the user wrote: each
+Telegram thread has its own window, opened by a message written in it (a
+topic message relayed on the paired chat's conversation, not bound or not
+configured, still shows typing in its topic) and started, extended and ended
+by the rules above on its own; the worker serves every open window each
+tick. A topic window's chat action is `{"chat_id": <chat_id>, "action":
+"typing", "message_thread_id": <thread_id>}`; General's carries no thread,
+exactly as without topics. The ledger does not record which conversation a
+row belongs to, so any send closes every window open when it was made: a
+reply in one topic also ends "typing..." in another, until that topic's next
+message. A topic window's failure logs `typing not shown (thread <id>):
+<reason>`, once per window.
 
 ## Voice-note transcription
 

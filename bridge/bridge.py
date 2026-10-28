@@ -478,6 +478,11 @@ class Store:
             # the target of `react` without --message-id.
             db.execute('CREATE TABLE IF NOT EXISTS accepted (id INTEGER PRIMARY KEY CHECK (id = 1), '
                        'message_id INTEGER NOT NULL, accepted_at TEXT NOT NULL)')
+            # The same per conversation GC accepted it on (<chat_id>, or a
+            # topic's <chat_id>:topic:<thread_id>): the target of `react
+            # --conversation-id/--topic`. The accepted row keeps its meaning.
+            db.execute('CREATE TABLE IF NOT EXISTS accepted_conversations (conversation_id TEXT PRIMARY KEY, '
+                       'message_id INTEGER NOT NULL, accepted_at TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS pins (slot TEXT PRIMARY KEY, generation INTEGER NOT NULL DEFAULT 1, '
                        'message_id INTEGER, revision INTEGER NOT NULL DEFAULT 0, fingerprint TEXT)')
             # Topics of the paired chat (OPERATIONS.md, "Topics"): each
@@ -608,6 +613,22 @@ class Store:
         """The last accepted message's id, or None when none is recorded."""
         with self.connect() as db:
             row = db.execute('SELECT message_id FROM accepted WHERE id=1').fetchone()
+        return row[0] if row else None
+
+    def record_accepted_in(self, conversation_id, message_id, accepted_at):
+        """Remember the last message accepted on one conversation; a replayed
+        older update never moves it back."""
+        with self.connect() as db:
+            db.execute('INSERT INTO accepted_conversations VALUES (?, ?, ?) ON CONFLICT(conversation_id) DO UPDATE '
+                       'SET message_id=excluded.message_id, accepted_at=excluded.accepted_at '
+                       'WHERE excluded.message_id >= accepted_conversations.message_id',
+                       (conversation_id, message_id, accepted_at))
+
+    def last_accepted_in(self, conversation_id):
+        """The id of the last message accepted on one conversation, or None."""
+        with self.connect() as db:
+            row = db.execute('SELECT message_id FROM accepted_conversations WHERE conversation_id=?',
+                             (conversation_id,)).fetchone()
         return row[0] if row else None
 
     def agent_reacted(self, message_id):
@@ -845,11 +866,13 @@ class Bridge:
         self.reaction_queue = queue.Queue()
         self.reaction_worker = None
         self.reaction_worker_lock = threading.Lock()
-        # The typing window ([typing]): None, or dict(end, mark, due, failed)
-        # under typing_lock; the worker waits on typing_wake between ticks
-        # (tests inject typing_wait, so none sleeps).
+        # The typing windows ([typing]): one dict(thread, end, mark, due,
+        # failed, extended) per Telegram thread of an accepted message
+        # (thread None for General), keyed by thread, under typing_lock; the
+        # worker waits on typing_wake between ticks (tests inject typing_wait,
+        # so none sleeps).
         self.typing_seconds = dict(TYPING_DEFAULTS, **(config.get('typing') or {}))['seconds']
-        self.typing_window = None
+        self.typing_windows = {}
         self.typing_lock = threading.Lock()
         self.typing_wake = threading.Event()
         self.typing_wait = typing_wait or self.typing_wake.wait
@@ -1825,7 +1848,7 @@ class Bridge:
         if type(reply) is not int or reply <= 0 or reply == thread_id:
             reply = None  # in a topic, a reply to its root message is no reply
         conversation = self._relay(mid, str(mid), relay_text, reply, thread_id)
-        self._accepted(mid)
+        self._accepted(mid, conversation['conversation_id'], thread_id)
         # The message above is now durably queued for the mayor but it may be
         # quota-blocked and unable to answer it any time soon; tell the user once
         # per exhaustion episode, on the conversation the message was accepted
@@ -1849,14 +1872,19 @@ class Bridge:
     # setMessageReaction replaces the message's whole reaction list (a bot sets
     # at most one), so a repeat can never stack a second reaction.
 
-    def _accepted(self, mid):
+    def _accepted(self, mid, conversation_id, thread_id):
         """The accept point: GC durably accepted message `mid` from the paired
-        user. Record it as the last accepted message and, with on_accept,
-        queue the seen reaction for the worker, and with [typing] open or
-        extend the typing window. Never raises: the inbound cursor never
-        waits on, or is retained by, a reaction or a chat action."""
+        user on `conversation_id`, written in Telegram thread `thread_id`
+        (None for General; a fallback relay's thread differs from its
+        conversation). Record it as the last accepted message of the chat and
+        of that conversation and, with on_accept, queue the seen reaction for
+        the worker, and with [typing] open or extend the typing window of its
+        thread. Never raises: the inbound cursor never waits on, or is
+        retained by, a reaction or a chat action."""
+        accepted_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
         try:
-            self.store.record_accepted(mid, datetime.datetime.now(datetime.timezone.utc).isoformat())
+            self.store.record_accepted(mid, accepted_at)
+            self.store.record_accepted_in(conversation_id, mid, accepted_at)
         except Exception:  # noqa: BLE001 - the relay already succeeded
             self._log(f'accepted message not recorded (msg {mid})')
         if self.reactions['on_accept']:
@@ -1865,7 +1893,7 @@ class Bridge:
             except Exception:  # noqa: BLE001 - e.g. no thread could start; the relay already succeeded
                 self._log(f'reaction not set (msg {mid}): reaction_worker_unavailable')
         if self.typing_seconds:
-            self._open_typing()
+            self._open_typing(thread_id)
 
     def _enqueue_reaction(self, mid):
         with self.reaction_worker_lock:
@@ -1931,28 +1959,35 @@ class Bridge:
     # ---- typing ([typing]) -----------------------------------------------------
     # sendChatAction delivers nothing to the chat history, so it is the one
     # Telegram call outside the ledger: no key, no row, one attempt, never
-    # retried. One worker (started by run) sends it; the poll loop only opens
-    # the window, and nothing here takes publish_lock.
+    # retried. One worker (started by run) sends it for every open window; the
+    # poll loop only opens windows, and nothing here takes publish_lock.
 
-    def _open_typing(self):
-        """Open the typing window for an accepted message, or extend the open
-        one to `seconds` from now. A window remembers the ledger's newest
-        delivery row when it began; one that already ended, at its end time
-        or by a send, before the worker looked, begins again with a new mark
-        and its own failure log. Never raises."""
+    def _open_typing(self, thread):
+        """Open the typing window of a Telegram thread (None for General) for
+        an accepted message, or extend its open one to `seconds` from now. A
+        window remembers the ledger's newest delivery row when it began; one
+        that already ended, at its end time or by a send, before the worker
+        looked, begins again with a new mark and its own failure log. An
+        extended window stays the same window, so a chat action in flight
+        on it still counts toward its one failure log, and counts its
+        extensions, so an end the worker decided before one leaves it open.
+        Never raises."""
         with self.typing_lock:
-            window = self.typing_window
+            window = self.typing_windows.get(thread)
         now = self.monotonic()
         try:
-            if window is not None and now < window['end'] and not self.store.sent_since(window['mark']):
-                mark, failed = window['mark'], window['failed']
-            else:
-                mark, failed = self.store.deliveries_mark(), False
+            extend = window is not None and now < window['end'] and not self.store.sent_since(window['mark'])
+            mark = None if extend else self.store.deliveries_mark()
         except Exception:  # noqa: BLE001 - the relay already succeeded
-            self._log('typing not shown: ledger_unavailable')
+            self._log(self._typing_line(thread, 'ledger_unavailable'))
             return
         with self.typing_lock:
-            self.typing_window = dict(end=now + self.typing_seconds, mark=mark, due=now, failed=failed)
+            if extend:
+                window.update(end=now + self.typing_seconds, due=now, extended=window['extended'] + 1)
+            else:
+                window = dict(thread=thread, end=now + self.typing_seconds, mark=mark, due=now, failed=False,
+                              extended=0)
+            self.typing_windows[thread] = window
         self.typing_wake.set()
 
     def _start_typing(self):
@@ -1966,50 +2001,58 @@ class Bridge:
 
     def _typing_loop(self):
         """The typing worker: a tick at least every TYPING_TICK seconds, and at
-        once when a message is accepted, until bridge.stop ends the window."""
+        once when a message is accepted, until bridge.stop ends every window."""
         while not self.stop.is_set():
             self.typing_wake.clear()
-            try:
-                self._typing_tick()
-            except Exception:  # noqa: BLE001 - the worker must outlive any single tick
-                with self.typing_lock:
-                    window = self.typing_window
-                if window is not None:
-                    self._end_typing(window, 'typing_failed')
+            self._typing_tick()
             self.typing_wait(TYPING_TICK)
         with self.typing_lock:
-            self.typing_window = None
+            self.typing_windows.clear()
 
     def _typing_tick(self):
-        """One look at the typing window: end it at its end time or once the
-        ledger holds a send newer than its mark, else send the chat action
-        when one is due."""
+        """One look at every open typing window, each on its own: a look that
+        fails unexpectedly ends its window alone."""
         with self.typing_lock:
-            window = self.typing_window
-        if window is None:
-            return
+            windows = [(window, window['extended']) for window in self.typing_windows.values()]
+        for window, extended in windows:
+            try:
+                self._typing_look(window, extended)
+            except Exception:  # noqa: BLE001 - the worker must outlive any single look
+                self._end_typing(window, extended, 'typing_failed')
+
+    def _typing_look(self, window, extended):
+        """End the window at its end time or once the ledger holds a send
+        newer than its mark (the ledger does not say which conversation a
+        row is for, so a send ends every window it is newer than), else send
+        the chat action when one is due. `extended` is the window's count of
+        extensions when the tick took it."""
         now = self.monotonic()
         if now >= window['end']:
-            return self._end_typing(window)
+            return self._end_typing(window, extended)
         try:
             sent = self.store.sent_since(window['mark'])
         except Exception:  # noqa: BLE001 - a send it cannot see must not leave typing on
-            return self._end_typing(window, 'ledger_unavailable')
+            return self._end_typing(window, extended, 'ledger_unavailable')
         if sent:
-            return self._end_typing(window)
+            return self._end_typing(window, extended)
         with self.typing_lock:
             due = now >= window['due']
             if due:
                 window['due'] = now + TYPING_INTERVAL
         if due:
-            self._send_typing(window)
+            reason = self._send_typing(window)
+            if reason is not None:
+                self._end_typing(window, extended, reason)
 
     def _send_typing(self, window):
-        """One sendChatAction typing to the paired chat, a single attempt of at
-        most TYPING_TIMEOUT seconds. A definite rejection ends the window (the
-        next would be refused alike); any other failure leaves it to the next
-        due time."""
+        """One sendChatAction typing to the window's thread of the paired chat
+        (General: no message_thread_id), a single attempt of at most
+        TYPING_TIMEOUT seconds. A definite rejection returns the reason that
+        ends the window (the next would be refused alike); any other failure
+        leaves it to the next due time."""
         body = dict(chat_id=self.config['chat_id'], action='typing')
+        if window['thread'] is not None:
+            body['message_thread_id'] = window['thread']
         try:
             status, data = self.telegram('sendChatAction', body, timeout=TYPING_TIMEOUT)
         except TransportError:
@@ -2018,22 +2061,29 @@ class Bridge:
             return
         code = data.get('error_code')
         if data.get('ok') is False and type(code) is int and 400 <= code < 500:
-            return self._end_typing(window, f'telegram_rejected_{code}')
+            return f'telegram_rejected_{code}'
         self._typing_failed(window, 'telegram_unconfirmed')
 
+    @staticmethod
+    def _typing_line(thread, reason):
+        """A typing failure's log line: its thread id and reason, never text."""
+        return f'typing not shown: {reason}' if thread is None else f'typing not shown (thread {thread}): {reason}'
+
     def _typing_failed(self, window, reason):
-        """Log a failure once per window: its reason, never text."""
+        """Log a failure once per window."""
         with self.typing_lock:
             logged, window['failed'] = window['failed'], True
         if not logged:
-            self._log(f'typing not shown: {reason}')
+            self._log(self._typing_line(window['thread'], reason))
 
-    def _end_typing(self, window, reason=None):
+    def _end_typing(self, window, extended, reason=None):
+        """End the window as the worker's look saw it: one a message extended
+        since (or a new one in its thread) stays open for its own look."""
         if reason is not None:
             self._typing_failed(window, reason)
         with self.typing_lock:
-            if self.typing_window is window:
-                self.typing_window = None
+            if self.typing_windows.get(window['thread']) is window and window['extended'] == extended:
+                del self.typing_windows[window['thread']]
 
     # ---- city commands ([[command]]) -----------------------------------------
     # A registered slash command or a button press under a registered
@@ -3811,10 +3861,10 @@ def _build_parser():
                         help="the sending session (default: $GC_SESSION_ID, else the settings' agent)")
     parser.add_argument('--conversation-id',
                         help="optional: the settings' bot.chat_id, or <chat id>:topic:<thread id> of a configured "
-                             'topic, as the message notice names it')
+                             'topic, as the message notice names it (react: its last accepted message)')
     parser.add_argument('--topic', metavar='NAME',
                         help='send, reply-current: send into the configured topic of this name, '
-                             'instead of --conversation-id')
+                             'instead of --conversation-id; react: react to its last accepted message')
     parser.add_argument('--attachment', type=Path, action='append',
                         help='absolute path of a file to send, the body as its caption; '
                              'given 2-10 times, the files go as one album captioned by the body')
@@ -3872,10 +3922,13 @@ def _validate_attachment_flags(parser, args):
         parser.error('--message-id is a react and ask-close flag')
     if getattr(args, 'conflict_exit_status_given', False) and args.command != 'run':
         parser.error('--conflict-exit-status is a run flag')
-    if args.topic is not None and args.command not in ('send', 'reply-current'):
-        parser.error('--topic is a send and reply-current flag')
+    if args.topic is not None and args.command not in ('send', 'reply-current', 'react'):
+        parser.error('--topic is a send, reply-current and react flag')
     if args.topic is not None and args.conversation_id is not None:
         parser.error('--topic and --conversation-id are exclusive')
+    if args.command == 'react' and args.message_id is not None and (args.conversation_id is not None
+                                                                    or args.topic is not None):
+        parser.error('react takes at most one of --message-id, --conversation-id and --topic')
     selectors = [flag for flag, value in (('--message-id', args.message_id), ('--ask-key', args.ask_key))
                  if value is not None]
     if args.command != 'ask-close':
@@ -3965,6 +4018,7 @@ def _print_gc_receipt(delivered, failure_kind, reason):
 
 NOT_SENT_MESSAGE = ('Telegram could not be reached; nothing was sent '
                     f'({NOT_SENT_REASON}): send again with the same key and body')
+UNRESOLVED_CONVERSATION = 'conversation ID is not the paired private chat or a configured topic'
 
 
 def _read_keyboard_file(path):
@@ -3981,9 +4035,10 @@ def _read_keyboard_file(path):
 
 
 def _outbound_conversation(bridge, args):
-    """The conversation a send or reply-current goes to: the paired chat's
-    without --conversation-id and --topic, else the configured, recorded
-    topic's or the paired chat's they name (OPERATIONS.md, "Topics")."""
+    """The conversation a send, reply-current or react goes to: the paired
+    chat's without --conversation-id and --topic, else the configured,
+    recorded topic's or the paired chat's they name (OPERATIONS.md,
+    "Topics")."""
     if args.topic is not None:
         topic = bridge.topic_by_name(args.topic)
         if topic is None:
@@ -3993,7 +4048,7 @@ def _outbound_conversation(bridge, args):
         return bridge.conversation
     conversation = bridge.conversation_for_id(args.conversation_id)
     if conversation is None:
-        raise TransportError('conversation ID is not the paired private chat or a configured topic')
+        raise TransportError(UNRESOLVED_CONVERSATION)
     return conversation
 
 
@@ -4055,10 +4110,11 @@ def _dispatch_outbound(bridge, args, text, conversation=None):
 
 
 def _react(bridge, args):
-    """Set the --reaction on --message-id, else on the last accepted message,
-    directly from this process: GC's outbound relay cannot carry a reaction.
-    Each call has its own ledger key, so an earlier ambiguous one never
-    blocks it. Returns the message id."""
+    """Set the --reaction on --message-id, else on the last message accepted
+    on the conversation --conversation-id or --topic names, else on the last
+    accepted message, directly from this process: GC's outbound relay cannot
+    carry a reaction. Each call has its own ledger key, so an earlier
+    ambiguous one never blocks it. Returns the message id."""
     if args.reaction in ('seen', 'done'):
         emoji = bridge.reactions[args.reaction]
     elif args.reaction == 'none':
@@ -4067,9 +4123,19 @@ def _react(bridge, args):
         emoji = args.reaction
     else:
         raise TransportError('--reaction must be seen, done, none or one emoji')
-    message_id = args.message_id if args.message_id is not None else bridge.store.last_accepted()
-    if message_id is None:
-        raise TransportError('no accepted message to react to')
+    if args.topic is not None or args.conversation_id is not None:
+        if args.conversation_id == '':
+            # Send reads an empty id as the paired chat; a reaction refuses
+            # it rather than guess which conversation's message was meant.
+            raise TransportError(UNRESOLVED_CONVERSATION)
+        conversation = _outbound_conversation(bridge, args)
+        message_id = bridge.store.last_accepted_in(conversation['conversation_id'])
+        if message_id is None:
+            raise TransportError('no accepted message to react to in that conversation')
+    else:
+        message_id = args.message_id if args.message_id is not None else bridge.store.last_accepted()
+        if message_id is None:
+            raise TransportError('no accepted message to react to')
     key = f'reaction:{message_id}:{time.time_ns()}-{secrets.token_hex(4)}'
     receipt = bridge.set_reaction(message_id, emoji, key)
     if not receipt.get('delivered'):

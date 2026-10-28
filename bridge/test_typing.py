@@ -118,7 +118,7 @@ class TypingTests(BridgeTestCase):
     def test_seconds_0_makes_no_chat_action_ever(self):
         self.bridge = self.make_bridge(0)
         self.bridge.drain([self.update(uid=10), self.update(uid=11)])
-        self.assertIsNone(self.bridge.typing_window)
+        self.assertIsNone(self.bridge.typing_windows.get(None))
         self.work(20)
         self.assertEqual(self.actions, [])
         self.bridge = self.make_bridge(None)  # no [typing] table at all
@@ -131,19 +131,19 @@ class TypingTests(BridgeTestCase):
         self.bridge.drain([self.update(uid=10)])
         self.assertEqual(self.store.offset(), 11)
         self.assertEqual(self.actions, [])  # the poll loop only opens the window
-        self.assertEqual(self.bridge.typing_window['end'], START + 300)
+        self.assertEqual(self.bridge.typing_windows.get(None)['end'], START + 300)
         self.assertTrue(self.bridge.typing_wake.is_set())
         self.work(1)
         self.assertEqual(self.actions, [(START, TYPING, b.TYPING_TIMEOUT)])
         self.assertEqual(self.ledger_rows(), [])  # no reservation, no row
-        self.assertIsNone(self.bridge.typing_window)  # stop ended it
+        self.assertIsNone(self.bridge.typing_windows.get(None))  # stop ended it
 
     def test_actions_repeat_every_4_seconds_until_the_end(self):
         self.bridge = self.make_bridge(10)
         self.bridge.drain([self.update(uid=10)])
         self.work(15)
         self.assertEqual(self.action_times(), [0, 4, 8])
-        self.assertIsNone(self.bridge.typing_window)
+        self.assertIsNone(self.bridge.typing_windows.get(None))
 
     def test_a_later_accepted_message_extends_the_window(self):
         self.bridge = self.make_bridge(10)
@@ -151,7 +151,7 @@ class TypingTests(BridgeTestCase):
         self.hooks[START + 6] = lambda: self.bridge.drain([self.update(uid=11)])
         self.work(25)
         self.assertEqual(self.action_times(), [0, 4, 6, 10, 14])
-        self.assertIsNone(self.bridge.typing_window)
+        self.assertIsNone(self.bridge.typing_windows.get(None))
         self.assertEqual(self.store.offset(), 12)
 
     def test_a_daemon_send_closes_the_window(self):
@@ -159,7 +159,7 @@ class TypingTests(BridgeTestCase):
         self.hooks[START + 6] = lambda: self.assertTrue(self.bridge.publish(self.publish(key='reply-1'))['delivered'])
         self.work(20)
         self.assertEqual(self.action_times(), [0, 4])
-        self.assertIsNone(self.bridge.typing_window)
+        self.assertIsNone(self.bridge.typing_windows.get(None))
 
     def test_a_cli_send_on_another_store_connection_closes_the_window(self):
         self.bridge.drain([self.update(uid=10)])
@@ -167,7 +167,7 @@ class TypingTests(BridgeTestCase):
         self.hooks[START + 5] = lambda: self.assertTrue(cli.publish(self.publish(key='cli-1'))['delivered'])
         self.work(20)
         self.assertEqual(self.action_times(), [0, 4])
-        self.assertIsNone(self.bridge.typing_window)
+        self.assertIsNone(self.bridge.typing_windows.get(None))
 
     def test_a_cli_pin_edit_closes_the_window(self):
         cli = self.make_bridge(None, store=b.Store(self.path, 10))
@@ -177,7 +177,7 @@ class TypingTests(BridgeTestCase):
         self.work(20)
         self.assertEqual(self.ledger_rows()[-1], 'pin:waiting:g1:r1')  # the edit's row alone
         self.assertEqual(self.action_times(), [0, 4])
-        self.assertIsNone(self.bridge.typing_window)
+        self.assertIsNone(self.bridge.typing_windows.get(None))
 
     def test_an_accept_reaction_row_keeps_the_window_and_an_agent_reaction_closes_it(self):
         self.bridge = self.make_bridge(300, reactions=dict(b.REACTIONS_DEFAULTS, on_accept=True))
@@ -195,13 +195,13 @@ class TypingTests(BridgeTestCase):
         self.hooks[self.now + 2] = lambda: b._react(cli, args)
         self.work(10)
         self.assertEqual(self.action_times(), [0, 3, 7, 10])
-        self.assertIsNone(self.bridge.typing_window)
+        self.assertIsNone(self.bridge.typing_windows.get(None))
 
     def test_stop_ends_the_window(self):
         self.bridge.drain([self.update(uid=10)])
         self.work(3)
         self.assertTrue(self.bridge.stop.is_set())
-        self.assertIsNone(self.bridge.typing_window)
+        self.assertIsNone(self.bridge.typing_windows.get(None))
         self.assertEqual(self.action_times(), [0])
         self.bridge._typing_loop()  # a stopped worker sends nothing more
         self.assertEqual(self.action_times(), [0])
@@ -213,15 +213,15 @@ class TypingTests(BridgeTestCase):
         self.assertEqual(self.ledger_rows(), ['quota-exhausted-episode-1'])
         self.work(5)
         self.assertEqual(self.actions, [])
-        self.assertIsNone(self.bridge.typing_window)
+        self.assertIsNone(self.bridge.typing_windows.get(None))
 
     def test_a_window_a_send_already_ended_begins_again_for_the_next_message(self):
         self.bridge.drain([self.update(uid=10)])
-        first = self.bridge.typing_window
+        first = self.bridge.typing_windows.get(None)
         self.assertTrue(self.bridge.publish(self.publish(key='reply-1'))['delivered'])
         self.bridge.drain([self.update(uid=11)])  # before the worker saw the reply
-        self.assertIsNot(self.bridge.typing_window, first)
-        self.assertEqual(self.bridge.typing_window['mark'], self.store.deliveries_mark())
+        self.assertIsNot(self.bridge.typing_windows.get(None), first)
+        self.assertEqual(self.bridge.typing_windows.get(None)['mark'], self.store.deliveries_mark())
         self.work(5)
         self.assertEqual(self.action_times(), [0, 4])
 
@@ -234,7 +234,7 @@ class TypingTests(BridgeTestCase):
         with patch.object(self.bridge, 'run_command') as run_command:
             self.bridge.drain([update])
         run_command.assert_called_once()
-        self.assertIsNone(self.bridge.typing_window)
+        self.assertIsNone(self.bridge.typing_windows.get(None))
         ask_id = b.Bridge._ask_id_for_key('ask-1')
         request = dict(self.publish(key='ask-1', text='Ship it?'),
                        keyboard=[[dict(text='Yes', callback_data=f'ask:{ask_id}:yes')]])
@@ -244,7 +244,7 @@ class TypingTests(BridgeTestCase):
             message=dict(message_id=77, chat=dict(id=123, type='private'))))
         self.bridge.drain([press])
         self.assertTrue(self.store.get_ask(ask_id)['relayed'])
-        self.assertIsNone(self.bridge.typing_window)
+        self.assertIsNone(self.bridge.typing_windows.get(None))
         self.work(5)
         self.assertEqual(self.actions, [])
 
@@ -273,8 +273,8 @@ class TypingTests(BridgeTestCase):
             self.bridge._typing_tick()
             self.now = START + 10  # the window's end; the worker has not looked yet
             self.bridge.drain([self.update(uid=11)])
-            self.assertEqual(self.bridge.typing_window['end'], START + 20)
-            self.assertFalse(self.bridge.typing_window['failed'])
+            self.assertEqual(self.bridge.typing_windows.get(None)['end'], START + 20)
+            self.assertFalse(self.bridge.typing_windows.get(None)['failed'])
             self.bridge._typing_tick()
         self.assertEqual(self.action_times(), [0, 10])
         self.assertEqual(log.getvalue().count('typing not shown: transport_unavailable'), 2)
@@ -310,7 +310,7 @@ class TypingTests(BridgeTestCase):
             self.bridge.drain([self.update(uid=10)])
             self.work(10)
         self.assertEqual(self.action_times(), [0])
-        self.assertIsNone(self.bridge.typing_window)
+        self.assertIsNone(self.bridge.typing_windows.get(None))
         self.assertEqual(log.getvalue().count('typing not shown: telegram_rejected_400'), 1)
         self.assertNotIn('chat not found', log.getvalue())
 

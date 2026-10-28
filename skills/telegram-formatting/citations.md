@@ -65,9 +65,13 @@ The rows live only here; SKILL.md holds none.
 | pack | bridge/OPERATIONS.md | "Reactions" | reactions follow this section |
 | pack | bridge/OPERATIONS.md | the emoji for "GC has the message" (received, not read) | seen means received, not read |
 | pack | bridge/bridge.py | REACTIONS_DEFAULTS = dict(on_accept=False, seen='\U0001F440', done='\U0001F44C') | 👀 and 👌 defaults, off unless on_accept |
-| pack | bridge/bridge.py | def _accepted(self, mid): | the bridge sets seen at the accept point |
+| pack | bridge/bridge.py | def _accepted(self, mid, conversation_id, thread_id): | the bridge sets seen at the accept point |
 | pack | commands/react/command.toml | --reaction done when the work it asked for is finished | react done when finished or answered |
 | pack | bridge/bridge.py | bridge.store.last_accepted() | default target is the last accepted message |
+| pack | bridge/bridge.py | bridge.store.last_accepted_in(conversation['conversation_id']) | --conversation-id targets that conversation's last accepted message |
+| pack | bridge/bridge.py | parser.error('react takes at most one of --message-id, --conversation-id and --topic') | never both flags |
+| pack | commands/react/command.toml | --conversation-id <chat id, or chat id:topic:thread id> or --topic <name> | react command flags |
+| pack | bridge/OPERATIONS.md | the conversation its notice names | the notice's id names the recorded conversation |
 | pack | bridge/OPERATIONS.md | ✅ and ✔ are not on it | no check mark reaction |
 | pack | bridge/bridge.py | reaction=[dict(type='emoji', emoji=emoji)] if emoji else [] | none clears the reaction |
 | pack | bridge/bridge.py | HTML_TAGS = ('b', 'strong', 'i', 'em', 'u', 's', 'code', 'pre', 'a', 'blockquote', 'tg-spoiler') | tag allowlist |
