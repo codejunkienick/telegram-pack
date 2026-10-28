@@ -1184,7 +1184,7 @@ class BridgeTests(BridgeTestCase):
         parser = b._build_parser()
         args = parser.parse_args(['send', '--body-file', 'x.txt', '--idempotency-key', 'k',
                                    '--attachment', '/tmp/shot.png'])
-        self.assertEqual(args.attachment, Path('/tmp/shot.png'))
+        self.assertEqual(args.attachment, [Path('/tmp/shot.png')])
         self.assertIsNone(args.attachment_kind)
         b._validate_attachment_flags(parser, args)  # must not raise: --attachment alone is fine
 

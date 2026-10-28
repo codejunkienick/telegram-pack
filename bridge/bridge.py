@@ -255,6 +255,12 @@ def _curl_config_quote(value):
 
 
 def http_multipart(url, fields, file_field, file_path, timeout=20):
+    return http_multipart_files(url, fields, [(file_field, file_path)], timeout)
+
+
+def http_multipart_files(url, fields, files, timeout=20):
+    """One multipart POST of `fields` and the (field, path) `files` in order:
+    one file for send<Media>, file0..file9 for an album's sendMediaGroup."""
     # curl receives credentials only via the URL on stdin, never in argv, logs, or errors.
     # No Content-Type header is set: curl generates its own multipart/form-data boundary,
     # which sendPhoto/sendVideo/sendDocument require instead of application/json.
@@ -262,7 +268,8 @@ def http_multipart(url, fields, file_field, file_path, timeout=20):
     for key, value in fields.items():
         text = str(value)
         config.append('form-string = ' + _curl_config_quote(f'{key}={text}'))
-    config.append('form = ' + _curl_config_quote(f'{file_field}=@{file_path}'))
+    for file_field, file_path in files:
+        config.append('form = ' + _curl_config_quote(f'{file_field}=@{file_path}'))
     return _curl(['--request', 'POST'], config, url, timeout)
 
 
@@ -600,7 +607,7 @@ def _callback_handler(bridge):
                 request = json.loads(self.rfile.read(length))
                 if not isinstance(request, dict):
                     raise ValueError()
-                if 'attachment' in request:
+                if 'attachment' in request or 'attachments' in request:
                     result = bridge.receipt(reason='attachment_not_accepted_over_callback')
                 else:
                     result = bridge.publish(request)
@@ -628,6 +635,10 @@ class Bridge:
     }
     # sendVideoNote has no caption: the body must be empty for these kinds.
     CAPTIONLESS_KINDS = frozenset({'video_note'})
+    # sendMediaGroup: 2-10 items; photos and videos mix, documents group only
+    # with documents, and voice and video notes never group.
+    ALBUM_FILES = (2, 10)
+    ALBUM_KINDS = frozenset({'photo', 'video', 'document'})
     # A health report older than HEALTH_MAX_AGE no longer proves the agent is quota-blocked, so the exhaustion notice stays quiet.
     HEALTH_MAX_AGE = datetime.timedelta(minutes=10)
     HEALTH_CLOCK_SKEW = datetime.timedelta(minutes=1)
@@ -672,7 +683,7 @@ class Bridge:
 
     def __init__(self, config, store, token, callback_secret, port=8930, request=http_json,
                  request_multipart=http_multipart, request_download=None, state_dir=None, transcribe=None,
-                 sleep=None, monotonic=None):
+                 sleep=None, monotonic=None, request_media_group=http_multipart_files):
         self.config, self.store, self.token = config, store, token
         # The send retry's wait and clock (tests inject both, so none sleeps).
         self.sleep, self.monotonic = sleep or time.sleep, monotonic or time.monotonic
@@ -682,6 +693,7 @@ class Bridge:
         self.transcribe_worker_lock = threading.Lock()
         self.secret, self.port, self.request = callback_secret, port, request
         self.request_multipart = request_multipart
+        self.request_media_group = request_media_group
         self.request_download = request_download or http_download
         # The bridge's own directory: ledger, offset, inbound files, heartbeat.
         self.state_dir = Path(state_dir) if state_dir is not None else None
@@ -711,6 +723,13 @@ class Bridge:
     def telegram_multipart(self, method, fields, file_field, file_path, timeout=20):
         status, data = self.request_multipart('https://api.telegram.org/bot' + self.token + '/' + method,
                                                fields, file_field, file_path, timeout)
+        if not isinstance(data, dict):
+            raise TransportError('Telegram response unconfirmed')
+        return status, data
+
+    def telegram_media_group(self, fields, files, timeout=20):
+        status, data = self.request_media_group('https://api.telegram.org/bot' + self.token + '/sendMediaGroup',
+                                                fields, files, timeout)
         if not isinstance(data, dict):
             raise TransportError('Telegram response unconfirmed')
         return status, data
@@ -2470,10 +2489,74 @@ class Bridge:
         except TransportError:
             return pending
 
-    def _fallback_to_text(self, text, reply, reason, pending, extra=None):
+    def _fallback_to_text(self, text, reply, reason, pending, extra=None, what='attachment'):
         fallback_text = self._truncate_utf16((text + '\n' if text.strip() else '')
-                                             + f'[attachment rejected: {reason}]', 4096)
+                                             + f'[{what} rejected: {reason}]', 4096)
         return self._deliver_text(fallback_text, reply, pending, extra=extra, fallback_reason=reason)
+
+    def _album_error(self, attachments, text, visible):
+        """The first reason an album refuses, before anything is reserved or
+        sent: its size, its kinds' grouping, then every file's own checks."""
+        low, high = self.ALBUM_FILES
+        if not isinstance(attachments, list) or not low <= len(attachments) <= high:
+            return 'album_needs_2_to_10_files'
+        kinds = [item.get('kind') if isinstance(item, dict) else None for item in attachments]
+        if any(kind in self.ATTACHMENT_KINDS and kind not in self.ALBUM_KINDS for kind in kinds):
+            return 'album_kind_not_groupable'
+        if 'document' in kinds and any(kind in ('photo', 'video') for kind in kinds):
+            return 'album_mixes_documents'
+        for item in attachments:
+            error = self._attachment_error(item, text, visible)
+            if error:
+                return error
+        return None
+
+    def _deliver_album(self, attachments, text, reply, pending, plain=None, extra=None):
+        """Send 2-10 files as one sendMediaGroup album, the body as the first
+        item's caption (none when empty). Confirmed only by one Message per
+        file, each in the paired chat; the receipt names the first message
+        and all of them in order. The HTML parse-rejection fallback re-sends
+        the album once with the plain caption; any other 4xx falls back to
+        one plain text message, like a rejected attachment. `extra` carries
+        a silent send's disable_notification."""
+        media, files = [], []
+        for index, item in enumerate(attachments):
+            entry = {'type': item['kind'], 'media': f'attach://file{index}'}
+            if index == 0 and text:
+                entry['caption'] = text
+                if plain is not None:
+                    entry['parse_mode'] = 'HTML'
+            media.append(entry)
+            files.append((f'file{index}', item['path']))
+        fields = {'chat_id': str(self.config['chat_id']), 'media': json.dumps(media)}
+        if reply:
+            fields['reply_parameters'] = json.dumps({'message_id': int(reply)})
+        if extra and extra.get('disable_notification') is True:
+            fields['disable_notification'] = 'true'
+        try:
+            status, data = self._send('sendMediaGroup', lambda timeout: self.telegram_media_group(
+                fields, files, timeout))
+            # One Message per file, each passing _confirmed's own checks.
+            sent = data.get('result')
+            if (isinstance(sent, list) and len(sent) == len(files)
+                    and all(isinstance(message, dict) and self._confirmed(status, dict(data, result=message))
+                            for message in sent)):
+                ids = [str(message['message_id']) for message in sent]
+                return self.receipt(True, message_id=ids[0], message_ids=ids)
+            if plain is not None and self._html_rejected(data):
+                receipt = self._deliver_album(attachments, plain, reply, pending, extra=extra)
+                if receipt is not pending:
+                    receipt['format_fallback_reason'] = 'telegram_html_parse_rejected_400'
+                return receipt
+            if data.get('ok') is False and 400 <= data.get('error_code', 0) < 500:
+                reason = 'telegram_rejected_not_sent_' + str(data['error_code'])
+                return self._fallback_to_text(text if plain is None else plain, reply, reason, pending,
+                                              extra=extra, what='album')
+            return pending
+        except RequestNotSent:
+            return self.not_sent()
+        except TransportError:
+            return pending
 
     def publish(self, request):
         if request.get('conversation') != self.conversation:
@@ -2507,17 +2590,31 @@ class Bridge:
                 return self.receipt(reason=error)
         visible = text if plain is None else plain
         attachment = request.get('attachment')
+        # An album (2-10 files, sendMediaGroup) is the field attachments; one
+        # file keeps the field attachment, so its request is unchanged.
+        attachments = request.get('attachments')
+        if attachment is not None and attachments is not None:
+            return self.receipt(reason='attachment_and_attachments_together')
         # A captionless kind is the one send with an empty body; a body given
-        # with it is refused by _attachment_error below.
+        # with it is refused by _attachment_error below. An album may go
+        # without a caption too.
         captionless = isinstance(attachment, dict) and attachment.get('kind') in self.CAPTIONLESS_KINDS
         # Telegram counts its limits on the visible text after parsing, so an
         # HTML body is bounded by that (and its source by HTML_SOURCE_MAX_UNITS)
         # and refused whole when over, never cut inside a tag.
-        if (not visible.strip() and not captionless) or utf16_units(visible) > 4096:
+        if (not visible.strip() and not captionless and attachments is None) or utf16_units(visible) > 4096:
             return self.receipt(reason='text_required_maximum_4096_utf16_units')
         reply = request.get('reply_to_message_id', '')
         if reply and (not isinstance(reply, str) or not reply.isdecimal() or int(reply) <= 0):
             return self.receipt(reason='invalid_reply_message_id')
+        if attachments is not None:
+            # sendMediaGroup takes no reply_markup (P1: no keyboard with more
+            # than one attachment).
+            if 'keyboard' in request:
+                return self.receipt(reason='invalid_keyboard')
+            error = self._album_error(attachments, text, visible)
+            if error:
+                return self.receipt(reason=error)
         rows = None
         if 'keyboard' in request:
             # Absent means byte-identical behaviour to today: the field joins
@@ -2589,7 +2686,9 @@ class Bridge:
                 extra['reply_markup'] = {'inline_keyboard': rows}
             if silent:
                 extra['disable_notification'] = True
-            if attachment is not None:
+            if attachments is not None:
+                receipt = self._deliver_album(attachments, text, reply, pending, plain, extra=extra or None)
+            elif attachment is not None:
                 receipt = self._deliver_attachment(attachment, text, reply, pending, plain, extra=extra or None)
             else:
                 receipt = self._deliver_text(text, reply, pending, plain, extra=extra or None)
@@ -2830,8 +2929,9 @@ def _build_parser():
                         help="the sending session (default: $GC_SESSION_ID, else the settings' agent)")
     parser.add_argument('--conversation-id',
                         help="optional; must equal the settings' bot.chat_id")
-    parser.add_argument('--attachment', type=Path,
-                        help='absolute path of a file to send, the body as its caption')
+    parser.add_argument('--attachment', type=Path, action='append',
+                        help='absolute path of a file to send, the body as its caption; '
+                             'given 2-10 times, the files go as one album captioned by the body')
     parser.add_argument('--attachment-kind', choices=tuple(Bridge.ATTACHMENT_KINDS),
                         help='voice and video_note are never inferred; video_note takes an empty body')
     parser.add_argument('--keyboard-file', type=Path,
@@ -2979,8 +3079,13 @@ def _dispatch_outbound(bridge, args, text):
         if keyboard is not None:
             request['keyboard'] = keyboard
         if args.attachment:
-            request['attachment'] = dict(path=str(args.attachment.resolve()),
-                                         kind=args.attachment_kind or infer_attachment_kind(args.attachment))
+            # --attachment-kind applies to every file; otherwise each is inferred.
+            files = [dict(path=str(path.resolve()), kind=args.attachment_kind or infer_attachment_kind(path))
+                     for path in args.attachment]
+            if len(files) == 1:
+                request['attachment'] = files[0]
+            else:
+                request['attachments'] = files
         receipt = bridge.publish(request)
         delivered = receipt.get('delivered') is True
         failure_kind = receipt.get('failure_kind', 'permanent')

@@ -15,6 +15,8 @@ itself.
 - The agent gets inbound photos, documents, videos, voice and audio files
   saved on the host, and can send photos, videos, documents, voice notes
   and round video notes to the chat.
+- The agent sends several screenshots as one album (`--attachment` given
+  2-10 times) under one key, captioned by the body.
 - When transcription is enabled, the mayor gets each voice and audio note
   transcribed on the host with whisper.cpp in the configured language, with
   no cloud service. With `method = "auto"`, it uses the GPU when one is free.

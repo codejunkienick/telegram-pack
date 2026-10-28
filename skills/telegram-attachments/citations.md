@@ -12,7 +12,14 @@ The rows live only here; SKILL.md holds none.
 | pack | bridge/bridge.py | 'video_note': ('sendVideoNote', 'video_note', 50 * 1024 * 1024), | voice and video note kinds |
 | pack | bridge/bridge.py | video_note_takes_no_caption | no caption on a video note |
 | pack | bridge/bridge.py | attachment_path_unsupported_characters | no ; or , in the path |
-| pack | bridge/bridge.py | [attachment rejected: {reason}] | text fallback |
+| pack | bridge/bridge.py | + f'[{what} rejected: {reason}]', 4096) | text fallback |
+| pack | bridge/OPERATIONS.md | **Albums.** | albums follow this section |
+| pack | bridge/bridge.py | ALBUM_FILES = (2, 10) | 2-10 files |
+| pack | bridge/bridge.py | given 2-10 times, the files go as one album captioned by the body | repeat --attachment |
+| pack | bridge/OPERATIONS.md | The body is the caption of the first item only | caption on the first item |
+| pack | bridge/OPERATIONS.md | Photos and videos may mix; documents group only with documents. | album grouping |
+| pack | bridge/bridge.py | album_kind_not_groupable | no voice or video note in an album |
+| pack | bridge/OPERATIONS.md | `--keyboard-file` with an album refuses as `invalid_keyboard` (P1): | no buttons in an album |
 | pack | bridge/bridge.py | base = self.state_dir / 'telegram-inbound' | inbound folder |
 | pack | bridge/bridge.py | note = f'[attachment saved: {path} \| {kind} \| {size} bytes \| caption: {caption_display}]' | saved note |
 | pack | bridge/bridge.py | INBOUND_MAX_BYTES = 50 * 1024 * 1024 | 50 MB inbound cap |

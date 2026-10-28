@@ -641,6 +641,54 @@ plain text message carrying the caption (if any) and
 ask with a keyboard never takes this fallback: a rejected photo fails the
 send instead, so the ask is never recorded as sent without its buttons.
 
+**Albums.** `--attachment` given 2-10 times (on `send` and `reply-current`)
+sends the files as one Telegram album (sendMediaGroup) under one idempotency
+key, with one receipt: `message_id` is the first message's id and
+`message_ids` lists every message in order; the CLI prints the first. One
+`--attachment` keeps today's request (`attachment`) and bytes exactly; two or
+more make the request field `attachments`, the ordered list of `{path, kind}`
+with resolved absolute paths, which is part of the idempotency identity
+(another file, order or kind under the same key is `idempotency_key_conflict`;
+`attachment` and `attachments` together refuse,
+`attachment_and_attachments_together`). `--attachment-kind`, when given,
+applies to every file; otherwise each kind is inferred per file.
+
+- Photos and videos may mix; documents group only with documents. A voice
+  note or video note refuses the album (`album_kind_not_groupable`), a
+  document with a photo or video refuses it (`album_mixes_documents`), and
+  fewer than two or more than ten files refuse it
+  (`album_needs_2_to_10_files`). Every file passes the single-file checks
+  above (absolute path, no `;` or `,`, not a bridge credential or the ledger,
+  regular and readable, its kind's size limit); any one reason refuses the
+  whole album before anything is reserved or sent.
+- The body is the caption of the first item only (at most 1024 visible
+  UTF-16 units; `--format html` sets that item's `parse_mode`); an empty
+  body sends no caption. `--silent` adds `disable_notification=true`.
+  `--keyboard-file` with an album refuses as `invalid_keyboard` (P1):
+  sendMediaGroup takes no `reply_markup`.
+- The multipart request carries `chat_id`, `media` (a JSON array of
+  `{"type": "photo"|"video"|"document", "media": "attach://file<i>"}`, the
+  first with the caption) and the files as `file0`..`file9`, through curl's
+  configuration on stdin like every other send.
+- The send is confirmed only by HTTP 200 with a list of one Message per
+  file, each in the paired chat. An HTML caption that Telegram cannot parse
+  (400 "can't parse entities") re-sends the album once with the plain
+  caption inside the same reservation
+  (`format_fallback_reason: telegram_html_parse_rejected_400`); any other
+  4xx falls back to one plain text message with the caption and
+  `[album rejected: <reason>]` under the same key. A 5xx, a timeout, a short
+  or foreign answer stays ambiguous and is never resent; an album that never
+  left this host follows the not-sent rule ("Delivery recovery").
+- One attempt has the 20 s send limit, and an upload still running past it
+  ends ambiguous and is never resent, so albums suit screenshots, not large
+  videos.
+
+Telegram Bot API sendMediaGroup (read 2026-10-27, Bot API 10.3): the media
+"must include 2-10 items"; "Documents and audio files can be only grouped in
+an album with messages of the same type"; "On success, an Array of Message
+objects that were sent is returned". Its parameters include
+`disable_notification` and `reply_parameters`, and no `reply_markup`.
+
 Inbound must receive a matching durable native GC transcript entry and a route
 to the configured `agent` (default `mayor`) before advancing the SQLite offset.
 HTTP 200 alone is insufficient: unrouted or hydration-pending responses retain

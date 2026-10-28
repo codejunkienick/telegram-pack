@@ -1,6 +1,6 @@
 ---
 name: telegram-attachments
-description: Files to and from the paired private Telegram chat through the city's bridge - sending a photo, video, document, voice note or round video note with --attachment (kinds, size and caption limits, the text fallback), and reading the inbound "[attachment saved ...]", skipped and unavailable notes and the saved files. Use when a Telegram message carries a file, or before sending a screenshot, video, document, voice note or video note to the chat.
+description: Files to and from the paired private Telegram chat through the city's bridge - sending a photo, video, document, voice note or round video note with --attachment, or several screenshots as one album (kinds, size and caption limits, the text fallback), and reading the inbound "[attachment saved ...]", skipped and unavailable notes and the saved files. Use when a Telegram message carries a file, or before sending a screenshot, video, document, voice note or video note to the chat.
 ---
 
 # Telegram attachments
@@ -36,7 +36,10 @@ Which command: `gc telegram reply-current` once the city imports this pack and i
   under the same key. Keys
   and retries follow the `telegram-formatting` skill: one file and caption,
   one key.
-- One message per file. For several screenshots, send each with its own key.
+- Several related screenshots go as one album: repeat `--attachment` (2-10
+  files) under one key, and the body captions the album (on its first
+  item). Photos and videos may mix; documents go only with documents; no
+  voice note, video note or buttons (`--keyboard-file`) in an album.
 
 ## Files the user sends
 
