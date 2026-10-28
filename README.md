@@ -289,10 +289,13 @@ table (and a `handler_write_paths` entry if it writes), then run
 `launchctl bootout gui/$(id -u)/<label> 2>/dev/null; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<label>.plist`, and run
 `set-commands`. Remove one: delete the table, delete the handler program if nothing else uses it, drop its `handler_write_paths` entry if no other handler writes there, run `install.sh` again, restart the service the same way, then run `set-commands`. The menu loses the command only then.
 The handler protocol is in `bridge/OPERATIONS.md`, "City commands".
-One ready add-on is
-[telegram-quota](https://github.com/codejunkienick/telegram-quota). It adds
+Two ready add-ons are
+[telegram-quota](https://github.com/codejunkienick/telegram-quota), which adds
 a `/quota` command that shows how much of each AI subscription's usage
-windows is spent, with the time left until each reset.
+windows is spent, with the time left until each reset, and
+[telegram-waiting](https://github.com/codejunkienick/telegram-waiting),
+which adds a `/waiting` command that shows the list of what waits on the
+paired user.
 
 ## Example
 
