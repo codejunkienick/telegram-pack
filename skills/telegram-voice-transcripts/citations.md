@@ -9,6 +9,8 @@ The rows live only here; SKILL.md holds none.
 | pack | bridge/bridge.py | note = f'[attachment saved: {path} \| {kind} {duration} \| transcribing]' | first note |
 | pack | bridge/bridge.py | return f'[{kind} {duration} transcript (msg {mid}): {body}] (audio: {path})' | follow-up |
 | pack | bridge/bridge.py | body = transcript if reason is None else f'transcription failed: {reason}' | failure text |
+| pack | bridge/bridge.py | self._relay_to_gc(provider_message_id, f"[topic: {topic['name']}]\n{text}", reply, | topic line first |
+| pack | bridge/bridge.py | self._relay(mid, f'{mid}-transcript', text, thread_id=state.get('thread_id')) | transcript follows its note's topic |
 | pack | bridge/bridge.py | 'VOICE_TRANSCRIBE_LANGUAGE': language, | configured language reaches the transcriber |
 | pack | bridge/bridge.py | is English-only and cannot decode | English-only (.en) model requires language = "en" |
 | pack | transcriber/voice_transcribe.py | DEFAULT_LANGUAGE = 'en' | default language |

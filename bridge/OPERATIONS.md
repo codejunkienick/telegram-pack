@@ -301,6 +301,10 @@ read up to 64 KiB.
 - `{"type": "answer_callback", "text": ..., "alert": <bool>}` (a press only, at
   most once; `text` up to 200 characters, both optional)
 
+A command typed in a topic, or a press on a message in a topic, answers in
+that thread: each `send` and the failure notice carry its
+`message_thread_id`; edits and press answers do not ("Topics").
+
 `format` defaults to `plain`; `html` follows "Formatted messages" below and
 the text limit is 4096 UTF-16 units of visible text. A `keyboard` is rows of
 buttons `{"text": ..., "callback_data": ...}`, at most 8 buttons per row and
@@ -379,6 +383,8 @@ fingerprint like `format` does: the same key with another keyboard is
 before. `send` and `reply-current` take `--keyboard-file <path>` holding the
 rows as JSON; a keyboard send publishes directly in this process through the
 shared ledger, never through GC's relay (like an attachment or HTML send).
+An ask is sent to General in this version, so its answer relays on the
+paired chat's conversation with no topic line ("Topics").
 
 A mayor ask may be one photo whose caption is the question, with the same
 buttons; a tap answers it exactly as a text ask is answered, and the caption
@@ -546,7 +552,9 @@ Use `gc telegram reply-current --body-file <path> --idempotency-key <stable-key>
 `--keyboard-file <path>` attaches an inline keyboard ("Mayor asks" above);
 `--silent` notifies with no sound ("Silent messages" below).
 `gc telegram pin` keeps one pinned message per slot ("Pinned messages" below).
-Optional `--conversation-id` must match the private configured chat. The native
+Optional `--conversation-id` must match the private configured chat; a
+message written in a topic reaches the agent with its topic line first, and
+the reply still lands in General ("Topics"). The native
 controller reminder omits the mandatory idempotency flag; add it. This pack
 command delegates to the same transport CLI and native GC outbound endpoint.
 The direct form works before pack reload:
@@ -796,10 +804,10 @@ with the paired chat's `<chat_id>` as its parent and kind `thread`, and
 needs its own binding: GC v1.5.0 has no parent fallback, so an unbound topic
 does not inherit the paired chat's agent (`internal/extmsg/inbound.go:110-145`).
 General stays the paired chat's conversation (`<chat_id>`, kind `dm`) and
-behaves exactly as without topics. This version keeps the topics and their
-thread ids; it does not yet relay a message written in a topic on the
-topic's conversation or answer in the topic: such a message reaches the
-agent as one in the paired chat, and every reply lands in General.
+behaves exactly as without topics. A message written in a topic reaches the
+agent on that topic's conversation (below); the agent's replies still land
+in General in this version, since `reply-current` and `send` take only the
+paired chat's conversation id.
 
 Prerequisites, in BotFather's settings for the bot: topic mode on (getMe's
 `has_topics_enabled`), and users creating and deleting topics off
@@ -863,8 +871,7 @@ topic would bind it to that route's agent, and the binding sticks
 
 Recovering an unconfirmed create: check the chat. If the topic is there,
 write in it, take the thread id from the `[topic: thread <id> | not
-configured ...]` line the agent receives for that message (once topic
-messages are relayed), and run
+configured ...]` line the agent receives for that message, and run
 `gc telegram topics --record <name> --thread-id <id>`: it records the
 thread id with no Telegram call, and is refused when the name is not a
 `[[topic]]`, already has a thread id, or the id is another topic's. If the
@@ -874,6 +881,59 @@ the create was ambiguous or rejected; for one not sent it says
 `send again: run topics without --retry`. After a rejection, fix its cause
 first. `--record` and `--retry` are exclusive, and `--thread-id` goes only
 with `--record`.
+
+**Inbound.** A message is in a topic only when Telegram sets
+`is_topic_message` to true and `message_thread_id` is an integer above 0.
+Anything else is General and relays exactly as without topics: the same GC
+request, the same text, the same reply id. A message in a topic relays under
+one first line naming its topic, and the text General would relay (a
+forward's header, an attachment's note, a voice note's note, the caption)
+follows it in its usual order; every "first line" documented elsewhere is,
+in a topic, the line after the topic line:
+
+| the message's thread | relayed on | first line |
+| --- | --- | --- |
+| a `[[topic]]` with a ledger row | the topic's conversation | `[topic: <name>]` |
+| the same, when GC routes it nowhere | the paired chat's conversation | `[topic: <name> \| not bound: reply lands in the main chat]` |
+| no `[[topic]]`, or one with no ledger row | the paired chat's conversation | `[topic: thread <id> \| not configured: reply lands in the main chat]` |
+
+- On a topic's conversation the inbound cursor moves only when GC confirms a
+  durable entry on that conversation routed to the topic's `agent`, as for
+  the paired chat with the settings' agent.
+- "Routes it nowhere" is GC's answer with HTTP 200, an empty target agent and
+  session and no transcript entry: no binding and no default route
+  (`internal/extmsg/inbound.go:249-253`). The bridge then relays the same
+  message once more, in the same pass, on the paired chat's conversation
+  with the same provider id and reply id, logs
+  `topic thread <id> not bound (msg <id>); relayed to the main conversation`,
+  and moves the cursor once GC confirms that relay. Every other answer on a
+  topic's conversation (routed to another agent, a target whose entry is
+  still pending, a mismatched entry, a GC error) retains the cursor exactly
+  as on the paired chat, and nothing reaches the paired chat.
+- A thread no topic serves logs
+  `topic thread <id> not configured (msg <id>); relayed to the main conversation`.
+  Without any `[[topic]]`, a message in a topic is relayed so too; a chat
+  without topic mode never has one.
+- A reply to the topic's root message (`reply_to_message.message_id` equal
+  to the message's `message_thread_id`) relays no reply id; a reply to any
+  other message keeps it.
+- The service messages `forum_topic_created`, `forum_topic_edited`,
+  `forum_topic_closed` and `forum_topic_reopened` carry no text and relay
+  nothing; the cursor moves past them.
+- A voice or audio note in a topic records its thread in its pending file
+  (`thread_id`, "Durable transcript queue"). Its transcript resolves the
+  thread when it relays, by the rules above, so a topic recorded or bound
+  meanwhile gets the transcript on its own conversation.
+- A city command typed in a topic, and a press on a message in a topic, send
+  every `send` action and the failure notice into that thread
+  (`message_thread_id`, which also joins the send's ledger identity), the
+  topic configured or not; edits and press answers act by message id, and the
+  handler input is unchanged.
+- Provider ids stay `<id>`, `<id>-transcript` and `ask-<ask-id>`: Telegram
+  message ids are unique in a chat, so a fallback relay on the paired chat's
+  conversation never meets a General message's id.
+
+Logs name the thread and message ids, never a topic's name or any text.
 
 The bridge never deletes, closes or renames a topic: deleteForumTopic would
 delete all its messages. A changed `name` is a new topic, which the next
@@ -944,7 +1004,8 @@ transcript entry both carry the header, the transcript quoted as
 `/start` is relayed like any other text. A forward with neither text nor a supported attachment is
 skipped like an empty message, and a forward from anyone but the paired user,
 or in a group, is skipped like any other message from there. There is no
-setting: forwards are always relayed.
+setting: forwards are always relayed. In a topic, the header is the line
+after the topic line ("Topics").
 
 ## Reactions
 
@@ -1367,7 +1428,11 @@ a name with separators is refused), `attempts`, `note_sent`, `gave_up`,
 `created_at`, and for a forwarded note `forwarded` (`origin` and `sent`, the
 header's fields). `note_sent` flips to true once GC confirms the first note. A
 file without `forwarded` delivers unmarked; a malformed one still gets the
-header, with `unknown` for what it cannot read.
+header, with `unknown` for what it cannot read. A note written in a topic
+also has `thread_id` (an integer above 0), and its transcript relays by the
+rules of "Topics"; a file without it relays on the paired chat's
+conversation, and one whose `thread_id` is malformed is refused like any
+other malformed file.
 
 On start the bridge scans the inbound date directories (the state directory
 and the inbound root must be real directories; symlinked date directories and

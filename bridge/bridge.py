@@ -1534,7 +1534,8 @@ class Bridge:
         if (not isinstance(state, dict) or not isinstance(state.get('audio_name'), str)
                 or not self._AUDIO_NAME_RE.match(state['audio_name'])
                 or type(state.get('attempts')) is not int or state.get('kind') not in self.TRANSCRIBE_KINDS
-                or not isinstance(state.get('duration'), str)):
+                or not isinstance(state.get('duration'), str)
+                or ('thread_id' in state and (type(state['thread_id']) is not int or state['thread_id'] <= 0))):
             raise TransportError('pending transcript file has an unexpected shape')
         return state
 
@@ -1587,9 +1588,12 @@ class Bridge:
         text = self._format_voice_transcript(state['kind'], state['duration'], mid, path, transcript, reason, header)
         # The provider id is the idempotency key: a retry after a relay whose
         # acknowledgement was lost lands on the same GC entry, never a second one.
+        # A note written in a topic follows it: its thread is resolved at each
+        # relay, so a topic recorded or bound meanwhile gets its transcript; a
+        # file without "thread_id" relays as General.
         while True:
             try:
-                self._relay_to_gc(f'{mid}-transcript', text)
+                self._relay(mid, f'{mid}-transcript', text, thread_id=state.get('thread_id'))
                 self._pending_delete(day_dir, mid)
                 return
             except TransportError:
@@ -1650,8 +1654,18 @@ class Bridge:
                 queued += 1
         return queued
 
-    def _relay_to_gc(self, provider_message_id, text, reply=None):
-        normalized = dict(provider_message_id=str(provider_message_id), conversation=self.conversation,
+    class _TopicNotBound(TransportError):
+        """GC routed a topic's message nowhere: no binding, no default route."""
+
+    def _relay_to_gc(self, provider_message_id, text, reply=None, conversation=None, agent=None):
+        """Relay one inbound entry on `conversation` (default the paired
+        chat's) and require GC to confirm it durably, routed to `agent`
+        (default the settings' agent). On a topic's conversation, GC's empty
+        target with no entry raises _TopicNotBound; every other
+        non-confirmation raises TransportError."""
+        conversation = conversation or self.conversation
+        agent = agent or self.agent
+        normalized = dict(provider_message_id=str(provider_message_id), conversation=conversation,
             actor=dict(id=str(self.config['user_id']), display_name=self.display_name, is_bot=False), text=text,
             received_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
         if reply is not None:
@@ -1660,15 +1674,45 @@ class Bridge:
         # GC can return HTTP 200 without a transcript when routing is absent or
         # hydration is pending. Only a matching durable entry acknowledges input.
         entry = result.get('TranscriptEntry')
-        if (result.get('TargetAgentName') != self.agent or result.get('TargetSessionID')
+        if (conversation != self.conversation and entry is None
+                and result.get('TargetAgentName', '') == '' and result.get('TargetSessionID', '') == ''):
+            raise self._TopicNotBound('GC routed the topic to no agent')
+        if (result.get('TargetAgentName') != agent or result.get('TargetSessionID')
             or not isinstance(entry, dict)
             or not isinstance(entry.get('ID'), str) or not entry['ID']
             or type(entry.get('Sequence')) is not int or entry['Sequence'] <= 0
             or entry.get('Kind') != 'inbound'
-            or entry.get('Conversation') != self.conversation
+            or entry.get('Conversation') != conversation
             or entry.get('ProviderMessageID') != str(provider_message_id)
             or entry.get('Actor') != normalized['actor']):
             raise TransportError('GC has not confirmed a matching durable inbound entry routed to the agent')
+
+    def _relay(self, mid, provider_message_id, text, reply=None, thread_id=None):
+        """Relay one message on the conversation of its topic thread
+        (OPERATIONS.md, "Topics"). General (thread_id None) relays exactly as
+        without topics. A configured, recorded topic relays on its own
+        conversation under a `[topic: <name>]` line; when GC routes it
+        nowhere, once more on the paired chat's, labelled not bound. A thread
+        no topic is configured or recorded for relays on the paired chat's,
+        labelled not configured. Any other failure raises and retains the
+        cursor."""
+        if thread_id is None:
+            self._relay_to_gc(provider_message_id, text, reply)
+            return
+        topic = self.topic_by_thread(thread_id)
+        if topic is None:
+            self._relay_to_gc(provider_message_id,
+                              f'[topic: thread {thread_id} | not configured: reply lands in the main chat]\n{text}',
+                              reply)
+            self._log(f'topic thread {thread_id} not configured (msg {mid}); relayed to the main conversation')
+            return
+        try:
+            self._relay_to_gc(provider_message_id, f"[topic: {topic['name']}]\n{text}", reply,
+                              topic['conversation'], topic['agent'])
+        except self._TopicNotBound:
+            self._relay_to_gc(provider_message_id,
+                              f"[topic: {topic['name']} | not bound: reply lands in the main chat]\n{text}", reply)
+            self._log(f'topic thread {thread_id} not bound (msg {mid}); relayed to the main conversation')
 
     @staticmethod
     def _update_id(update):
@@ -1683,6 +1727,16 @@ class Bridge:
         if type(mid) is not int or mid <= 0:
             raise TransportError('authorized inbound message has invalid ID')
         return mid
+
+    @staticmethod
+    def _topic_thread(message):
+        """The topic thread id of a message Telegram marks as written in a
+        topic (`is_topic_message` true, `message_thread_id` an int > 0); None
+        for General and anything else."""
+        if not isinstance(message, dict) or message.get('is_topic_message') is not True:
+            return None
+        thread = message.get('message_thread_id')
+        return thread if type(thread) is int and thread > 0 else None
 
     def inbound(self, update):
         if 'callback_query' in update:
@@ -1706,6 +1760,7 @@ class Bridge:
         attachment = self._extract_attachment(message)
         text = message.get('text')
         caption = message.get('caption')
+        thread_id = self._topic_thread(message)
         found = self._match_command(text) if forward is None and attachment is None and isinstance(text, str) else None
         if found is not None:
             # A city command goes to its handler, never to GC.
@@ -1714,7 +1769,7 @@ class Bridge:
             self.run_command(command, uid, dict(
                 kind='command', command=command['name'], args=args, update_id=uid, message_id=mid,
                 callback_data=None, callback_message_id=None, received_at=self._received_at(),
-                user_display_name=self.display_name))
+                user_display_name=self.display_name), thread_id=thread_id)
             return
         if attachment is None and (not isinstance(text, str) or not text.strip()
                                    or (forward is None and text.startswith('/start'))):
@@ -1738,6 +1793,8 @@ class Bridge:
                              created_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
                 if forward is not None:
                     state['forwarded'] = forward
+                if thread_id is not None:
+                    state['thread_id'] = thread_id
                 try:
                     # Persisted before the first note goes out, so a restart at
                     # any later point can still deliver the transcript.
@@ -1755,9 +1812,9 @@ class Bridge:
             relay_text = text if header is None else self._relay_body(header, None, text)
 
         reply = message.get('reply_to_message', {}).get('message_id')
-        if type(reply) is not int or reply <= 0:
-            reply = None
-        self._relay_to_gc(str(mid), relay_text, reply)
+        if type(reply) is not int or reply <= 0 or reply == thread_id:
+            reply = None  # in a topic, a reply to its root message is no reply
+        self._relay(mid, str(mid), relay_text, reply, thread_id)
         self._accepted(mid)
         # The message above is now durably queued for the mayor but it may be
         # quota-blocked and unable to answer it any time soon; tell the user once
@@ -2326,10 +2383,12 @@ class Bridge:
             self.store.finish(key, result)
             return result
 
-    def _command_message(self, key, action):
+    def _command_message(self, key, action, thread_id=None):
         """Send or edit one message under its ledger key: reserved before
         Telegram is contacted, a saved receipt returned instead of a second
-        send, an unconfirmed send left ambiguous."""
+        send, an unconfirmed send left ambiguous. A send goes to `thread_id`,
+        the topic thread of the update, when there is one; an edit acts by
+        message id."""
         extra = {}
         if 'keyboard' in action:
             extra['reply_markup'] = {'inline_keyboard': action['keyboard']}
@@ -2337,6 +2396,8 @@ class Bridge:
         if action['type'] == 'edit':
             method, extra['message_id'] = 'editMessageText', action['message_id']
         identity = {k: v for k, v in action.items() if k != 'plain'}
+        if action['type'] == 'send' and thread_id is not None:
+            extra['message_thread_id'] = identity['message_thread_id'] = thread_id
         return self._reserve_and_deliver(key, identity, lambda pending: self._deliver_text(
             action['text'], None, pending, action['plain'], method=method, extra=extra))
 
@@ -2377,10 +2438,12 @@ class Bridge:
     def _log(line):
         print(line, file=sys.stderr, flush=True)
 
-    def run_command(self, command, update_id, payload, query_id=None):
+    def run_command(self, command, update_id, payload, query_id=None, thread_id=None):
         """Run the handler for one command or callback and act on its answer.
         A handler failure sends the fixed notice instead; a pending callback is
-        always answered (the handler's answer, else empty) before returning."""
+        always answered (the handler's answer, else empty) before returning.
+        Sends and the notice go to `thread_id`, the topic thread the update
+        came from, when there is one."""
         name = command['name']
         data = json.dumps(payload).encode()  # ASCII: a lone surrogate in chat text cannot break it
         try:
@@ -2390,7 +2453,7 @@ class Bridge:
         except self._HandlerFailure as failure:
             self._log(f'command {name} failed (update {update_id}): {failure.args[0]}')
             receipt = self._command_message(f'command:{update_id}:notice', dict(
-                type='send', text=f'command {name} failed', format='plain', plain=None))
+                type='send', text=f'command {name} failed', format='plain', plain=None), thread_id)
             if receipt.get('delivered') is not True:
                 self._log(f'command {name} (update {update_id}): failure notice not delivered: '
                           f"{receipt.get('metadata', {}).get('reason')}")
@@ -2403,7 +2466,7 @@ class Bridge:
                 receipt = self._answer_callback(update_id, query_id, action['text'], action['alert'])
                 answered = True
             else:
-                receipt = self._command_message(f'command:{update_id}:{index}', action)
+                receipt = self._command_message(f'command:{update_id}:{index}', action, thread_id)
             if receipt.get('delivered') is not True:
                 self._log(f"command {name} (update {update_id}): action {index} {action['type']} not delivered: "
                           f"{receipt.get('metadata', {}).get('reason')}")
@@ -2445,7 +2508,7 @@ class Bridge:
         payload = dict(kind='callback', command=command['name'], args=None, update_id=update_id, message_id=None,
                        callback_data=data, callback_message_id=mid if type(mid) is int and mid > 0 else None,
                        received_at=self._received_at(), user_display_name=self.display_name)
-        self.run_command(command, update_id, payload, query_id=query['id'])
+        self.run_command(command, update_id, payload, query_id=query['id'], thread_id=self._topic_thread(message))
 
     def inbound_ask(self, update_id, query, data):
         """One tap on a mayor ask button: record the answer, relay it once,

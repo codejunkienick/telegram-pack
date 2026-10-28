@@ -14,6 +14,11 @@ two messages:
 2. Seconds to a few minutes later, from the same chat:
    `[voice <m:ss> transcript (msg <id>): <text>] (audio: <path>)`.
 
+A note written in a topic of the chat has a topic line first,
+`[topic: <name>]` (or a `not bound` or `not configured` label), on both
+messages; the lines above follow it, and the transcript arrives on the same
+conversation as its note.
+
 The transcript is the user's message. Act on it as if typed, and quote it
 lightly cleaned when you write it into a bead or a reply. With transcription
 off, a note arrives as a plain `[attachment saved: ...]` note: say you cannot
