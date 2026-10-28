@@ -71,6 +71,7 @@ city.
 | `[[command]]` | no | the city's own commands and buttons, run by its own handlers ("City commands" below) |
 | `handler_write_paths` | no | directories the unit lets command handlers write, besides the bridge's own |
 | `[transcribe]` | no | voice transcription (below); off by default |
+| `[reactions]` | no | `on_accept`, `seen`, `done`: the `seen` reaction on each accepted message and the emoji `react` sets ("Reactions" below); no reaction ever without `on_accept = true` or a `react` call |
 
 The health report at `health_file` is a JSON object with `observed_at`
 (ISO-8601 with zone, at most 10 minutes old) and `sessions`, a list of
@@ -758,6 +759,65 @@ transcript entry both carry the header, the transcript quoted as
 skipped like an empty message, and a forward from anyone but the paired user,
 or in a group, is skipped like any other message from there. There is no
 setting: forwards are always relayed.
+
+## Reactions
+
+The bridge can react to the paired user's messages with one emoji, a quick
+acknowledgement that is not a message: Telegram's `setMessageReaction`, which
+replaces the message's whole reaction list (a bot sets at most one), so a
+repeat never stacks a second reaction and edits nothing the user wrote.
+
+| `[reactions]` key | default | meaning |
+| --- | --- | --- |
+| `on_accept` | `false` | `true` sets `seen` on each message once GC has durably accepted it |
+| `seen` | `"👀"` | the emoji for "GC has the message" (received, not read) |
+| `done` | `"👌"` | the emoji for "the work this message asked for is finished or answered" |
+
+An emoji value is a non-empty string of at most 16 characters with no
+whitespace, control character or ASCII letter or digit; anything else, and
+an unknown key in the table, refuses at load naming the key. Telegram allows
+only the emoji of its fixed reaction list (👀, 👌, 👍, 🫡 and 💯 among them;
+✅ and ✔ are not on it), and answers 400 for any other. A file without the
+table loads exactly as before.
+
+**The accept point.** When GC confirms a durable inbound entry for a message
+from the paired user (text, a file, a voice or audio note, a forward), the
+ledger records it as the last accepted message (one row: its message id and
+when). A city command, an ask answer, any other button press and a voice
+transcript follow-up are never accepted messages. With `on_accept = true`
+the bridge then queues the `seen` reaction for a worker thread: it never runs
+in the poll loop, and it never retains, delays or advances the inbound
+cursor. It is sent once under ledger key `reaction:<message_id>:accept`, so a
+replayed update never sets it a second time; a not-sent attempt is saved as
+final too. Since a reaction replaces the whole list, `seen` never runs over
+a `react` call: the worker and every `react` process hold one `flock`
+(`<state_dir>/telegram-bridge.sqlite3.reactions.lock`) from their check to
+Telegram's answer, so a `done` waits for a `seen` in flight, and the worker
+sends nothing for a message a `react` call already reserved a key for. A
+failure, a worker thread that cannot start included, only logs
+`reaction not set (msg <id>): <reason>`. A crash before the worker ran loses
+the reaction; it is cosmetic and never retried.
+
+**The `react` command.** An agent sets a reaction with
+
+```sh
+gc telegram react --reaction done
+python3 <pack>/bridge/bridge.py --settings <settings> react [--message-id <id>] --reaction seen|done|none|<emoji>
+```
+
+`seen` and `done` resolve from the settings, `none` clears the reaction (an
+empty list), and any other value passes the emoji check above. Without
+`--message-id` (a positive integer) it targets the last accepted message,
+and refuses with `no accepted message to react to` when none is recorded.
+GC's outbound relay cannot carry a reaction, so the CLI process sends it
+directly through the same ledger the daemon uses, each call under its own key
+`reaction:<message_id>:<n>`: an earlier ambiguous call never blocks the next.
+Success prints `Telegram reaction set; message ID <id>`; a rejection exits 1
+with `Telegram reaction not set: telegram_rejected_not_sent_<code>` (an emoji
+outside Telegram's list is a 400), a not-sent call with the not-sent message
+of "Send and receive", each with the `GC_RECEIPT` line on stderr. The pack
+command honours `TELEGRAM_BRIDGE_SETTINGS` like `reply-current`. Reaction
+updates from the user are not polled.
 
 ## Voice-note transcription
 

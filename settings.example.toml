@@ -45,6 +45,12 @@ description = "Show the agent's status"
 # callback_prefix = "deploy:"               # default "<name>:"
 # timeout = 10                              # seconds, 1-3600
 
+# Reactions on the paired user's messages (OPERATIONS.md, "Reactions").
+# [reactions]
+# on_accept = true                          # set `seen` once GC has a message; default false: no reaction unless an agent runs react
+# seen = "👀"                               # default 👀
+# done = "👌"                               # `gc telegram react --reaction done`; default 👌 (✅ is not an allowed reaction)
+
 [transcribe]
 enabled = true                              # voice and audio notes get a transcript in the configured language
 # whisper_cli and models_dir default to ~/work/whisper.cpp, the build every city on the host shares; set both to place it elsewhere.

@@ -1,0 +1,1 @@
+description = "React to the paired user's last accepted message (or --message-id <id>); --reaction done when the work it asked for is finished, seen, none to clear, or one emoji"

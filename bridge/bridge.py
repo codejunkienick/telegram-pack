@@ -61,6 +61,21 @@ GC_OUTBOUND_TIMEOUT = 35
 # The receipt of a send whose every attempt failed before sending: delivered
 # false, failure_kind transient. Its ledger row is not final.
 NOT_SENT_REASON = 'transport_unavailable_not_sent'
+# Reactions on the paired user's messages ([reactions]): none unless
+# on_accept is set or an agent asks. Telegram's reaction list has no check
+# mark, so "done" defaults to the OK hand.
+REACTIONS_KEYS = {'on_accept', 'seen', 'done'}
+REACTIONS_DEFAULTS = dict(on_accept=False, seen='\U0001F440', done='\U0001F44C')
+REACTION_MAX_CHARS = 16
+
+
+def valid_reaction_emoji(value):
+    """One reaction emoji as the settings and `react` accept it: a non-empty
+    string of at most 16 characters, no whitespace, control character or ASCII
+    letter or digit. Whether Telegram allows it is Telegram's 400 to say."""
+    return (isinstance(value, str) and 0 < len(value) <= REACTION_MAX_CHARS
+            and not any(c.isspace() or (c.isascii() and c.isalnum()) for c in value)
+            and not Bridge._CONTROL_RE.search(value))
 PACK_DIR = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True  # the pack directory is read-only under the unit
 _transcriber_spec = importlib.util.spec_from_file_location(
@@ -444,6 +459,10 @@ class Store:
             # write lock, so a second process opening the ledger waits here.
             if 'decided' not in [row[1] for row in db.execute('PRAGMA table_info(asks)')]:
                 db.execute('ALTER TABLE asks ADD COLUMN decided INTEGER NOT NULL DEFAULT 0')
+            # The paired user's newest message GC durably accepted: one row,
+            # the target of `react` without --message-id.
+            db.execute('CREATE TABLE IF NOT EXISTS accepted (id INTEGER PRIMARY KEY CHECK (id = 1), '
+                       'message_id INTEGER NOT NULL, accepted_at TEXT NOT NULL)')
 
     @contextlib.contextmanager
     def connect(self):
@@ -541,6 +560,29 @@ class Store:
         """Record the ask as relayed once GC confirms the answer entry."""
         with self.connect() as db:
             db.execute('UPDATE asks SET relayed=1 WHERE ask_id=?', (ask_id,))
+
+    def record_accepted(self, message_id, accepted_at):
+        """Remember the last accepted message; a replayed older update never
+        moves it back."""
+        with self.connect() as db:
+            db.execute('INSERT INTO accepted VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET '
+                       'message_id=excluded.message_id, accepted_at=excluded.accepted_at '
+                       'WHERE excluded.message_id >= accepted.message_id', (message_id, accepted_at))
+
+    def last_accepted(self):
+        """The last accepted message's id, or None when none is recorded."""
+        with self.connect() as db:
+            row = db.execute('SELECT message_id FROM accepted WHERE id=1').fetchone()
+        return row[0] if row else None
+
+    def agent_reacted(self, message_id):
+        """True once a `react` call reserved a reaction for the message: the
+        accept reaction then never runs over it."""
+        prefix = f'reaction:{int(message_id)}:'
+        with self.connect() as db:
+            row = db.execute('SELECT 1 FROM deliveries WHERE substr(key, 1, ?) = ? AND key != ? LIMIT 1',
+                             (len(prefix), prefix, prefix + 'accept')).fetchone()
+        return row is not None
 
 
 def check_bridge_config(config, *, settings=False):
@@ -691,6 +733,11 @@ class Bridge:
         self.transcribe_queue = queue.Queue()
         self.transcribe_worker = None
         self.transcribe_worker_lock = threading.Lock()
+        # The settings loader validated [reactions]; without it, the defaults.
+        self.reactions = dict(REACTIONS_DEFAULTS, **(config.get('reactions') or {}))
+        self.reaction_queue = queue.Queue()
+        self.reaction_worker = None
+        self.reaction_worker_lock = threading.Lock()
         self.secret, self.port, self.request = callback_secret, port, request
         self.request_multipart = request_multipart
         self.request_media_group = request_media_group
@@ -1600,6 +1647,7 @@ class Bridge:
         if type(reply) is not int or reply <= 0:
             reply = None
         self._relay_to_gc(str(mid), relay_text, reply)
+        self._accepted(mid)
         # The message above is now durably queued for the mayor but it may be
         # quota-blocked and unable to answer it any time soon; tell the user once
         # per exhaustion episode rather than leaving the user wondering why the
@@ -1618,6 +1666,86 @@ class Bridge:
                 print(f'voice transcript queue not updated (msg {mid}); cursor retained', file=sys.stderr, flush=True)
                 raise
             self._enqueue_transcription((mid, day_dir))
+
+    # ---- reactions -------------------------------------------------------------
+    # setMessageReaction replaces the message's whole reaction list (a bot sets
+    # at most one), so a repeat can never stack a second reaction.
+
+    def _accepted(self, mid):
+        """The accept point: GC durably accepted message `mid` from the paired
+        user. Record it as the last accepted message and, with on_accept,
+        queue the seen reaction for the worker. Never raises: the inbound
+        cursor never waits on, or is retained by, a reaction."""
+        try:
+            self.store.record_accepted(mid, datetime.datetime.now(datetime.timezone.utc).isoformat())
+        except Exception:  # noqa: BLE001 - the relay already succeeded
+            self._log(f'accepted message not recorded (msg {mid})')
+        if self.reactions['on_accept']:
+            try:
+                self._enqueue_reaction(mid)
+            except Exception:  # noqa: BLE001 - e.g. no thread could start; the relay already succeeded
+                self._log(f'reaction not set (msg {mid}): reaction_worker_unavailable')
+
+    def _enqueue_reaction(self, mid):
+        with self.reaction_worker_lock:
+            if self.reaction_worker is None:
+                worker = threading.Thread(target=self._reaction_loop, daemon=True, name='accept-reaction')
+                worker.start()
+                self.reaction_worker = worker
+        self.reaction_queue.put(mid)
+
+    def _reaction_loop(self):
+        while True:
+            mid = self.reaction_queue.get()
+            try:
+                receipt = self.set_reaction(mid, self.reactions['seen'], f'reaction:{mid}:accept', once=True)
+                if receipt is not None and not receipt.get('delivered'):
+                    self._log(f"reaction not set (msg {mid}): {receipt['metadata']['reason']}")
+            except Exception:  # noqa: BLE001 - the worker must outlive any single reaction
+                self._log(f'reaction not set (msg {mid}): reaction_failed')
+            finally:
+                self.reaction_queue.task_done()
+
+    @contextlib.contextmanager
+    def _reaction_lock(self):
+        """An flock beside the ledger that the daemon's accept worker and every
+        `react` process hold from their check to Telegram's answer, so the two
+        never interleave: a seen still in flight finishes before a done goes."""
+        fd = os.open(self.store.path + '.reactions.lock', os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)
+
+    def set_reaction(self, message_id, emoji, key, once=False):
+        """Set one emoji reaction (None clears) on a message of the paired chat
+        under its own ledger key. With `once` (the accept reaction) a not-sent
+        attempt is saved as final, so a replayed update never sets it later,
+        and nothing is sent once a `react` call reserved one for the message:
+        None then. setMessageReaction replaces the whole list, so a late seen
+        would erase a done."""
+        body = dict(chat_id=self.config['chat_id'], message_id=int(message_id),
+                    reaction=[dict(type='emoji', emoji=emoji)] if emoji else [])
+
+        def deliver(pending):
+            receipt = pending
+            try:
+                status, data = self._send('setMessageReaction',
+                                          lambda timeout: self.telegram('setMessageReaction', body, timeout))
+                if status == 200 and data.get('ok') is True and data.get('result') is True:
+                    receipt = self.receipt(True, message_id=str(message_id))
+                elif data.get('ok') is False and 400 <= data.get('error_code', 0) < 500:
+                    receipt = self.receipt(reason='telegram_rejected_not_sent_' + str(data['error_code']))
+            except RequestNotSent:
+                receipt = self.receipt(reason=NOT_SENT_REASON) if once else self.not_sent()
+            except TransportError:
+                pass
+            return receipt
+        with self._reaction_lock():
+            if once and self.store.agent_reacted(message_id):
+                return None
+            return self._reserve_and_deliver(key, body, deliver)
 
     # ---- city commands ([[command]]) -----------------------------------------
     # A registered slash command or a button press under a registered
@@ -2905,8 +3033,8 @@ def _conflict_exit_status(value):
     return status
 
 
-def _positive_message_id(value):
-    if not (value.isascii() and value.isdecimal()) or not 1 <= int(value) <= 2 ** 63 - 1:
+def _message_id_arg(value):
+    if not re.fullmatch(r'[1-9][0-9]{0,18}', value or '') or int(value) > 2 ** 63 - 1:
         raise argparse.ArgumentTypeError('--message-id must be a positive integer')
     return int(value)
 
@@ -2919,8 +3047,8 @@ def _build_parser():
     parser.add_argument('--city-root', type=Path, default=_default_city_root(),
                         help='only used to find the default settings file')
     parser.add_argument('--port', type=int, help='overrides the settings\' port')
-    parser.add_argument('command', choices=('run', 'probe', 'send', 'reply-current', 'ask-close', 'set-commands',
-                                            'render-unit', 'check-install'))
+    parser.add_argument('command', choices=('run', 'probe', 'send', 'reply-current', 'ask-close', 'react',
+                                            'set-commands', 'render-unit', 'check-install'))
     parser.add_argument('--body-file', type=Path,
                         help='file holding the message text (send, reply-current)')
     parser.add_argument('--idempotency-key',
@@ -2942,12 +3070,15 @@ def _build_parser():
     parser.add_argument('--silent', action='store_true',
                         help='send, reply-current: notify with no sound '
                              '(publishes directly in this process, never through GC)')
-    parser.add_argument('--message-id', type=_positive_message_id,
-                        help='ask-close: the message ID the ask was sent as')
+    parser.add_argument('--message-id', type=_message_id_arg,
+                        help='ask-close: the message ID the ask was sent as; react: the message to '
+                             'react to (default: the last accepted message)')
     parser.add_argument('--ask-key',
                         help="ask-close: the ask send's --idempotency-key, instead of --message-id")
     parser.add_argument('--decision',
                         help='ask-close: the decision made, one line, shown under the ask in place of its buttons')
+    parser.add_argument('--reaction',
+                        help='react: seen or done (the settings\' emoji), none to clear, or one emoji')
     parser.add_argument('--gpu-probe', action='store_true',
                         help='check-install: also transcribe a clip on the GPU inside the bridge unit\'s sandbox')
     parser.add_argument('--clip', type=Path,
@@ -2966,13 +3097,17 @@ def _validate_attachment_flags(parser, args):
         parser.error('--gpu-probe is a check-install flag')
     if args.clip and not args.gpu_probe:
         parser.error('--clip requires --gpu-probe')
+    if args.reaction is not None and args.command != 'react':
+        parser.error('--reaction is a react flag')
+    if args.message_id is not None and args.command not in ('react', 'ask-close'):
+        parser.error('--message-id is a react and ask-close flag')
     if getattr(args, 'conflict_exit_status_given', False) and args.command != 'run':
         parser.error('--conflict-exit-status is a run flag')
     selectors = [flag for flag, value in (('--message-id', args.message_id), ('--ask-key', args.ask_key))
                  if value is not None]
     if args.command != 'ask-close':
-        if selectors or args.decision is not None:
-            parser.error('--message-id, --ask-key and --decision are ask-close flags')
+        if args.ask_key is not None or args.decision is not None:
+            parser.error('--ask-key and --decision are ask-close flags')
     elif len(selectors) != 1:
         parser.error('ask-close requires exactly one of --message-id and --ask-key')
     elif args.decision is None:
@@ -3112,6 +3247,33 @@ def _dispatch_outbound(bridge, args, text):
     return message_id
 
 
+def _react(bridge, args):
+    """Set the --reaction on --message-id, else on the last accepted message,
+    directly from this process: GC's outbound relay cannot carry a reaction.
+    Each call has its own ledger key, so an earlier ambiguous one never
+    blocks it. Returns the message id."""
+    if args.reaction in ('seen', 'done'):
+        emoji = bridge.reactions[args.reaction]
+    elif args.reaction == 'none':
+        emoji = None
+    elif valid_reaction_emoji(args.reaction):
+        emoji = args.reaction
+    else:
+        raise TransportError('--reaction must be seen, done, none or one emoji')
+    message_id = args.message_id if args.message_id is not None else bridge.store.last_accepted()
+    if message_id is None:
+        raise TransportError('no accepted message to react to')
+    key = f'reaction:{message_id}:{time.time_ns()}-{secrets.token_hex(4)}'
+    receipt = bridge.set_reaction(message_id, emoji, key)
+    if not receipt.get('delivered'):
+        reason = receipt['metadata']['reason']
+        _print_gc_receipt(False, receipt.get('failure_kind', 'permanent'), reason)
+        if reason == NOT_SENT_REASON:
+            raise TransportError(NOT_SENT_MESSAGE)
+        raise TransportError('Telegram reaction not set: ' + reason)
+    return message_id
+
+
 # ---- per-city settings ------------------------------------------------------
 # Everything that differs between two cities running this bridge comes from
 # one owner-only TOML file outside the repository (settings.example.toml in
@@ -3127,7 +3289,7 @@ _MODEL_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,79}')
 SETTINGS_KEYS = {'city', 'state_dir', 'port', 'python', 'token_file', 'callback_secret_file', 'lock_dir', 'unit',
                  'user_display_name', 'timezone', 'gc_base_url', 'gc_api_token_file', 'health_file',
                  'pairing_update_id', 'bot', 'menu', 'transcribe', 'agent', 'command',
-                 'handler_write_paths'}
+                 'handler_write_paths', 'reactions'}
 BOT_KEYS = {'bot_id', 'user_id', 'chat_id', 'account_id'}
 COMMAND_KEYS = {'name', 'description', 'handler', 'url', 'menu', 'callback_prefix', 'timeout'}
 # Commands the bridge itself owns: /start is never relayed.
@@ -3418,6 +3580,14 @@ def load_settings(path, home=None):
         config['agent'] = agent
     if city_commands:
         config['commands'] = city_commands
+    if 'reactions' in data:
+        reactions = dict(REACTIONS_DEFAULTS, **_table(data, 'reactions', REACTIONS_KEYS))
+        _bool_setting(reactions['on_accept'], 'reactions.on_accept')
+        for name in ('seen', 'done'):
+            if not valid_reaction_emoji(reactions[name]):
+                raise SettingsError(f'settings: reactions.{name} must be one emoji: at most '
+                                    f'{REACTION_MAX_CHARS} characters, no space, letter or digit')
+        config['reactions'] = reactions
     optional = (('gc_api_token_path', data.get('gc_api_token_file'), 'gc_api_token_file'),
                 ('health_file', data.get('health_file'), 'health_file'))
     for key, value, what in optional:
@@ -4044,6 +4214,10 @@ def main():
                                      'run the same command again to send the edit')
             raise TransportError(f'ask closed; Telegram edit not confirmed: {reason}')
         print('Telegram ask closed; message ID ' + str(receipt['message_id']))
+    elif args.command == 'react':
+        if args.reaction is None:
+            parser.error('react requires --reaction seen|done|none|<emoji>')
+        print('Telegram reaction set; message ID ' + str(_react(bridge, args)))
     else:
         # Token-wide lock survives alternate state directories; never unlink while locked.
         with (settings.lock_dir / ('telegram-bot-' + str(settings.config['bot_id']) + '.lock')).open('a') as lock:
