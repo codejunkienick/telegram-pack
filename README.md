@@ -28,6 +28,9 @@ itself.
 - A city keeps one pinned message per slot at the top of the chat,
   edited in place (`gc telegram pin`), such as a list of what waits on
   the user.
+- A city gives the paired chat topics, one per subject beside General,
+  each its own GC conversation: `gc telegram topics` creates the topics its
+  settings list (`[[topic]]`) once and prints the line that binds each.
 - The paired user gets a slash command menu, and a city adds commands
   through its own handler programs that answer with text and inline
   buttons and need no enable flag.
@@ -53,7 +56,7 @@ itself.
 
 | Path | What |
 | --- | --- |
-| `bridge/bridge.py` | the bridge: `run`, `probe`, `send`, `reply-current`, `ask-close`, `react`, `pin`, `set-commands`, `render-unit`, `check-install` |
+| `bridge/bridge.py` | the bridge: `run`, `probe`, `send`, `reply-current`, `ask-close`, `react`, `pin`, `topics`, `set-commands`, `render-unit`, `check-install` |
 | `bridge/OPERATIONS.md` | the operations guide: settings, launch, delivery recovery, transcription |
 | `bridge/test_*.py` | `sh scripts/test.sh` (fake Telegram, GC and whisper-cli; no network). Set `TEST_PORT_RANGE=LOW-HIGH` to bind test servers inside that range. Pick a range that excludes ports the host's own services use. |
 | `settings.example.toml` | every settings key, with example values |
@@ -64,6 +67,7 @@ itself.
 | `commands/ask-close/` | `gc telegram ask-close`: close an open ask with the decision made (`--message-id` or `--ask-key`, `--decision`) |
 | `commands/react/` | `gc telegram react`: react to the paired user's last accepted message (or `--message-id`) |
 | `commands/pin/` | `gc telegram pin`: keep one pinned message per slot, edited in place (`--slot`, `--body-file` or `--unpin`) |
+| `commands/topics/` | `gc telegram topics`: create the settings' topics once and print their bind lines (`--record <name> --thread-id <id>`, `--retry <name>`) |
 | `skills/` | the shared skills: `telegram-formatting`, `telegram-attachments`, `telegram-voice-transcripts` |
 
 ## Add-ons
@@ -186,6 +190,13 @@ with this pack at `<pack>`:
    `gc extmsg bind --provider telegram --account-id <bot username> --conversation-id <chat id> --agent mayor --json`.
    The printed record names the conversation and the agent mayor. There is
    no wildcard route, and `gc extmsg bind --help` lists every flag.
+
+   Topics (optional): (you) in BotFather's settings for the bot, turn topic
+   mode on and leave users creating topics off; (agent or shell) add one
+   `[[topic]]` table per topic to the settings (`settings.example.toml`),
+   run `gc telegram topics`, and run each `bind:` line it prints, before
+   anyone writes in that topic. Success: a `topic <name>: thread <id>` line
+   for every topic and exit status 0. See `bridge/OPERATIONS.md`, "Topics".
 5. (shell) `<pack>/install.sh --settings ~/.config/<city>/telegram-bridge.toml`: it
    creates the callback secret and the shared queue directory if they are
    missing. On Linux and WSL 2 it renders

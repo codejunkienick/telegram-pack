@@ -215,6 +215,7 @@ class ExampleSettingsTests(unittest.TestCase):
                        'gpu_min_free_mb'},
         'reactions': {'on_accept', 'seen', 'done'},
         'typing': {'seconds'},
+        'topic': {'name', 'agent'},
     }
 
     def setUp(self):
@@ -226,7 +227,7 @@ class ExampleSettingsTests(unittest.TestCase):
         for line in text.splitlines():
             stripped = line.strip()
             content = stripped.lstrip('#').strip() if stripped.startswith('#') else stripped
-            header = re.fullmatch(r'\[\[(menu|command)\]\]|\[(bot|transcribe|reactions|typing)\]', content)
+            header = re.fullmatch(r'\[\[(menu|command|topic)\]\]|\[(bot|transcribe|reactions|typing)\]', content)
             if header:
                 section = header.group(1) or header.group(2)
                 keys.setdefault(section, set())
@@ -263,7 +264,7 @@ class ExampleSettingsTests(unittest.TestCase):
             stripped = line.strip()
             commented = stripped.startswith('#')
             content = stripped.lstrip('#').strip() if commented else stripped
-            header = re.fullmatch(r'\[\[(menu|command)\]\]|\[(bot|transcribe|reactions|typing)\]', content)
+            header = re.fullmatch(r'\[\[(menu|command|topic)\]\]|\[(bot|transcribe|reactions|typing)\]', content)
             if header:
                 section = header.group(1) or header.group(2)
                 lines.append(content)
@@ -298,13 +299,16 @@ class ExampleSettingsTests(unittest.TestCase):
                 self.assertIn('url' if command == 'url' else 'handler', settings.config['commands'][0])
                 self.assertIsNotNone(settings.transcribe)
                 data = tomllib.loads(path.read_text())
-                loaded[''] |= set(data) - {'bot', 'menu', 'command', 'transcribe', 'reactions', 'typing'}
+                loaded[''] |= set(data) - {'bot', 'menu', 'command', 'transcribe', 'reactions', 'typing', 'topic'}
                 loaded['bot'] |= set(data['bot'])
                 loaded['menu'] |= set(data['menu'][0])
                 loaded['command'] |= set(data['command'][0])
                 loaded['transcribe'] |= set(data['transcribe'])
                 loaded['reactions'] |= set(data['reactions'])
                 loaded['typing'] |= set(data['typing'])
+                loaded['topic'] |= set(data['topic'][0])
+                self.assertEqual(settings.config['topics'],
+                                 (dict(name='ops', agent='mayor'), dict(name='web', agent='mayor')))
         self.assertEqual(loaded, dict(self.EXPECTED, command=self.EXPECTED['command'] | {'url'}))
         path = self._write_example()
         path.write_text('unknown_example_key = 1\n' + path.read_text())

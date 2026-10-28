@@ -56,6 +56,14 @@ description = "Show the agent's status"
 # [typing]
 # seconds = 300                             # the longest it shows after the latest accepted message, 0-900; default 0: never
 
+# Topics in the paired private chat, each its own GC conversation (OPERATIONS.md,
+# "Topics"): `gc telegram topics` creates each once and prints the line that binds it.
+# [[topic]]
+# name = "ops"                              # the topic's name in the chat, 1-128 characters, unique ignoring case
+# agent = "mayor"                           # the gc agent its bind line names; default the settings' agent
+# [[topic]]
+# name = "web"
+
 [transcribe]
 enabled = true                              # voice and audio notes get a transcript in the configured language
 # whisper_cli and models_dir default to ~/work/whisper.cpp, the build every city on the host shares; set both to place it elsewhere.

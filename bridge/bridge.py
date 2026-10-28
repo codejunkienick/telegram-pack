@@ -24,6 +24,7 @@ import queue
 import re
 import secrets
 import selectors
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -474,6 +475,12 @@ class Store:
                        'message_id INTEGER NOT NULL, accepted_at TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS pins (slot TEXT PRIMARY KEY, generation INTEGER NOT NULL DEFAULT 1, '
                        'message_id INTEGER, revision INTEGER NOT NULL DEFAULT 0, fingerprint TEXT)')
+            # Topics of the paired chat (OPERATIONS.md, "Topics"): each
+            # settings name's thread id, created by `topics` or recorded by
+            # hand, and the attempt its create key topic:<attempt>:<name> uses.
+            db.execute('CREATE TABLE IF NOT EXISTS topics (name TEXT PRIMARY KEY, thread_id INTEGER NOT NULL UNIQUE, '
+                       'source TEXT NOT NULL, recorded_at TEXT NOT NULL)')
+            db.execute('CREATE TABLE IF NOT EXISTS topic_attempts (name TEXT PRIMARY KEY, attempt INTEGER NOT NULL)')
 
     @contextlib.contextmanager
     def connect(self):
@@ -621,6 +628,45 @@ class Store:
         with self.connect() as db:
             db.execute('UPDATE pins SET ' + ', '.join(f'{name}=?' for name in fields) + ' WHERE slot=?',
                        (*fields.values(), slot))
+
+    TOPIC_SOURCES = ('created', 'recorded')
+
+    def record_topic(self, name, thread_id, source):
+        """Record a topic's thread id in one transaction. Returns None, or the
+        refusal: topic_already_recorded when the name has a row,
+        thread_id_already_recorded when another row holds the thread id."""
+        if source not in self.TOPIC_SOURCES:
+            raise ValueError('topic source must be created or recorded')
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if db.execute('SELECT 1 FROM topics WHERE name=?', (name,)).fetchone():
+                return 'topic_already_recorded'
+            if db.execute('SELECT 1 FROM topics WHERE thread_id=?', (thread_id,)).fetchone():
+                return 'thread_id_already_recorded'
+            db.execute('INSERT INTO topics VALUES (?, ?, ?, ?)', (name, thread_id, source,
+                       datetime.datetime.now(datetime.timezone.utc).isoformat()))
+        return None
+
+    def topic_rows(self):
+        """Every recorded topic, in the order recorded: dicts of name,
+        thread_id, source and recorded_at."""
+        with self.connect() as db:
+            rows = db.execute('SELECT name, thread_id, source, recorded_at FROM topics ORDER BY rowid').fetchall()
+        return [dict(zip(('name', 'thread_id', 'source', 'recorded_at'), row)) for row in rows]
+
+    def topic_attempt(self, name):
+        """The attempt a topic's create key uses: 1 until --retry raises it."""
+        with self.connect() as db:
+            row = db.execute('SELECT attempt FROM topic_attempts WHERE name=?', (name,)).fetchone()
+        return row[0] if row else 1
+
+    def raise_topic_attempt(self, name):
+        """Raise a topic's attempt by one in one write; returns the new one."""
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute('INSERT INTO topic_attempts VALUES (?, 2) ON CONFLICT(name) DO UPDATE SET attempt=attempt+1',
+                       (name,))
+            return db.execute('SELECT attempt FROM topic_attempts WHERE name=?', (name,)).fetchone()[0]
 
     def deliveries_mark(self):
         """The highest rowid of the deliveries table, 0 when it is empty: rows
@@ -814,6 +860,9 @@ class Bridge:
         # The city's own commands ([[command]]), by name in file order; the
         # settings loader has validated every entry.
         self.commands = {command['name']: command for command in config.get('commands') or ()}
+        # The city's topics of the paired chat ([[topic]]), each {name, agent}
+        # in file order; their thread ids live in the ledger.
+        self.topic_settings = tuple(config.get('topics') or ())
         # The gc agent this bridge serves (check_bridge_config validated it):
         # inbound must be routed to it, and the quota-exhaustion notice
         # watches its session.
@@ -3199,6 +3248,224 @@ class Bridge:
         except TransportError:
             return pending
 
+    # ---- topics of the paired private chat (OPERATIONS.md, "Topics") ----
+    _THREAD_ID_RE = re.compile(r'[1-9][0-9]{0,18}')
+    TOPIC_USERS_WARNING = 'WARN users may create and delete topics in this chat (BotFather setting)'
+
+    def topic_conversation(self, thread_id):
+        """The GC conversation of one topic: a thread whose parent is the
+        paired chat. GC compares all six fields, so it is built the same way
+        every time."""
+        chat = str(self.config['chat_id'])
+        return dict(scope_id=self.city, provider='telegram', account_id=self.account,
+                    conversation_id=f'{chat}:topic:{thread_id}', parent_conversation_id=chat, kind='thread')
+
+    def _recorded_topics(self):
+        """The settings' topics that have a ledger row, in file order, each
+        {name, agent, thread_id, conversation}. The ledger is read on every
+        call: the CLI may record a topic while the daemon runs."""
+        if not self.topic_settings or self.store is None:
+            return []
+        rows = {row['name']: row['thread_id'] for row in self.store.topic_rows()}
+        return [dict(topic, thread_id=rows[topic['name']], conversation=self.topic_conversation(rows[topic['name']]))
+                for topic in self.topic_settings if topic['name'] in rows]
+
+    def topic_by_thread(self, thread_id):
+        """The configured, recorded topic with this thread id, or None."""
+        return next((topic for topic in self._recorded_topics() if topic['thread_id'] == thread_id), None)
+
+    def topic_by_name(self, name):
+        """The configured, recorded topic with this name, or None."""
+        return next((topic for topic in self._recorded_topics() if topic['name'] == name), None)
+
+    def conversation_for_id(self, conversation_id):
+        """The ref of a conversation id this bridge serves: the paired chat's
+        own ref for <chat_id>, a configured, recorded topic's ref for
+        <chat_id>:topic:<thread_id>, else None."""
+        chat = str(self.config['chat_id'])
+        if conversation_id == chat:
+            return self.conversation
+        prefix = chat + ':topic:'
+        if isinstance(conversation_id, str) and conversation_id.startswith(prefix):
+            thread = conversation_id[len(prefix):]
+            if self._THREAD_ID_RE.fullmatch(thread):
+                topic = self.topic_by_thread(int(thread))
+                return topic['conversation'] if topic else None
+        return None
+
+    @contextlib.contextmanager
+    def _topics_lock(self):
+        """Hold <state_dir>/telegram-topics.lock (owner-only, never the bot
+        lock) for one whole `topics` run, so two runs never both create."""
+        fd = os.open(Path(self.store.path).parent / 'telegram-topics.lock', os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)  # closing releases the lock; the file is never unlinked
+
+    def _topic_key(self, name):
+        return f'topic:{self.store.topic_attempt(name)}:{name}'
+
+    @staticmethod
+    def _topic_created(receipt):
+        """The thread id a delivered create receipt carries, else None."""
+        if isinstance(receipt, dict) and receipt.get('delivered') is True:
+            thread_id = receipt.get('message_thread_id')
+            if type(thread_id) is int and thread_id > 0:
+                return thread_id
+        return None
+
+    def _topic_mode(self):
+        """getMe before any create: True when users may create topics too.
+        Raises when topic mode is off, so nothing is created."""
+        status, data = self.telegram('getMe', {})
+        bot = data.get('result')
+        if status != 200 or data.get('ok') is not True or not isinstance(bot, dict):
+            raise TransportError(f'Telegram getMe failed (HTTP {status}); no topic created')
+        if bot.get('id') != self.config['bot_id'] or bot.get('is_bot') is not True:
+            raise TransportError('Telegram bot identity mismatch; no topic created')
+        if bot.get('has_topics_enabled') is not True:
+            raise TransportError('topic mode is off for this bot; switch it on with BotFather')
+        return bot.get('allows_users_to_create_topics') is True
+
+    def create_topic(self, name, attempt):
+        """Create one topic in the paired chat, exactly once under
+        topic:<attempt>:<name>; its ledger row is written in the same
+        deliver step. Returns the receipt (message_thread_id when delivered)."""
+        identity = dict(type='create_topic', name=name, attempt=attempt)
+        return self._reserve_and_deliver(f'topic:{attempt}:{name}', identity,
+                                         lambda pending: self._deliver_create_topic(name, pending))
+
+    def _deliver_create_topic(self, name, pending):
+        """createForumTopic: confirmed only by HTTP 200 with a ForumTopic of
+        this name and a thread id > 0; rejected on a 4xx, not sent when no
+        byte left, else the pending (ambiguous) receipt."""
+        body = dict(chat_id=self.config['chat_id'], name=name)
+        try:
+            status, data = self._send('createForumTopic', lambda timeout: self.telegram('createForumTopic', body,
+                                                                                           timeout))
+        except RequestNotSent:
+            return self.not_sent()
+        except TransportError:
+            return pending
+        topic = data.get('result')
+        thread_id = topic.get('message_thread_id') if isinstance(topic, dict) else None
+        if (status == 200 and data.get('ok') is True and type(thread_id) is int and thread_id > 0
+                and topic.get('name') == name):
+            self.store.record_topic(name, thread_id, 'created')
+            return self.receipt(True, message_thread_id=thread_id)
+        if data.get('ok') is False and 400 <= data.get('error_code', 0) < 500:
+            return self.receipt(reason='telegram_rejected_not_sent_' + str(data['error_code']))
+        return pending
+
+    def topics(self, record=None, thread_id=None, retry=None):
+        """Create each settings topic without a ledger row once, in file order
+        (OPERATIONS.md, "Topics"), under the topics lock; never getUpdates, so
+        safe while the unit polls. `record` (with `thread_id`) records a
+        topic created by hand and makes no Telegram call; `retry` raises a
+        topic's attempt after an ambiguous or rejected create and creates it
+        again. A refusal raises TransportError before any Telegram call.
+        Returns (lines, complete): the report, and whether every settings
+        topic has a thread id."""
+        names = [topic['name'] for topic in self.topic_settings]
+        with self._topics_lock():
+            done = {}  # name -> how this run gave it its row
+            rows = {row['name']: row for row in self.store.topic_rows()}
+            # A confirmed create whose row is missing (a crash between the
+            # two) gets its row from the receipt; nothing is sent.
+            for name in names:
+                found = None if name in rows else self._topic_created(self.store.saved_receipt(self._topic_key(name)))
+                if found and self.store.record_topic(name, found, 'created') is None:
+                    done[name] = 'created'
+            rows = {row['name']: row for row in self.store.topic_rows()}
+            for flag, name in (('--record', record), ('--retry', retry)):
+                if name is None:
+                    continue
+                if name not in names:
+                    raise TransportError(f'topics {flag}: no [[topic]] named {name!r} in the settings')
+                if name in rows:
+                    raise TransportError(f'topics {flag}: topic {name} already has thread {rows[name]["thread_id"]}')
+            if record is not None:
+                if self.store.record_topic(record, thread_id, 'recorded') is not None:
+                    holder = next((row['name'] for row in rows.values() if row['thread_id'] == thread_id), '?')
+                    raise TransportError(f'topics --record: thread {thread_id} is already recorded for topic {holder}')
+                done[record] = 'recorded by hand'
+                rows = {row['name']: row for row in self.store.topic_rows()}
+            if retry is not None:
+                saved = self.store.saved_receipt(self._topic_key(retry))
+                if saved is None:
+                    raise TransportError(f'topics --retry: topic {retry} has no create to retry; '
+                                         'run topics without --retry')
+                if resendable(saved):
+                    raise TransportError(f'topics --retry: the create of topic {retry} was not sent; '
+                                         'send again: run topics without --retry')
+                if saved.get('delivered') is True:
+                    raise TransportError(f'topics --retry: topic {retry} was created; run topics without --retry')
+            # A plain run creates every topic without a row whose create was
+            # never tried or was not sent; --record makes no Telegram call.
+            create = []
+            if record is None:
+                for name in names:
+                    saved = self.store.saved_receipt(self._topic_key(name))
+                    if name not in rows and (name == retry or saved is None or resendable(saved)):
+                        create.append(name)
+            lines = []
+            if create and self._topic_mode():
+                lines.append(self.TOPIC_USERS_WARNING)
+            if retry is not None:
+                self.store.raise_topic_attempt(retry)
+            unreachable = False
+            for name in create:
+                if unreachable:
+                    continue
+                receipt = self.create_topic(name, self.store.topic_attempt(name))
+                if receipt.get('delivered') is True:
+                    done[name] = 'created'
+                unreachable = resendable(receipt)
+            rows = {row['name']: row for row in self.store.topic_rows()}
+            for topic in self.topic_settings:
+                name = topic['name']
+                if name in rows:
+                    thread = rows[name]['thread_id']
+                    ref = self.topic_conversation(thread)
+                    lines.append(f"topic {name}: thread {thread} ({done.get(name, 'recorded earlier')})")
+                    lines.append(f"bind: gc extmsg bind --provider telegram --account-id {self.account} "
+                                 f"--conversation-id {ref['conversation_id']} "
+                                 f"--parent-conversation-id {ref['parent_conversation_id']} "
+                                 f"--kind thread --agent {topic['agent']} --json")
+                else:
+                    reason, step = self._topic_not_created(name, unreachable)
+                    lines.append(f'topic {name}: not created ({reason})' + (f'; {step}' if step else ''))
+            if not names:
+                lines.append('no [[topic]] tables in the settings')
+            for name, row in rows.items():
+                if name not in names:
+                    lines.append(f"topic {name}: thread {row['thread_id']} "
+                                 '(not in settings; its messages reach the agent as not configured)')
+            return lines, all(name in rows for name in names)
+
+    def _topic_not_created(self, name, unreachable):
+        """Why a settings topic has no row, and what the operator does next:
+        (reason, next step or None)."""
+        saved = self.store.saved_receipt(self._topic_key(name))
+        command, quoted = 'gc telegram topics', shlex.quote(name)
+        if saved is None:
+            if unreachable:
+                return 'not attempted: Telegram could not be reached', f'run {command} again'
+            return 'not attempted', f'run {command} to create it'
+        found = self._topic_created(saved)
+        if found:
+            return f'created as thread {found}, which the ledger holds for another topic', None
+        reason = (saved.get('metadata') or {}).get('reason') or 'delivery not confirmed'
+        if resendable(saved):
+            return reason, f'run {command} again to send it'
+        if reason.startswith('telegram_rejected_not_sent_'):
+            return reason, f'fix the cause, then run {command} --retry {quoted}'
+        return reason, (f'check the chat: if topic {name} is there, write in it, take the thread id from the '
+                        f'"[topic: thread <id> | not configured" line the agent receives and run {command} '
+                        f'--record {quoted} --thread-id <id>; if it is not, run {command} --retry {quoted}')
+
     # Poll heartbeat for a city's health check: proof that getUpdates is
     # still succeeding, written at most once a minute. It judges health
     # by its age and pid, so a failed write only costs one stderr line.
@@ -3415,6 +3682,12 @@ def _message_id_arg(value):
     return int(value)
 
 
+def _thread_id_arg(value):
+    if not re.fullmatch(r'[1-9][0-9]{0,18}', value or '') or int(value) > 2 ** 63 - 1:
+        raise argparse.ArgumentTypeError('--thread-id must be a positive integer')
+    return int(value)
+
+
 def _build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--settings', type=Path,
@@ -3424,7 +3697,7 @@ def _build_parser():
                         help='only used to find the default settings file')
     parser.add_argument('--port', type=int, help='overrides the settings\' port')
     parser.add_argument('command', choices=('run', 'probe', 'send', 'reply-current', 'ask-close', 'react', 'pin',
-                                            'set-commands', 'render-unit', 'check-install'))
+                                            'topics', 'set-commands', 'render-unit', 'check-install'))
     parser.add_argument('--body-file', type=Path,
                         help='file holding the message text (send, reply-current)')
     parser.add_argument('--idempotency-key',
@@ -3459,6 +3732,13 @@ def _build_parser():
                         help='pin: the pinned message slot, [a-z0-9_-]{1,32}, updated to the text of --body-file')
     parser.add_argument('--unpin', action='store_true',
                         help="pin: unpin the slot's message instead of updating it")
+    parser.add_argument('--record', metavar='NAME',
+                        help='topics: record the thread id of a topic that exists in the chat, with --thread-id, '
+                             'instead of creating it')
+    parser.add_argument('--thread-id', type=_thread_id_arg,
+                        help='topics --record: the thread id of the topic')
+    parser.add_argument('--retry', metavar='NAME',
+                        help='topics: create a topic again after an unconfirmed or rejected create')
     parser.add_argument('--gpu-probe', action='store_true',
                         help='check-install: also transcribe a clip on the GPU inside the bridge unit\'s sandbox')
     parser.add_argument('--clip', type=Path,
@@ -3501,6 +3781,13 @@ def _validate_attachment_flags(parser, args):
         parser.error('pin requires exactly one of --body-file and --unpin')
     elif args.unpin and args.format != 'plain':
         parser.error('--format is a --body-file flag')
+    if args.command != 'topics':
+        if args.record is not None or args.thread_id is not None or args.retry is not None:
+            parser.error('--record, --thread-id and --retry are topics flags')
+    elif args.record is not None and args.retry is not None:
+        parser.error('topics takes at most one of --record and --retry')
+    elif (args.record is None) != (args.thread_id is None):
+        parser.error('topics --record requires --thread-id, and --thread-id requires --record')
 
 
 def _launchd_label(unit):
@@ -3678,7 +3965,7 @@ _MODEL_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,79}')
 SETTINGS_KEYS = {'city', 'state_dir', 'port', 'python', 'token_file', 'callback_secret_file', 'lock_dir', 'unit',
                  'user_display_name', 'timezone', 'gc_base_url', 'gc_api_token_file', 'health_file',
                  'pairing_update_id', 'bot', 'menu', 'transcribe', 'agent', 'command',
-                 'handler_write_paths', 'reactions', 'typing'}
+                 'handler_write_paths', 'reactions', 'typing', 'topic'}
 BOT_KEYS = {'bot_id', 'user_id', 'chat_id', 'account_id'}
 COMMAND_KEYS = {'name', 'description', 'handler', 'url', 'menu', 'callback_prefix', 'timeout'}
 # Commands the bridge itself owns: /start is never relayed.
@@ -3691,6 +3978,13 @@ _HANDLER_URL_RE = re.compile(r'http://(127\.0\.0\.1|\[::1\]):([0-9]{1,5})(/[A-Za
 # A callback prefix: printable ASCII without spaces, at most callback_data's 64 bytes.
 _CALLBACK_PREFIX_RE = re.compile(r'[\x21-\x7e]{1,64}')
 HANDLER_WRITE_PATHS_MAX = 256
+# A topic of the paired private chat (OPERATIONS.md, "Topics"): its name is
+# createForumTopic's, 1-128 characters; [, ] and | would break the relay's
+# topic line.
+TOPIC_KEYS = {'name', 'agent'}
+TOPIC_MAX = 50
+TOPIC_NAME_MAX = 128
+TOPIC_NAME_FORBIDDEN = '[]|'
 TRANSCRIBE_KEYS = {'enabled', 'whisper_cli', 'models_dir', 'model', 'vad_model', 'threads', 'cpus', 'timeout',
                    'timeout_per_minute', 'gpu', 'gpu_min_free_mb', 'method', 'gpu_check', 'language'}
 TRANSCRIBE_METHODS = ('auto', 'cpu', 'gpu')
@@ -3907,6 +4201,42 @@ def _command_settings(data, menu):
     return tuple(commands)
 
 
+def _topic_settings(data, agent):
+    """The validated [[topic]] entries, in file order, each {name, agent};
+    a topic's agent defaults to the settings' `agent`."""
+    entries = data.get('topic', [])
+    if not isinstance(entries, list):
+        raise SettingsError('settings: topic must be a list of [[topic]] tables')
+    topics, seen = [], {}
+    for index, item in enumerate(entries, 1):
+        def fail(problem):
+            raise SettingsError(f'settings: topic entry {index}: {problem}')
+        if index > TOPIC_MAX:
+            fail(f'more than {TOPIC_MAX} [[topic]] tables')
+        if not isinstance(item, dict):
+            fail('not a [[topic]] table')
+        unknown = sorted(set(item) - TOPIC_KEYS)
+        if unknown:
+            fail(f'unknown key {unknown[0]}')
+        name = item.get('name')
+        if not isinstance(name, str) or not 1 <= len(name) <= TOPIC_NAME_MAX:
+            fail(f'name must be a string of 1-{TOPIC_NAME_MAX} characters')
+        if name != name.strip():
+            fail('name has leading or trailing whitespace')
+        if any(unicodedata.category(char) in ('Cc', 'Zl', 'Zp') for char in name):
+            fail('name has a control or line separator character')
+        if any(char in TOPIC_NAME_FORBIDDEN for char in name):
+            fail('name has [, ] or |')
+        if name.casefold() in seen:
+            fail(f'name repeats topic entry {seen[name.casefold()]} (names differ in more than case)')
+        seen[name.casefold()] = index
+        topic_agent = item.get('agent', agent)
+        if not isinstance(topic_agent, str) or not NAME_RE.fullmatch(topic_agent):
+            fail('agent is missing or malformed')
+        topics.append(dict(name=name, agent=topic_agent))
+    return tuple(topics)
+
+
 def _handler_write_paths(data):
     """Directories the unit lets handlers write, besides the bridge's own."""
     raw = data.get('handler_write_paths', [])
@@ -3993,6 +4323,10 @@ def load_settings(path, home=None):
     protected.append(str(path))
     config['protected_paths'] = tuple(protected)
     check_bridge_config(config, settings=True)
+    # After the check, so a malformed settings' agent is named as itself.
+    topics = _topic_settings(data, agent)
+    if topics:
+        config['topics'] = topics
     unit = _text_setting(data.get('unit', f'{city}-telegram.service'), 'unit', _UNIT_RE, limit=128)
     config['unit'] = unit
 
@@ -4636,6 +4970,14 @@ def main():
             print(f'pin {slot} unchanged; message ID {receipt["message_id"]}')
         else:
             print(f'pinned message ID {receipt["message_id"]} (slot {slot}, revision {receipt["revision"]})')
+    elif args.command == 'topics':
+        # Directly in this process through the shared ledger, under its own
+        # lock; never getUpdates, so it runs beside the polling unit.
+        lines, complete = bridge.topics(record=args.record, thread_id=args.thread_id, retry=args.retry)
+        for line in lines:
+            print(line)
+        if not complete:
+            raise TransportError('not every [[topic]] has a thread id')
     else:
         # Token-wide lock survives alternate state directories; never unlink while locked.
         with (settings.lock_dir / ('telegram-bot-' + str(settings.config['bot_id']) + '.lock')).open('a') as lock:

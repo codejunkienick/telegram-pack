@@ -73,6 +73,7 @@ city.
 | `[transcribe]` | no | voice transcription (below); off by default |
 | `[reactions]` | no | `on_accept`, `seen`, `done`: the `seen` reaction on each accepted message and the emoji `react` sets ("Reactions" below); no reaction ever without `on_accept = true` or a `react` call |
 | `[typing]` | no | `seconds` (0-900, default 0): "typing..." in the chat after each accepted message until the next send, at most this long ("Typing" below); no chat action ever with 0 |
+| `[[topic]]` `name`, `agent` | no | topics of the paired chat, each its own GC conversation, created once by `topics` ("Topics" below); at most 50 |
 
 The health report at `health_file` is a JSON object with `observed_at`
 (ISO-8601 with zone, at most 10 minutes old) and `sessions`, a list of
@@ -785,6 +786,106 @@ chats", so a pin never rings. editMessageText's 48-hour limit applies only to
 business messages not sent by the bot, so the bot's own pinned message stays
 editable. Each new pin (a new generation) adds Telegram's one "pinned"
 service line to the chat; an edit adds nothing and never notifies.
+
+## Topics
+
+A city can give the paired chat topics: Telegram's threads in a private
+chat with a bot, one per subject, beside General, the chat outside any
+topic. Each topic is its own GC conversation, `<chat_id>:topic:<thread_id>`,
+with the paired chat's `<chat_id>` as its parent and kind `thread`, and
+needs its own binding: GC v1.5.0 has no parent fallback, so an unbound topic
+does not inherit the paired chat's agent (`internal/extmsg/inbound.go:110-145`).
+General stays the paired chat's conversation (`<chat_id>`, kind `dm`) and
+behaves exactly as without topics. This version keeps the topics and their
+thread ids; it does not yet relay a message written in a topic on the
+topic's conversation or answer in the topic: such a message reaches the
+agent as one in the paired chat, and every reply lands in General.
+
+Prerequisites, in BotFather's settings for the bot: topic mode on (getMe's
+`has_topics_enabled`), and users creating and deleting topics off
+(`allows_users_to_create_topics`), so the city's topics are the only ones
+and nobody deletes one, with all its messages, from the phone.
+
+The settings name the topics, one `[[topic]]` table each, at most 50, in the
+order `topics` creates them:
+
+| `[[topic]]` key | required | meaning |
+| --- | --- | --- |
+| `name` | yes | the topic's name in the chat: 1-128 characters, no leading or trailing whitespace, no control or line separator character (Unicode categories Cc, Zl and Zp), none of `[`, `]` and `\|`; unique ignoring case |
+| `agent` | no | the gc agent the topic's bind line names; default the settings' `agent` |
+
+A file without `[[topic]]` loads exactly as before. A bad entry refuses every
+command with one line, `settings: topic entry <n>: <problem>`. No thread id
+is a setting: Telegram assigns it when it creates the topic, and the
+ledger's `topics` table keeps it.
+
+`gc telegram topics` (the pack command runs `bridge.py topics`; as with
+`reply-current`, `TELEGRAM_BRIDGE_SETTINGS` selects a second bridge's
+settings) creates each `[[topic]]` that has no thread id once, in file
+order. It holds `<state_dir>/telegram-topics.lock` (created owner-only,
+never the bot lock) for its whole run and never calls getUpdates, so it runs
+beside the polling unit. In order:
+
+- Before the first create, getMe. With topic mode off it exits 1 with
+  `topic mode is off for this bot; switch it on with BotFather` and creates
+  nothing. When users may create topics it prints
+  `WARN users may create and delete topics in this chat (BotFather setting)`
+  and goes on.
+- Each create is createForumTopic `{"chat_id": <chat_id>, "name": <name>}`
+  through the ledger under `topic:<attempt>:<name>` (attempt 1 until
+  `--retry` raises it). It is confirmed only by HTTP 200 with a topic of that
+  name and a thread id above 0, and the thread id is recorded in the same
+  step. A confirmed create whose row is missing (a crash between the two)
+  gets its row from the saved receipt on the next run, with no send.
+- A 4xx is `telegram_rejected_not_sent_<code>`. A create that never left the
+  host is not sent: the next plain run sends it under the same key, and this
+  run creates nothing after it (Telegram is unreachable). Anything else is
+  `ambiguous_delivery_requires_manual_reconciliation`, and no run sends it
+  again.
+
+Output, one line each, in settings order: for a topic with a thread id
+
+```text
+topic <name>: thread <id> (created|recorded earlier|recorded by hand)
+bind: gc extmsg bind --provider telegram --account-id <account_id> --conversation-id <chat_id>:topic:<id> --parent-conversation-id <chat_id> --kind thread --agent <agent> --json
+```
+
+and for one without, `topic <name>: not created (<reason>); <next step>`;
+then, for each ledger row whose name left the settings,
+`topic <name>: thread <id> (not in settings; its messages reach the agent as not configured)`.
+It exits 0 only when every `[[topic]]` has a thread id, else 1 after
+printing every line. It binds, edits and deletes nothing.
+
+Run each printed `bind:` line once, before anyone writes in that topic: with
+a `[[extmsg.default_route]]` for telegram, the first message in an unbound
+topic would bind it to that route's agent, and the binding sticks
+(`internal/config/extmsg.go:6-30`).
+
+Recovering an unconfirmed create: check the chat. If the topic is there,
+write in it, take the thread id from the `[topic: thread <id> | not
+configured ...]` line the agent receives for that message (once topic
+messages are relayed), and run
+`gc telegram topics --record <name> --thread-id <id>`: it records the
+thread id with no Telegram call, and is refused when the name is not a
+`[[topic]]`, already has a thread id, or the id is another topic's. If the
+topic is not there, run `gc telegram topics --retry <name>`: it raises the
+attempt and creates the topic under the new key. `--retry` is refused unless
+the create was ambiguous or rejected; for one not sent it says
+`send again: run topics without --retry`. After a rejection, fix its cause
+first. `--record` and `--retry` are exclusive, and `--thread-id` goes only
+with `--record`.
+
+The bridge never deletes, closes or renames a topic: deleteForumTopic would
+delete all its messages. A changed `name` is a new topic, which the next
+`topics` creates; the old one stays in the chat, unserved, and its row is
+printed as not in settings. A removed `[[topic]]` stops serving its topic the
+same way.
+
+Telegram Bot API (read 2026-10-27, Bot API 10.3): `User.has_topics_enabled`
+and `User.allows_users_to_create_topics` are "Returned only in getMe" (9.3
+and 9.4); createForumTopic creates "a topic in a forum supergroup chat or a
+private chat with a user" (9.4) with a name of 1-128 characters, and returns
+a ForumTopic with its `message_thread_id`.
 
 ## Inbound media relay
 

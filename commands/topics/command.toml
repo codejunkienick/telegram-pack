@@ -1,0 +1,1 @@
+description = "Create each [[topic]] of the settings once in the paired private chat and print the line that binds it; --record <name> --thread-id <id> records a topic that exists, --retry <name> creates again after an unconfirmed or rejected create"
