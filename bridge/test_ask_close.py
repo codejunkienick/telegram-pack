@@ -314,7 +314,7 @@ class AskCloseTests(BridgeTestCase):
         b.Store(path, 10)  # a second open finds the column and adds nothing
         with closing(sqlite3.connect(path)) as db:
             columns = [(row[1], row[2], row[3], row[4]) for row in db.execute('PRAGMA table_info(asks)')]
-        self.assertEqual(columns[-1], ('decided', 'INTEGER', 1, '0'))
+        self.assertEqual(columns[-2:], [('decided', 'INTEGER', 1, '0'), ('conversation_id', 'TEXT', 0, None)])
         self.assertEqual([name for name, *_ in columns].count('decided'), 1)
         ask = self.store.get_ask(ask_id)
         self.assertEqual((ask['answered'], ask['decided'], ask['message_id']), (False, False, 77))

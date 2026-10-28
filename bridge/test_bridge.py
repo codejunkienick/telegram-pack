@@ -1193,7 +1193,9 @@ class BridgeTests(BridgeTestCase):
         for text in ('file holding the message text (send, reply-current)',
                      'one stable key per logical message: a retry reuses it with the same body; '
                      'a new message takes a new key',
-                     "optional; must equal the settings' bot.chat_id",
+                     "optional: the settings' bot.chat_id, or <chat id>:topic:<thread id> of a configured "
+                     'topic, as the message notice names it',
+                     'send, reply-current: send into the configured topic of this name, instead of --conversation-id',
                      'absolute path of a file to send, the body as its caption'):
             self.assertIn(text, help_text)
 
@@ -1774,7 +1776,7 @@ class AskTests(BridgeTestCase):
                                    ('options', 'TEXT'), ('message_id', 'INTEGER'),
                                    ('answered', 'INTEGER'), ('answer', 'TEXT'),
                                    ('update_id', 'INTEGER'), ('relayed', 'INTEGER'), ('kind', 'TEXT'),
-                                   ('decided', 'INTEGER')])
+                                   ('decided', 'INTEGER'), ('conversation_id', 'TEXT')])
 
     def test_command_keyboard_on_a_photo_is_refused(self):
         self.bridge = b.Bridge(dict(self.config, commands=(dict(name='deploy', callback_prefix='deploy:'),)),

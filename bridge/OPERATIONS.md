@@ -383,7 +383,8 @@ fingerprint like `format` does: the same key with another keyboard is
 before. `send` and `reply-current` take `--keyboard-file <path>` holding the
 rows as JSON; a keyboard send publishes directly in this process through the
 shared ledger, never through GC's relay (like an attachment or HTML send).
-An ask is sent to General in this version, so its answer relays on the
+An ask sent in a topic records that topic's conversation, and its answer
+relays there under the topic's line; any other ask's answer relays on the
 paired chat's conversation with no topic line ("Topics").
 
 A mayor ask may be one photo whose caption is the question, with the same
@@ -534,8 +535,8 @@ edit is sent by running the same command again; a rejected edit (the user
 deleted the message, say) stays rejected, and an ambiguous one is reconciled
 by hand.
 
-(6) The ledger's asks table carries `decided` (0 or 1, default 0) as its
-last column. An existing ledger opens unchanged and gains the column once
+(6) The ledger's asks table carries `decided` (0 or 1, default 0) after
+`kind`. An existing ledger opens unchanged and gains the column once
 when the bridge opens it, so every recorded ask reads decided=0 and keeps its
 meaning. No settings key is involved.
 
@@ -552,9 +553,10 @@ Use `gc telegram reply-current --body-file <path> --idempotency-key <stable-key>
 `--keyboard-file <path>` attaches an inline keyboard ("Mayor asks" above);
 `--silent` notifies with no sound ("Silent messages" below).
 `gc telegram pin` keeps one pinned message per slot ("Pinned messages" below).
-Optional `--conversation-id` must match the private configured chat; a
-message written in a topic reaches the agent with its topic line first, and
-the reply still lands in General ("Topics"). The native
+Optional `--conversation-id` is the paired chat's id or a configured
+topic's `<chat_id>:topic:<thread_id>`, exactly as the message notice names
+it, and `--topic <name>` names a configured topic instead: the reply lands
+in that topic. Without either it lands in General ("Topics"). The native
 controller reminder omits the mandatory idempotency flag; add it. This pack
 command delegates to the same transport CLI and native GC outbound endpoint.
 The direct form works before pack reload:
@@ -724,7 +726,8 @@ city's. `--unpin` removes the slot's message from the pins. A slot matches
 Telegram is contacted. The body follows the `sendMessage` rules: 4096 visible
 UTF-16 units, `--format html` with its allowlist and its one plain fallback,
 refused whole when over. No setting is involved, and GC is never called: the
-CLI process works through the shared ledger.
+CLI process works through the shared ledger. A slot's message lives in
+General, outside any topic: it is sent with no `message_thread_id`.
 
 The ledger's `pins` table holds per slot its generation (from 1), the live
 message id (none when nothing is pinned), the revision and the fingerprint of
@@ -805,9 +808,8 @@ needs its own binding: GC v1.5.0 has no parent fallback, so an unbound topic
 does not inherit the paired chat's agent (`internal/extmsg/inbound.go:110-145`).
 General stays the paired chat's conversation (`<chat_id>`, kind `dm`) and
 behaves exactly as without topics. A message written in a topic reaches the
-agent on that topic's conversation (below); the agent's replies still land
-in General in this version, since `reply-current` and `send` take only the
-paired chat's conversation id.
+agent on that topic's conversation, and the agent answers in the topic with
+the conversation id its notice names (both below).
 
 Prerequisites, in BotFather's settings for the bot: topic mode on (getMe's
 `has_topics_enabled`), and users creating and deleting topics off
@@ -933,6 +935,51 @@ in a topic, the line after the topic line:
   message ids are unique in a chat, so a fallback relay on the paired chat's
   conversation never meets a General message's id.
 
+**Outbound.** `publish()` accepts the paired chat's conversation or a
+configured topic's with a ledger row, its six fields exactly as above. Any
+other conversation (a thread with no ledger row, one whose name left the
+settings, another chat, another kind) is `recipient_not_authorized`, and
+nothing is sent. Every Telegram request of a send on a topic's conversation
+carries the topic's `message_thread_id`: an integer in the JSON body of
+`sendMessage` (the text, an ask, the HTML plain fallback, an attachment's or
+an album's text fallback) and a decimal string as a multipart field of
+`send<Media>` and `sendMediaGroup`, beside a silent send's
+`disable_notification`. The receipt names the topic's conversation. A send on
+the paired chat's conversation carries no thread: the same bodies and ledger
+fingerprints as without topics. The conversation is part of a send's
+identity, so one key in two conversations is `idempotency_key_conflict`.
+
+- `send` and `reply-current` (so `gc telegram reply-current`) take
+  `--conversation-id <chat_id>:topic:<thread_id>`, exactly as the agent's
+  notice names it, or `--topic <name>`, a `[[topic]]`'s exact name, and
+  send there, through GC's relay or directly (HTML, silent, a keyboard,
+  attachments) alike; `--session` keeps its default. A topic with no ledger
+  row is refused before anything is sent:
+  `conversation ID is not the paired private chat or a configured topic`, or
+  `topic <name> is not configured or not created (run gc telegram topics)`.
+  The two flags together, or `--topic` on another command, is a usage error
+  (exit 2). Without either, a send lands in General as before. GC relays only
+  to a conversation the sending session is bound to
+  (`internal/extmsg/outbound.go:76-147`), so bind a topic before its agent
+  answers there.
+- An ask with buttons sent in a topic records the topic's conversation id in
+  the ledger's asks table (`conversation_id`, its last column, NULL for the
+  paired chat; an existing ledger gains it once, and every ask it holds reads
+  NULL). A tap's answer relays on that conversation by the inbound rules
+  above: the `[topic: <name>]` line comes before the `[ask answer | ...]`
+  line; a topic not bound, or no longer configured, relays it on the paired
+  chat's conversation under that fallback's line, the thread id taken from
+  the recorded conversation id. The provider id stays `ask-<ask-id>`. The edit
+  and `ask-close` act by message id and are unchanged.
+- The quota-exhausted notice goes on the conversation its triggering message
+  was accepted on: the topic's, or the paired chat's for General and both
+  fallbacks. Its key is the episode's alone, so one episode still sends one
+  notice: a message on another conversation in the same episode meets the
+  key's conflict and sends nothing.
+- A pinned slot's message stays in General ("Pinned messages"). Edits,
+  reactions, callback answers, pins and unpins act by message id and take no
+  thread.
+
 Logs name the thread and message ids, never a topic's name or any text.
 
 The bridge never deletes, closes or renames a topic: deleteForumTopic would
@@ -945,7 +992,10 @@ Telegram Bot API (read 2026-10-27, Bot API 10.3): `User.has_topics_enabled`
 and `User.allows_users_to_create_topics` are "Returned only in getMe" (9.3
 and 9.4); createForumTopic creates "a topic in a forum supergroup chat or a
 private chat with a user" (9.4) with a name of 1-128 characters, and returns
-a ForumTopic with its `message_thread_id`.
+a ForumTopic with its `message_thread_id`. sendMessage, sendPhoto,
+sendVideo, sendDocument, sendVoice, sendVideoNote and sendMediaGroup take
+`message_thread_id` for "private chats of bots with forum topic mode
+enabled" (9.3).
 
 ## Inbound media relay
 

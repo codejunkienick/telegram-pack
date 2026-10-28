@@ -177,6 +177,10 @@ class TopicLedgerTests(unittest.TestCase):
         tables, rows = self.dump()
         store = b.Store(self.path, 10)
         after_tables, after_rows = self.dump()
+        # The asks table gains only its last column, conversation_id, which
+        # every recorded ask reads as NULL (the paired chat).
+        tables['asks'] = tables['asks'][:-1] + ', conversation_id TEXT)'
+        rows['asks'] = [row + (None,) for row in rows['asks']]
         self.assertEqual({k: v for k, v in after_tables.items() if not k.startswith('topic')}, tables)
         self.assertEqual({k: v for k, v in after_rows.items() if not k.startswith('topic')}, rows)
         self.assertEqual((after_rows['topics'], after_rows['topic_attempts']), ([], []))

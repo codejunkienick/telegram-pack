@@ -8,7 +8,7 @@ description: Files to and from the paired private Telegram chat through the city
 ## Send a file
 
 ```sh
-python3 <pack>/bridge/bridge.py --city-root <city> reply-current --conversation-id <configured-chat-id> \
+python3 <pack>/bridge/bridge.py --city-root <city> reply-current --conversation-id <id the notice names> \
   --body-file <caption-file> --idempotency-key <stable-key> --attachment /absolute/path.png
 ```
 
@@ -40,6 +40,11 @@ Which command: `gc telegram reply-current` once the city imports this pack and i
   files) under one key, and the body captions the album (on its first
   item). Photos and videos may mix; documents go only with documents; no
   voice note, video note or buttons (`--keyboard-file`) in an album.
+- Files and albums take the same topic flags as a message (the
+  `telegram-formatting` skill, "Topics"): `--conversation-id` exactly as
+  the notice names it answers in that message's topic, `--topic <name>`
+  posts into a project's topic, and neither sends to the main chat. A
+  rejected file's text fallback lands in the same topic.
 
 ## Files the user sends
 

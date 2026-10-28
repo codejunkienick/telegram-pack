@@ -6,6 +6,18 @@ The rows live only here; SKILL.md holds none.
 ```text
 <!-- citations -->
 | kind | path | symbol | note |
+| pack | bridge/OPERATIONS.md | ## Topics | topics follow this section |
+| pack | bridge/bridge.py | f"[topic: {topic['name']}]\n{text}" | the topic line first |
+| pack | bridge/OPERATIONS.md | `--conversation-id <chat_id>:topic:<thread_id>`, exactly as the agent's | answer with the notice's id |
+| pack | bridge/OPERATIONS.md | or `--topic <name>`, a `[[topic]]`'s exact name | post into a topic by name |
+| pack | bridge/bridge.py | parser.error('--topic and --conversation-id are exclusive') | never both flags |
+| pack | bridge/OPERATIONS.md | Without either, a send lands in General as before. | no flag is the main chat |
+| pack | bridge/OPERATIONS.md | not bound: reply lands in the main chat | not bound answers in the main chat |
+| pack | bridge/OPERATIONS.md | not configured: reply lands in the main chat | not configured answers in the main chat |
+| pack | bridge/bridge.py | is not configured or not created (run gc telegram topics) | an uncreated topic is refused |
+| pack | bridge/OPERATIONS.md | send there, through GC's relay or directly (HTML, silent, a keyboard, | every send kind takes the flags |
+| pack | bridge/OPERATIONS.md | the `[topic: <name>]` line comes before the `[ask answer \| ...]` | a topic ask's answer keeps its line |
+| pack | commands/reply-current/command.toml | --topic <name> sends into a configured topic | reply command flag |
 | pack | bridge/OPERATIONS.md | "Mayor asks" | asks with buttons follow this section |
 | pack | bridge/OPERATIONS.md | each question of a multi-question ask goes out as its own message with its own key and keyboard | one message per question |
 | pack | bridge/OPERATIONS.md | --keyboard-file <path> holding the rows as JSON | keyboard file rows |

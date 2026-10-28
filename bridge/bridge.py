@@ -462,13 +462,18 @@ class Store:
                        'format TEXT NOT NULL, options TEXT NOT NULL, message_id INTEGER, '
                        'answered INTEGER NOT NULL DEFAULT 0, answer TEXT, '
                        'update_id INTEGER, relayed INTEGER NOT NULL DEFAULT 0, '
-                       "kind TEXT NOT NULL DEFAULT 'text', decided INTEGER NOT NULL DEFAULT 0)")
+                       "kind TEXT NOT NULL DEFAULT 'text', decided INTEGER NOT NULL DEFAULT 0, "
+                       'conversation_id TEXT)')
             # CREATE TABLE IF NOT EXISTS never adds a column to an existing
-            # ledger: add decided once, so every recorded ask reads
-            # decided=0 and keeps its meaning. The INSERT above holds the
+            # ledger: add decided, then conversation_id, once each, so every
+            # recorded ask reads decided=0 and conversation_id NULL (the
+            # paired chat) and keeps its meaning. The INSERT above holds the
             # write lock, so a second process opening the ledger waits here.
-            if 'decided' not in [row[1] for row in db.execute('PRAGMA table_info(asks)')]:
+            columns = [row[1] for row in db.execute('PRAGMA table_info(asks)')]
+            if 'decided' not in columns:
                 db.execute('ALTER TABLE asks ADD COLUMN decided INTEGER NOT NULL DEFAULT 0')
+            if 'conversation_id' not in columns:
+                db.execute('ALTER TABLE asks ADD COLUMN conversation_id TEXT')
             # The paired user's newest message GC durably accepted: one row,
             # the target of `react` without --message-id.
             db.execute('CREATE TABLE IF NOT EXISTS accepted (id INTEGER PRIMARY KEY CHECK (id = 1), '
@@ -531,27 +536,30 @@ class Store:
         with self.connect() as db:
             db.execute('UPDATE deliveries SET receipt=? WHERE key=?', (json.dumps(receipt), key))
 
-    def record_ask(self, ask_id, question, fmt, options, kind='text'):
+    def record_ask(self, ask_id, question, fmt, options, kind='text', conversation_id=None):
         """Remember one mayor ask button group: the first record wins, so a
         repeated send of the same ask never resets its answered flag. Kind is
-        'text' or 'photo': the question is the message text or the photo caption."""
+        'text' or 'photo': the question is the message text or the photo caption.
+        conversation_id is the topic's conversation id for an ask sent in a
+        topic, None (the paired chat) otherwise."""
         if kind not in ('text', 'photo'):
             raise ValueError('ask kind must be text or photo')
         with self.connect() as db:
-            db.execute('INSERT OR IGNORE INTO asks(ask_id, question, format, options, kind)'
-                       ' VALUES (?,?,?,?,?)',
-                       (ask_id, question, fmt, json.dumps(options), kind))
+            db.execute('INSERT OR IGNORE INTO asks(ask_id, question, format, options, kind, conversation_id)'
+                       ' VALUES (?,?,?,?,?,?)',
+                       (ask_id, question, fmt, json.dumps(options), kind, conversation_id))
 
     def get_ask(self, ask_id):
         with self.connect() as db:
             row = db.execute('SELECT question, format, options, message_id, answered, answer, update_id, relayed, kind,'
-                             ' decided FROM asks WHERE ask_id=?', (ask_id,)).fetchone()
+                             ' decided, conversation_id FROM asks WHERE ask_id=?', (ask_id,)).fetchone()
         if row is None:
             return None
-        question, fmt, options, message_id, answered, answer, update_id, relayed, kind, decided = row
+        question, fmt, options, message_id, answered, answer, update_id, relayed, kind, decided, conversation_id = row
         return dict(ask_id=ask_id, question=question, format=fmt, options=json.loads(options),
                     message_id=message_id, answered=bool(answered), answer=answer,
-                    update_id=update_id, relayed=bool(relayed), kind=kind or 'text', decided=bool(decided))
+                    update_id=update_id, relayed=bool(relayed), kind=kind or 'text', decided=bool(decided),
+                    conversation_id=conversation_id)
 
     def get_ask_by_message(self, message_id):
         """The ask whose send confirmed this message id, or None."""
@@ -1695,24 +1703,26 @@ class Bridge:
         nowhere, once more on the paired chat's, labelled not bound. A thread
         no topic is configured or recorded for relays on the paired chat's,
         labelled not configured. Any other failure raises and retains the
-        cursor."""
+        cursor. Returns the conversation GC accepted the message on."""
         if thread_id is None:
             self._relay_to_gc(provider_message_id, text, reply)
-            return
+            return self.conversation
         topic = self.topic_by_thread(thread_id)
         if topic is None:
             self._relay_to_gc(provider_message_id,
                               f'[topic: thread {thread_id} | not configured: reply lands in the main chat]\n{text}',
                               reply)
             self._log(f'topic thread {thread_id} not configured (msg {mid}); relayed to the main conversation')
-            return
+            return self.conversation
         try:
             self._relay_to_gc(provider_message_id, f"[topic: {topic['name']}]\n{text}", reply,
                               topic['conversation'], topic['agent'])
+            return topic['conversation']
         except self._TopicNotBound:
             self._relay_to_gc(provider_message_id,
                               f"[topic: {topic['name']} | not bound: reply lands in the main chat]\n{text}", reply)
             self._log(f'topic thread {thread_id} not bound (msg {mid}); relayed to the main conversation')
+            return self.conversation
 
     @staticmethod
     def _update_id(update):
@@ -1814,13 +1824,13 @@ class Bridge:
         reply = message.get('reply_to_message', {}).get('message_id')
         if type(reply) is not int or reply <= 0 or reply == thread_id:
             reply = None  # in a topic, a reply to its root message is no reply
-        self._relay(mid, str(mid), relay_text, reply, thread_id)
+        conversation = self._relay(mid, str(mid), relay_text, reply, thread_id)
         self._accepted(mid)
         # The message above is now durably queued for the mayor but it may be
         # quota-blocked and unable to answer it any time soon; tell the user once
-        # per exhaustion episode rather than leaving the user wondering why the
-        # bridge went silent.
-        self.notify_quota_exhausted()
+        # per exhaustion episode, on the conversation the message was accepted
+        # on, rather than leaving the user wondering why the bridge went silent.
+        self.notify_quota_exhausted(conversation)
         if transcribe_job is not None:
             mid, day_dir, state = transcribe_job
             state['note_sent'] = True
@@ -2611,15 +2621,20 @@ class Bridge:
         the offset or relays again. The answer is two parts: a first line
         '[ask answer | choice: <label> | message: <id>]', then a newline and
         'question: ' with the visible question verbatim as the last field,
-        so nothing in a free-text question can be confused with a field."""
+        so nothing in a free-text question can be confused with a field.
+        It relays on the ask's conversation: an ask sent in a topic takes
+        that topic's rules (OPERATIONS.md, "Topics": the topic line, the
+        not-bound and not-configured fallbacks), any other the paired chat's."""
         question, fmt = ask['question'], ask['format']
         label = ask['answer']
         if fmt == 'html':
             visible, _ = html_visible_text(question)
         else:
             visible = question
-        self._relay_to_gc(f'ask-{ask_id}',
-                          f'[ask answer | choice: {label} | message: {mid}]\nquestion: {visible}')
+        conversation_id = ask.get('conversation_id')
+        thread_id = None if conversation_id is None else int(conversation_id.rpartition(':topic:')[2])
+        self._relay(mid, f'ask-{ask_id}', f'[ask answer | choice: {label} | message: {mid}]\nquestion: {visible}',
+                    thread_id=thread_id)
         self.store.mark_ask_relayed(ask_id)
         self._edit_ask(ask_id, ask, mid, update_id)
 
@@ -2831,8 +2846,8 @@ class Bridge:
         the markup. The first send was then definitively not delivered, so
         the fallback can never duplicate the message. `method` and `extra`
         (a keyboard, an edited message's id) serve the city commands; `extra`
-        also carries a silent send's disable_notification, so the fallback
-        is silent too."""
+        also carries a silent send's disable_notification and a topic's
+        message_thread_id, so the fallback is silent and in the topic too."""
         body = dict(chat_id=self.config['chat_id'], text=text, link_preview_options={'is_disabled': True})
         body.update(extra or {})
         if plain is not None:
@@ -2861,9 +2876,10 @@ class Bridge:
 
     def _deliver_attachment(self, attachment, text, reply, pending, plain=None, extra=None):
         """Send one attachment; `extra` carries the keyboard reply_markup for a
-        photo ask and a silent send's disable_notification, which both
-        fallbacks keep. The HTML parse-rejection fallback re-sends the same
-        file once without markup, keeping the keyboard. A keyboard send never
+        photo ask, a silent send's disable_notification and a topic's
+        message_thread_id, which both fallbacks keep. The HTML parse-rejection
+        fallback re-sends the same file once without markup, keeping the
+        keyboard. A keyboard send never
         falls back to a text message: a rejected photo ask fails instead, so
         the ask is never recorded as sent without its buttons."""
         method, field, _ = self.ATTACHMENT_KINDS[attachment['kind']]
@@ -2878,6 +2894,8 @@ class Bridge:
             fields['reply_markup'] = json.dumps(extra['reply_markup'])
         if extra and extra.get('disable_notification') is True:
             fields['disable_notification'] = 'true'
+        if extra and 'message_thread_id' in extra:
+            fields['message_thread_id'] = str(extra['message_thread_id'])
         try:
             status, data = self._send(method, lambda timeout: self.telegram_multipart(
                 method, fields, field, attachment['path'], timeout))
@@ -2900,7 +2918,8 @@ class Bridge:
                 # message carrying the same content plus the rejection reason.
                 # The fallback is always plain: the markup is unproven here.
                 reason = 'telegram_rejected_not_sent_' + str(data['error_code'])
-                # `extra` holds no keyboard here, only a silent send's flag.
+                # `extra` holds no keyboard here, only a silent send's flag
+                # and a topic's thread.
                 return self._fallback_to_text(text if plain is None else plain, reply, reason, pending, extra=extra)
             return pending
         except RequestNotSent:
@@ -2937,7 +2956,7 @@ class Bridge:
         and all of them in order. The HTML parse-rejection fallback re-sends
         the album once with the plain caption; any other 4xx falls back to
         one plain text message, like a rejected attachment. `extra` carries
-        a silent send's disable_notification."""
+        a silent send's disable_notification and a topic's message_thread_id."""
         media, files = [], []
         for index, item in enumerate(attachments):
             entry = {'type': item['kind'], 'media': f'attach://file{index}'}
@@ -2952,6 +2971,8 @@ class Bridge:
             fields['reply_parameters'] = json.dumps({'message_id': int(reply)})
         if extra and extra.get('disable_notification') is True:
             fields['disable_notification'] = 'true'
+        if extra and 'message_thread_id' in extra:
+            fields['message_thread_id'] = str(extra['message_thread_id'])
         try:
             status, data = self._send('sendMediaGroup', lambda timeout: self.telegram_media_group(
                 fields, files, timeout))
@@ -2978,8 +2999,20 @@ class Bridge:
             return pending
 
     def publish(self, request):
-        if request.get('conversation') != self.conversation:
+        """Send one request on the paired chat's conversation or on a
+        configured, recorded topic's (OPERATIONS.md, "Topics"); any other
+        conversation is recipient_not_authorized. In a topic every Telegram
+        request of the send carries the topic's message_thread_id, and the
+        receipt names the topic's conversation."""
+        conversation = request.get('conversation')
+        if conversation == self.conversation:
+            return self._publish(request)
+        topic = next((topic for topic in self._recorded_topics() if topic['conversation'] == conversation), None)
+        if topic is None:
             return self.receipt(reason='recipient_not_authorized')
+        return dict(self._publish(request, topic['thread_id']), conversation=topic['conversation'])
+
+    def _publish(self, request, thread_id=None):
         key, text = request.get('idempotency_key'), request.get('text')
         if not isinstance(key, str) or not key.strip() or len(key) > 256:
             return self.receipt(reason='stable_idempotency_key_required')
@@ -3094,17 +3127,21 @@ class Bridge:
                 # Recorded before Telegram is contacted, so a press can only
                 # ever resolve against a sent ask; the sent message id follows
                 # once the send is confirmed. A photo ask records kind photo
-                # with its caption as the question.
+                # with its caption as the question, and an ask in a topic its
+                # conversation, which its answer relays on.
                 kind = 'photo' if attachment is not None else 'text'
+                conversation_id = None if thread_id is None else request['conversation']['conversation_id']
                 for ask_id in ask_ids:
                     self.store.record_ask(ask_id, text, fmt, [button for row in rows for button in row
                                                              if (self._ask_choice(button['callback_data']) or (None,))[0] == ask_id],
-                                          kind)
+                                          kind, conversation_id)
             extra = {}
             if rows is not None:
                 extra['reply_markup'] = {'inline_keyboard': rows}
             if silent:
                 extra['disable_notification'] = True
+            if thread_id is not None:
+                extra['message_thread_id'] = thread_id
             if attachments is not None:
                 receipt = self._deliver_album(attachments, text, reply, pending, plain, extra=extra or None)
             elif attachment is not None:
@@ -3655,22 +3692,27 @@ class Bridge:
             reset_str = 'unknown time'
         return f'<b>bot:</b> quota exhausted, resets at {html_text(reset_str)}'
 
-    def notify_quota_exhausted(self):
+    def notify_quota_exhausted(self, conversation=None):
         """Tell the user once per quota-exhaustion episode that the mayor cannot
         answer right now, instead of leaving the bridge silently unresponsive.
+        The notice goes on `conversation`, the one the triggering message was
+        accepted on (default the paired chat's).
 
         The idempotency key is derived from the episode alone (not the
         triggering message), so every inbound message during the same episode
-        publishes the identical request and the store's dedup delivers it
-        exactly once; a new episode (new reset time) gets its own key. Never
-        raises: this runs inline in inbound() and must not break message relay.
+        on one conversation publishes the identical request and the store's
+        dedup delivers it exactly once; one on another conversation meets the
+        key's idempotency_key_conflict and sends nothing. A new episode (new
+        reset time) gets its own key. Never raises: this runs inline in
+        inbound() and must not break message relay.
         """
         try:
             found = self.mayor_quota_episode()
             if not found:
                 return
             episode, until = found
-            request = dict(conversation=self.conversation, idempotency_key=f'quota-exhausted-{episode}',
+            request = dict(conversation=conversation or self.conversation,
+                           idempotency_key=f'quota-exhausted-{episode}',
                            text=self.format_quota_exhausted_reply(until), format='html')
             self.publish(request)
         except Exception:
@@ -3768,7 +3810,11 @@ def _build_parser():
     parser.add_argument('--session', default=os.environ.get('GC_SESSION_ID') or None,
                         help="the sending session (default: $GC_SESSION_ID, else the settings' agent)")
     parser.add_argument('--conversation-id',
-                        help="optional; must equal the settings' bot.chat_id")
+                        help="optional: the settings' bot.chat_id, or <chat id>:topic:<thread id> of a configured "
+                             'topic, as the message notice names it')
+    parser.add_argument('--topic', metavar='NAME',
+                        help='send, reply-current: send into the configured topic of this name, '
+                             'instead of --conversation-id')
     parser.add_argument('--attachment', type=Path, action='append',
                         help='absolute path of a file to send, the body as its caption; '
                              'given 2-10 times, the files go as one album captioned by the body')
@@ -3826,6 +3872,10 @@ def _validate_attachment_flags(parser, args):
         parser.error('--message-id is a react and ask-close flag')
     if getattr(args, 'conflict_exit_status_given', False) and args.command != 'run':
         parser.error('--conflict-exit-status is a run flag')
+    if args.topic is not None and args.command not in ('send', 'reply-current'):
+        parser.error('--topic is a send and reply-current flag')
+    if args.topic is not None and args.conversation_id is not None:
+        parser.error('--topic and --conversation-id are exclusive')
     selectors = [flag for flag, value in (('--message-id', args.message_id), ('--ask-key', args.ask_key))
                  if value is not None]
     if args.command != 'ask-close':
@@ -3930,7 +3980,25 @@ def _read_keyboard_file(path):
         raise TransportError('keyboard file is not valid JSON') from None
 
 
-def _dispatch_outbound(bridge, args, text):
+def _outbound_conversation(bridge, args):
+    """The conversation a send or reply-current goes to: the paired chat's
+    without --conversation-id and --topic, else the configured, recorded
+    topic's or the paired chat's they name (OPERATIONS.md, "Topics")."""
+    if args.topic is not None:
+        topic = bridge.topic_by_name(args.topic)
+        if topic is None:
+            raise TransportError(f'topic {args.topic} is not configured or not created (run gc telegram topics)')
+        return topic['conversation']
+    if not args.conversation_id:
+        return bridge.conversation
+    conversation = bridge.conversation_for_id(args.conversation_id)
+    if conversation is None:
+        raise TransportError('conversation ID is not the paired private chat or a configured topic')
+    return conversation
+
+
+def _dispatch_outbound(bridge, args, text, conversation=None):
+    conversation = conversation or bridge.conversation
     keyboard = None
     if getattr(args, 'keyboard_file', None) is not None:
         keyboard = _read_keyboard_file(args.keyboard_file)
@@ -3945,7 +4013,7 @@ def _dispatch_outbound(bridge, args, text):
         # its callback can never hand publish() an attachment, a format, a
         # keyboard or silent. Deliver directly in this process instead, sharing
         # the daemon's idempotency store; GC keeps no transcript record of this send.
-        request = dict(conversation=bridge.conversation, idempotency_key=args.idempotency_key, text=text)
+        request = dict(conversation=conversation, idempotency_key=args.idempotency_key, text=text)
         if args.format == 'html':
             request['format'] = 'html'
         if silent:
@@ -3967,7 +4035,7 @@ def _dispatch_outbound(bridge, args, text):
         message_id = receipt.get('message_id', '')
         direct = True
     else:
-        outbound = dict(session_id=args.session, conversation=bridge.conversation, text=text,
+        outbound = dict(session_id=args.session, conversation=conversation, text=text,
                         idempotency_key=args.idempotency_key)
         result = _relay_outbound(bridge, outbound)
         receipt = result.get('Receipt', {})
@@ -4985,9 +5053,8 @@ def main():
         if not args.body_file or not args.idempotency_key:
             parser.error('send/reply-current requires --body-file and --idempotency-key (reuse the key for retries)')
         args.session = args.session or bridge.agent
-        if args.conversation_id and args.conversation_id != bridge.conversation['conversation_id']:
-            raise TransportError('conversation ID is not the paired private recipient')
-        message_id = _dispatch_outbound(bridge, args, args.body_file.read_text())
+        conversation = _outbound_conversation(bridge, args)
+        message_id = _dispatch_outbound(bridge, args, args.body_file.read_text(), conversation)
         print('Telegram delivery confirmed; message ID ' + str(message_id))
     elif args.command == 'ask-close':
         # Directly in this process through the shared ledger; GC is never called.

@@ -20,6 +20,10 @@ The rows live only here; SKILL.md holds none.
 | pack | bridge/OPERATIONS.md | Photos and videos may mix; documents group only with documents. | album grouping |
 | pack | bridge/bridge.py | album_kind_not_groupable | no voice or video note in an album |
 | pack | bridge/OPERATIONS.md | `--keyboard-file` with an album refuses as `invalid_keyboard` (P1): | no buttons in an album |
+| pack | bridge/OPERATIONS.md | ## Topics | topic sends follow this section |
+| pack | bridge/OPERATIONS.md | a decimal string as a multipart field of | files and albums carry the topic's thread |
+| pack | bridge/OPERATIONS.md | an album's text fallback) | the text fallback stays in the topic |
+| pack | bridge/OPERATIONS.md | Without either, a send lands in General as before. | no flag is the main chat |
 | pack | bridge/bridge.py | base = self.state_dir / 'telegram-inbound' | inbound folder |
 | pack | bridge/bridge.py | note = f'[attachment saved: {path} \| {kind} \| {size} bytes \| caption: {caption_display}]' | saved note |
 | pack | bridge/bridge.py | INBOUND_MAX_BYTES = 50 * 1024 * 1024 | 50 MB inbound cap |
