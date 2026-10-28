@@ -64,6 +64,12 @@ description = "Show the agent's status"
 # [[topic]]
 # name = "web"
 
+# Topics the paired user creates in the chat, when BotFather lets users create
+# topics (OPERATIONS.md, "Topics"): each is served on its own GC conversation,
+# bound to the settings' agent.
+# [auto_topics]
+# enabled = true                            # default false: only the [[topic]] tables are served
+
 [transcribe]
 enabled = true                              # voice and audio notes get a transcript in the configured language
 # whisper_cli and models_dir default to ~/work/whisper.cpp, the build every city on the host shares; set both to place it elsewhere.

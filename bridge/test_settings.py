@@ -199,6 +199,50 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual([x.display_name for x in bridges], ['Pat', 'Sam'])
 
 
+class AutoTopicsSettingsTests(unittest.TestCase):
+    """[auto_topics]: one bool key, enabled, default false."""
+
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def load(self, table):
+        path = write_settings(self.root)
+        path.write_text(path.read_text() + table)
+        return b.load_settings(path).config
+
+    def test_a_file_without_the_table_loads_as_before(self):
+        config = self.load('')
+        self.assertNotIn('auto_topics', config)
+        self.assertEqual(config, b.load_settings(write_settings(self.root)).config)
+        self.assertFalse(b.Bridge(config, None, 'SECRET', None).auto_topics)
+
+    def test_enabled_true_false_and_the_default_load(self):
+        without = self.load('')
+        for table, enabled in (('\n[auto_topics]\nenabled = true\n', True),
+                               ('\n[auto_topics]\nenabled = false\n', False), ('\n[auto_topics]\n', False)):
+            with self.subTest(table=table):
+                config = self.load(table)
+                self.assertEqual(config['auto_topics'], {'enabled': enabled})
+                self.assertEqual({k: v for k, v in config.items() if k != 'auto_topics'}, without)
+                self.assertIs(b.Bridge(config, None, 'SECRET', None).auto_topics, enabled)
+
+    def test_an_unknown_key_or_a_non_bool_refuses_with_one_line(self):
+        for table, message in (('\n[auto_topics]\nenabled = true\nagent = "helper"\n', 'unknown key auto_topics.agent'),
+                               ('\n[auto_topics]\nname = "ops"\n', 'unknown key auto_topics.name'),
+                               ('\n[auto_topics]\nenabled = 1\n', 'auto_topics.enabled must be true or false'),
+                               ('\n[auto_topics]\nenabled = "true"\n', 'auto_topics.enabled must be true or false'),
+                               ('\nauto_topics = true\n', 'auto_topics must be a table')):
+            with self.subTest(table=table):
+                with self.assertRaises(b.SettingsError) as raised:
+                    if table.startswith('\nauto_topics'):
+                        path = write_settings(self.root)
+                        path.write_text(table + path.read_text())
+                        b.load_settings(path)
+                    else:
+                        self.load(table)
+                self.assertEqual(str(raised.exception), 'settings: ' + message)
+
+
 class ExampleSettingsTests(unittest.TestCase):
     """Pin settings.example.toml against load_settings: every key the
     example sets, commented or not, is a key the loader accepts."""
@@ -216,6 +260,7 @@ class ExampleSettingsTests(unittest.TestCase):
         'reactions': {'on_accept', 'seen', 'done'},
         'typing': {'seconds'},
         'topic': {'name', 'agent'},
+        'auto_topics': {'enabled'},
     }
 
     def setUp(self):
@@ -227,7 +272,8 @@ class ExampleSettingsTests(unittest.TestCase):
         for line in text.splitlines():
             stripped = line.strip()
             content = stripped.lstrip('#').strip() if stripped.startswith('#') else stripped
-            header = re.fullmatch(r'\[\[(menu|command|topic)\]\]|\[(bot|transcribe|reactions|typing)\]', content)
+            header = re.fullmatch(r'\[\[(menu|command|topic)\]\]|\[(bot|transcribe|reactions|typing|auto_topics)\]',
+                                  content)
             if header:
                 section = header.group(1) or header.group(2)
                 keys.setdefault(section, set())
@@ -264,7 +310,8 @@ class ExampleSettingsTests(unittest.TestCase):
             stripped = line.strip()
             commented = stripped.startswith('#')
             content = stripped.lstrip('#').strip() if commented else stripped
-            header = re.fullmatch(r'\[\[(menu|command|topic)\]\]|\[(bot|transcribe|reactions|typing)\]', content)
+            header = re.fullmatch(r'\[\[(menu|command|topic)\]\]|\[(bot|transcribe|reactions|typing|auto_topics)\]',
+                                  content)
             if header:
                 section = header.group(1) or header.group(2)
                 lines.append(content)
@@ -299,7 +346,8 @@ class ExampleSettingsTests(unittest.TestCase):
                 self.assertIn('url' if command == 'url' else 'handler', settings.config['commands'][0])
                 self.assertIsNotNone(settings.transcribe)
                 data = tomllib.loads(path.read_text())
-                loaded[''] |= set(data) - {'bot', 'menu', 'command', 'transcribe', 'reactions', 'typing', 'topic'}
+                loaded[''] |= set(data) - {'bot', 'menu', 'command', 'transcribe', 'reactions', 'typing', 'topic',
+                                           'auto_topics'}
                 loaded['bot'] |= set(data['bot'])
                 loaded['menu'] |= set(data['menu'][0])
                 loaded['command'] |= set(data['command'][0])
@@ -307,6 +355,8 @@ class ExampleSettingsTests(unittest.TestCase):
                 loaded['reactions'] |= set(data['reactions'])
                 loaded['typing'] |= set(data['typing'])
                 loaded['topic'] |= set(data['topic'][0])
+                loaded['auto_topics'] |= set(data['auto_topics'])
+                self.assertEqual(settings.config['auto_topics'], {'enabled': True})
                 self.assertEqual(settings.config['topics'],
                                  (dict(name='ops', agent='mayor'), dict(name='web', agent='mayor')))
         self.assertEqual(loaded, dict(self.EXPECTED, command=self.EXPECTED['command'] | {'url'}))

@@ -451,6 +451,34 @@ def resendable(receipt):
             and isinstance(receipt.get('metadata'), dict) and receipt['metadata'].get('reason') == NOT_SENT_REASON)
 
 
+def auto_topic_names(rows, settings_names):
+    """The display name of each auto topic row, by thread id: Telegram's
+    name with [, ], | and every control or line separator character made a
+    space, whitespace collapsed, cut to TOPIC_NAME_MAX; `thread <id>` when
+    that is empty or unknown. A name equal, ignoring case, to a settings
+    topic's or another row's gets ` #<thread_id>` on every row involved, so
+    the result does not depend on the rows' order and is unique ignoring case
+    among them and the settings names. Computed on every use, never stored."""
+    names = {}
+    for row in rows:
+        name = ''.join(' ' if char in TOPIC_NAME_FORBIDDEN or unicodedata.category(char) in ('Cc', 'Zl', 'Zp')
+                       else char for char in row['name'] or '')
+        names[row['thread_id']] = ' '.join(name.split())[:TOPIC_NAME_MAX].rstrip() or f"thread {row['thread_id']}"
+    taken = {name.casefold() for name in settings_names}
+    # A suffixed name never meets another row's suffixed name (the thread ids
+    # differ), so each round suffixes rows that met a settings name or a row
+    # still without its suffix, and the loop ends.
+    while True:
+        counts = {}
+        for name in names.values():
+            counts[name.casefold()] = counts.get(name.casefold(), 0) + 1
+        clash = [thread for thread, name in names.items() if name.casefold() in taken or counts[name.casefold()] > 1]
+        if not clash:
+            return names
+        for thread in clash:
+            names[thread] += f' #{thread}'
+
+
 class Store:
     def __init__(self, path, initial_offset):
         self.path = str(path)
@@ -491,6 +519,14 @@ class Store:
             db.execute('CREATE TABLE IF NOT EXISTS topics (name TEXT PRIMARY KEY, thread_id INTEGER NOT NULL UNIQUE, '
                        'source TEXT NOT NULL, recorded_at TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS topic_attempts (name TEXT PRIMARY KEY, attempt INTEGER NOT NULL)')
+            # Topics the paired user created ([auto_topics]): Telegram's name
+            # as last seen (NULL until known) and whether it was implicit,
+            # the agent, and when GC confirmed the binding (NULL until then).
+            # Its own table: a Telegram-given name in topics.name could meet
+            # a settings name added later.
+            db.execute('CREATE TABLE IF NOT EXISTS auto_topics (thread_id INTEGER PRIMARY KEY, name TEXT, '
+                       'name_implicit INTEGER NOT NULL DEFAULT 0, agent TEXT NOT NULL, detected_at TEXT NOT NULL, '
+                       'bound_at TEXT)')
 
     @contextlib.contextmanager
     def connect(self):
@@ -697,6 +733,42 @@ class Store:
                        (name,))
             return db.execute('SELECT attempt FROM topic_attempts WHERE name=?', (name,)).fetchone()[0]
 
+    AUTO_TOPIC_FIELDS = ('thread_id', 'name', 'name_implicit', 'agent', 'detected_at', 'bound_at')
+
+    def add_auto_topic(self, thread_id, agent):
+        """Record a topic the paired user created, once, in one write:
+        True when this call inserted its row, False when the thread had one
+        (its detected_at kept)."""
+        with self.connect() as db:
+            cursor = db.execute('INSERT OR IGNORE INTO auto_topics(thread_id, agent, detected_at) VALUES (?, ?, ?)',
+                                (thread_id, agent, datetime.datetime.now(datetime.timezone.utc).isoformat()))
+        return cursor.rowcount == 1
+
+    def set_auto_topic_name(self, thread_id, name, implicit):
+        """Set an auto topic's Telegram name and is_name_implicit; False
+        when the thread has no row."""
+        with self.connect() as db:
+            cursor = db.execute('UPDATE auto_topics SET name=?, name_implicit=? WHERE thread_id=?',
+                                (name, int(bool(implicit)), thread_id))
+        return cursor.rowcount == 1
+
+    def set_auto_topic_bound(self, thread_id, bound):
+        """Set an auto topic's bound_at to now, or clear it to NULL; False
+        when the thread has no row."""
+        bound_at = datetime.datetime.now(datetime.timezone.utc).isoformat() if bound else None
+        with self.connect() as db:
+            cursor = db.execute('UPDATE auto_topics SET bound_at=? WHERE thread_id=?', (bound_at, thread_id))
+        return cursor.rowcount == 1
+
+    def auto_topic_rows(self):
+        """Every auto topic in rowid order, which is thread id order
+        (thread_id is the rowid): dicts of thread_id, name, name_implicit (a
+        bool), agent, detected_at and bound_at."""
+        with self.connect() as db:
+            rows = db.execute('SELECT ' + ', '.join(self.AUTO_TOPIC_FIELDS)
+                              + ' FROM auto_topics ORDER BY rowid').fetchall()
+        return [dict(zip(self.AUTO_TOPIC_FIELDS, row), name_implicit=bool(row[2])) for row in rows]
+
     def deliveries_mark(self):
         """The highest rowid of the deliveries table, 0 when it is empty: rows
         are never deleted, so every new key gets a higher one."""
@@ -894,6 +966,9 @@ class Bridge:
         # The city's topics of the paired chat ([[topic]]), each {name, agent}
         # in file order; their thread ids live in the ledger.
         self.topic_settings = tuple(config.get('topics') or ())
+        # Whether the topics the paired user creates are served ([auto_topics]);
+        # their rows live in the ledger and stay there while this is off.
+        self.auto_topics = (config.get('auto_topics') or {}).get('enabled') is True
         # The gc agent this bridge serves (check_bridge_config validated it):
         # inbound must be routed to it, and the quota-exhaustion notice
         # watches its session.
@@ -3401,6 +3476,7 @@ class Bridge:
     # ---- topics of the paired private chat (OPERATIONS.md, "Topics") ----
     _THREAD_ID_RE = re.compile(r'[1-9][0-9]{0,18}')
     TOPIC_USERS_WARNING = 'WARN users may create and delete topics in this chat (BotFather setting)'
+    AUTO_TOPICS_USERS_LINE = 'users may create topics: the bridge serves each one (auto_topics)'
 
     def topic_conversation(self, thread_id):
         """The GC conversation of one topic: a thread whose parent is the
@@ -3427,6 +3503,25 @@ class Bridge:
     def topic_by_name(self, name):
         """The configured, recorded topic with this name, or None."""
         return next((topic for topic in self._recorded_topics() if topic['name'] == name), None)
+
+    def _unshadowed_auto_topics(self):
+        """The ledger's auto topic rows whose thread no topics row holds (in
+        the settings or not), in thread id order; read on every call."""
+        if self.store is None:
+            return []
+        held = {row['thread_id'] for row in self.store.topic_rows()}
+        return [row for row in self.store.auto_topic_rows() if row['thread_id'] not in held]
+
+    def served_auto_topics(self):
+        """The auto topics this bridge serves: none unless [auto_topics] is
+        enabled, else every row no topics row shadows, in thread id order,
+        each with its display_name and conversation."""
+        if not self.auto_topics:
+            return []
+        rows = self._unshadowed_auto_topics()
+        names = auto_topic_names(rows, [topic['name'] for topic in self.topic_settings])
+        return [dict(row, display_name=names[row['thread_id']], conversation=self.topic_conversation(row['thread_id']))
+                for row in rows]
 
     def conversation_for_id(self, conversation_id):
         """The ref of a conversation id this bridge serves: the paired chat's
@@ -3562,7 +3657,7 @@ class Bridge:
                         create.append(name)
             lines = []
             if create and self._topic_mode():
-                lines.append(self.TOPIC_USERS_WARNING)
+                lines.append(self.AUTO_TOPICS_USERS_LINE if self.auto_topics else self.TOPIC_USERS_WARNING)
             if retry is not None:
                 self.store.raise_topic_attempt(retry)
             unreachable = False
@@ -3593,6 +3688,14 @@ class Bridge:
                 if name not in names:
                     lines.append(f"topic {name}: thread {row['thread_id']} "
                                  '(not in settings; its messages reach the agent as not configured)')
+            if self.auto_topics:
+                for topic in self.served_auto_topics():
+                    state = f"bound to {topic['agent']}" if topic['bound_at'] else 'not bound yet'
+                    lines.append(f"auto topic {topic['display_name']}: thread {topic['thread_id']} ({state})")
+            else:
+                unserved = len(self._unshadowed_auto_topics())
+                if unserved:
+                    lines.append(f'auto topics: {unserved} recorded, not served (auto_topics off)')
             return lines, all(name in rows for name in names)
 
     def _topic_not_created(self, name, unreachable):
@@ -4162,7 +4265,7 @@ _MODEL_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,79}')
 SETTINGS_KEYS = {'city', 'state_dir', 'port', 'python', 'token_file', 'callback_secret_file', 'lock_dir', 'unit',
                  'user_display_name', 'timezone', 'gc_base_url', 'gc_api_token_file', 'health_file',
                  'pairing_update_id', 'bot', 'menu', 'transcribe', 'agent', 'command',
-                 'handler_write_paths', 'reactions', 'typing', 'topic'}
+                 'handler_write_paths', 'reactions', 'typing', 'topic', 'auto_topics'}
 BOT_KEYS = {'bot_id', 'user_id', 'chat_id', 'account_id'}
 COMMAND_KEYS = {'name', 'description', 'handler', 'url', 'menu', 'callback_prefix', 'timeout'}
 # Commands the bridge itself owns: /start is never relayed.
@@ -4182,6 +4285,9 @@ TOPIC_KEYS = {'name', 'agent'}
 TOPIC_MAX = 50
 TOPIC_NAME_MAX = 128
 TOPIC_NAME_FORBIDDEN = '[]|'
+# Topics the paired user creates ([auto_topics]): served only when enabled,
+# each bound to the settings' agent.
+AUTO_TOPICS_KEYS = {'enabled'}
 TRANSCRIBE_KEYS = {'enabled', 'whisper_cli', 'models_dir', 'model', 'vad_model', 'threads', 'cpus', 'timeout',
                    'timeout_per_minute', 'gpu', 'gpu_min_free_mb', 'method', 'gpu_check', 'language'}
 TRANSCRIBE_METHODS = ('auto', 'cpu', 'gpu')
@@ -4524,6 +4630,9 @@ def load_settings(path, home=None):
     topics = _topic_settings(data, agent)
     if topics:
         config['topics'] = topics
+    if 'auto_topics' in data:
+        auto_topics = _table(data, 'auto_topics', AUTO_TOPICS_KEYS)
+        config['auto_topics'] = dict(enabled=_bool_setting(auto_topics.get('enabled', False), 'auto_topics.enabled'))
     unit = _text_setting(data.get('unit', f'{city}-telegram.service'), 'unit', _UNIT_RE, limit=128)
     config['unit'] = unit
 

@@ -181,10 +181,10 @@ class TopicLedgerTests(unittest.TestCase):
         # every recorded ask reads as NULL (the paired chat).
         tables['asks'] = tables['asks'][:-1] + ', conversation_id TEXT)'
         rows['asks'] = [row + (None,) for row in rows['asks']]
-        added = ('topics', 'topic_attempts', 'accepted_conversations')
+        added = ('topics', 'topic_attempts', 'accepted_conversations', 'auto_topics')
         self.assertEqual({k: v for k, v in after_tables.items() if k not in added}, tables)
         self.assertEqual({k: v for k, v in after_rows.items() if k not in added}, rows)
-        self.assertEqual([after_rows[k] for k in added], [[], [], []])
+        self.assertEqual([after_rows[k] for k in added], [[], [], [], []])
         self.assertEqual(store.offset(), 42)
         b.Store(self.path, 10)
         self.assertEqual(self.dump(), (after_tables, after_rows))

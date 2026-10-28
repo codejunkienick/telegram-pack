@@ -74,6 +74,7 @@ city.
 | `[reactions]` | no | `on_accept`, `seen`, `done`: the `seen` reaction on each accepted message and the emoji `react` sets ("Reactions" below); no reaction ever without `on_accept = true` or a `react` call |
 | `[typing]` | no | `seconds` (0-900, default 0): "typing..." in the chat after each accepted message until the next send, at most this long ("Typing" below); no chat action ever with 0 |
 | `[[topic]]` `name`, `agent` | no | topics of the paired chat, each its own GC conversation, created once by `topics` ("Topics" below); at most 50 |
+| `[auto_topics]` | no | `enabled` (default false): serve the topics the paired user creates in the chat, each bound to the settings' `agent` ("Topics" below); without it only the `[[topic]]` tables are served |
 
 The health report at `health_file` is a JSON object with `observed_at`
 (ISO-8601 with zone, at most 10 minutes old) and `sessions`, a list of
@@ -812,9 +813,12 @@ agent on that topic's conversation, and the agent answers in the topic with
 the conversation id its notice names (both below).
 
 Prerequisites, in BotFather's settings for the bot: topic mode on (getMe's
-`has_topics_enabled`), and users creating and deleting topics off
-(`allows_users_to_create_topics`), so the city's topics are the only ones
-and nobody deletes one, with all its messages, from the phone.
+`has_topics_enabled`). With `[auto_topics]` off or absent, also users
+creating and deleting topics off (`allows_users_to_create_topics`), so the
+city's topics are the only ones and nobody deletes one, with all its
+messages, from the phone. With `[auto_topics]` `enabled = true`, leave that
+setting on: it is what lets the paired user create the topics the bridge
+serves.
 
 The settings name the topics, one `[[topic]]` table each, at most 50, in the
 order `topics` creates them:
@@ -840,7 +844,9 @@ beside the polling unit. In order:
   `topic mode is off for this bot; switch it on with BotFather` and creates
   nothing. When users may create topics it prints
   `WARN users may create and delete topics in this chat (BotFather setting)`
-  and goes on.
+  and goes on; with `[auto_topics]` `enabled = true` it prints
+  `users may create topics: the bridge serves each one (auto_topics)` in
+  its place.
 - Each create is createForumTopic `{"chat_id": <chat_id>, "name": <name>}`
   through the ledger under `topic:<attempt>:<name>` (attempt 1 until
   `--retry` raises it). It is confirmed only by HTTP 200 with a topic of that
@@ -862,9 +868,34 @@ bind: gc extmsg bind --provider telegram --account-id <account_id> --conversatio
 
 and for one without, `topic <name>: not created (<reason>); <next step>`;
 then, for each ledger row whose name left the settings,
-`topic <name>: thread <id> (not in settings; its messages reach the agent as not configured)`.
+`topic <name>: thread <id> (not in settings; its messages reach the agent as not configured)`;
+then, with `[auto_topics]` `enabled = true`, one line per topic the paired
+user created that the bridge serves, in thread id order,
+
+```text
+auto topic <display name>: thread <id> (bound to <agent>|not bound yet)
+```
+
+and with it off or absent, when the ledger holds such topics, one line
+`auto topics: <n> recorded, not served (auto_topics off)`.
 It exits 0 only when every `[[topic]]` has a thread id, else 1 after
 printing every line. It binds, edits and deletes nothing.
+
+The ledger's `auto_topics` table keeps the topics the paired user created:
+the thread id, Telegram's name as last seen and whether it was implicit, the
+agent, when it was first seen and when GC confirmed its binding. No message
+text is stored. A thread a `topics` row holds (a settings topic, or a row
+whose name left the settings) is never an auto topic: `gc telegram topics
+--record <name> --thread-id <id>` on an auto topic's thread is allowed and
+adopts it as that settings topic, and its auto row stays, unserved and
+unlisted. With `[auto_topics]` off the rows stay too, unserved, and switching
+it on again serves them. An auto topic's display name is computed from its
+row on every use, never stored: Telegram's name with `[`, `]`, `|` and every
+control or line separator character made a space, whitespace collapsed, cut
+to 128 characters, `thread <id>` when that is empty or the name is unknown;
+a name equal, ignoring case, to a `[[topic]]` name or to another auto
+topic's gets ` #<thread_id>` on every auto topic involved, so each name is
+unique ignoring case and does not depend on the order the topics appeared.
 
 Run each printed `bind:` line once, before anyone writes in that topic: with
 a `[[extmsg.default_route]]` for telegram, the first message in an unbound
