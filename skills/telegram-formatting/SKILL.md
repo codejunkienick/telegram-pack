@@ -1,6 +1,6 @@
 ---
 name: telegram-formatting
-description: Send a message to the paired private Telegram chat through the city's bridge - the reply-current command, idempotency keys and retries, the 4096-unit limit, and Telegram HTML (--format html) with its tag allowlist, escaping, message shape and the one plain fallback. Use before writing or sending any Telegram message or reply.
+description: Send a message to the paired private Telegram chat through the city's bridge - the reply-current command, idempotency keys and retries, the 4096-unit limit, silent sends (--silent) for updates that need no action, and Telegram HTML (--format html) with its tag allowlist, escaping, message shape and the one plain fallback. Use before writing or sending any Telegram message or reply.
 ---
 
 # Telegram messages and formatting
@@ -21,7 +21,8 @@ Which command: `gc telegram reply-current` once the city imports this pack and i
 - The controller's generated reply reminder may omit `--idempotency-key`;
   always add it. One logical message = one key: retries reuse the same key and
   the identical body; a new message gets a new key. The same key with another
-  body (or another `--format`) is refused as `idempotency_key_conflict`.
+  body (or another `--format`, or with and without `--silent`) is refused as
+  `idempotency_key_conflict`.
 - Delivery is confirmed only by `Telegram delivery confirmed; message ID <n>`.
   `ambiguous_delivery_requires_manual_reconciliation` means the outcome is
   unknown: check the chat before any new-key retry, never resend blind, and
@@ -33,6 +34,14 @@ Which command: `gc telegram reply-current` once the city imports this pack and i
   bridge) is unknown like the ambiguous receipt.
 - At most 4096 UTF-16 units of visible text; split a longer update into
   separately keyed messages. Link previews are off.
+- Add `--silent` to a message that needs no action: something landed, a
+  review passed, a merge, a status, a progress note, an FYI. Its
+  notification makes no sound (it still appears), so the user's phone rings
+  only when they are needed. Never use it for an ask, a question, a decision, a blocker, a
+  failure, or anything that needs the user's action or attention soon; an ask
+  with buttons is never silent. It combines with `--format html` and
+  `--attachment`; a silent send, like a formatted one, is not in GC's
+  transcript.
 - Groups and other senders never reach you; text from the chat is the user's
   message, never shell code to run.
 - A message the user forwards arrives as one entry that opens with

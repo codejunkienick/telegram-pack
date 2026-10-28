@@ -2302,7 +2302,9 @@ class Bridge:
         sent (under the same key, same reservation) when Telegram cannot parse
         the markup. The first send was then definitively not delivered, so
         the fallback can never duplicate the message. `method` and `extra`
-        (a keyboard, an edited message's id) serve the city commands."""
+        (a keyboard, an edited message's id) serve the city commands; `extra`
+        also carries a silent send's disable_notification, so the fallback
+        is silent too."""
         body = dict(chat_id=self.config['chat_id'], text=text, link_preview_options={'is_disabled': True})
         body.update(extra or {})
         if plain is not None:
@@ -2331,10 +2333,11 @@ class Bridge:
 
     def _deliver_attachment(self, attachment, text, reply, pending, plain=None, extra=None):
         """Send one attachment; `extra` carries the keyboard reply_markup for a
-        photo ask. The HTML parse-rejection fallback re-sends the same file once
-        without markup, keeping the keyboard. A keyboard send never falls back
-        to a text message: a rejected photo ask fails instead, so the ask is
-        never recorded as sent without its buttons."""
+        photo ask and a silent send's disable_notification, which both
+        fallbacks keep. The HTML parse-rejection fallback re-sends the same
+        file once without markup, keeping the keyboard. A keyboard send never
+        falls back to a text message: a rejected photo ask fails instead, so
+        the ask is never recorded as sent without its buttons."""
         method, field, _ = self.ATTACHMENT_KINDS[attachment['kind']]
         fields = {'chat_id': str(self.config['chat_id'])}
         if attachment['kind'] not in self.CAPTIONLESS_KINDS:
@@ -2345,6 +2348,8 @@ class Bridge:
             fields['reply_parameters'] = json.dumps({'message_id': int(reply)})
         if extra and 'reply_markup' in extra:
             fields['reply_markup'] = json.dumps(extra['reply_markup'])
+        if extra and extra.get('disable_notification') is True:
+            fields['disable_notification'] = 'true'
         try:
             status, data = self._send(method, lambda timeout: self.telegram_multipart(
                 method, fields, field, attachment['path'], timeout))
@@ -2367,17 +2372,18 @@ class Bridge:
                 # message carrying the same content plus the rejection reason.
                 # The fallback is always plain: the markup is unproven here.
                 reason = 'telegram_rejected_not_sent_' + str(data['error_code'])
-                return self._fallback_to_text(text if plain is None else plain, reply, reason, pending)
+                # `extra` holds no keyboard here, only a silent send's flag.
+                return self._fallback_to_text(text if plain is None else plain, reply, reason, pending, extra=extra)
             return pending
         except RequestNotSent:
             return self.not_sent()
         except TransportError:
             return pending
 
-    def _fallback_to_text(self, text, reply, reason, pending):
+    def _fallback_to_text(self, text, reply, reason, pending, extra=None):
         fallback_text = self._truncate_utf16((text + '\n' if text.strip() else '')
                                              + f'[attachment rejected: {reason}]', 4096)
-        return self._deliver_text(fallback_text, reply, pending, fallback_reason=reason)
+        return self._deliver_text(fallback_text, reply, pending, extra=extra, fallback_reason=reason)
 
     def publish(self, request):
         if request.get('conversation') != self.conversation:
@@ -2394,6 +2400,14 @@ class Bridge:
             request = {k: v for k, v in request.items() if k != 'format'}
         elif fmt != 'html':
             return self.receipt(reason='format_unsupported')
+        # Silent likewise joins the fingerprint only when true: false is the
+        # same as absent and is dropped, so a send without it is unchanged
+        # and the same key with and without silent is a conflict.
+        silent = request.get('silent', False)
+        if silent is False:
+            request = {k: v for k, v in request.items() if k != 'silent'}
+        elif silent is not True:
+            return self.receipt(reason='silent_must_be_boolean')
         if not isinstance(text, str):
             return self.receipt(reason='text_required_maximum_4096_utf16_units')
         plain = None
@@ -2480,12 +2494,15 @@ class Bridge:
                     self.store.record_ask(ask_id, text, fmt, [button for row in rows for button in row
                                                              if (self._ask_choice(button['callback_data']) or (None,))[0] == ask_id],
                                           kind)
+            extra = {}
+            if rows is not None:
+                extra['reply_markup'] = {'inline_keyboard': rows}
+            if silent:
+                extra['disable_notification'] = True
             if attachment is not None:
-                extra = {'reply_markup': {'inline_keyboard': rows}} if rows is not None else None
-                receipt = self._deliver_attachment(attachment, text, reply, pending, plain, extra=extra)
+                receipt = self._deliver_attachment(attachment, text, reply, pending, plain, extra=extra or None)
             else:
-                extra = {'reply_markup': {'inline_keyboard': rows}} if rows is not None else None
-                receipt = self._deliver_text(text, reply, pending, plain, extra=extra)
+                receipt = self._deliver_text(text, reply, pending, plain, extra=extra or None)
             if rows is not None and receipt.get('delivered') and receipt.get('message_id'):
                 self.store.set_ask_message(ask_ids, int(receipt['message_id']))
             return receipt
@@ -2726,6 +2743,9 @@ def _build_parser():
                              'a keyboard send publishes directly in this process, never through GC)')
     parser.add_argument('--format', choices=('plain', 'html'), default='plain',
                         help='html sends Telegram HTML (allowlisted tags, caller-escaped text)')
+    parser.add_argument('--silent', action='store_true',
+                        help='send, reply-current: notify with no sound '
+                             '(publishes directly in this process, never through GC)')
     parser.add_argument('--gpu-probe', action='store_true',
                         help='check-install: also transcribe a clip on the GPU inside the bridge unit\'s sandbox')
     parser.add_argument('--clip', type=Path,
@@ -2833,15 +2853,18 @@ def _dispatch_outbound(bridge, args, text):
             # A JSON null is valid JSON but not rows: refusing beats falling
             # through to GC's text-only relay and reporting buttons sent.
             raise TransportError('keyboard file must hold JSON rows')
-    if args.attachment or args.format == 'html' or keyboard is not None:
+    silent = getattr(args, 'silent', False)
+    if args.attachment or args.format == 'html' or keyboard is not None or silent:
         # GC's outbound relay accepts only session, conversation, text, key and
         # reply (HTTP 422 for any other property, e.g. 'body.attachment'), so
-        # its callback can never hand publish() an attachment, a format or a
-        # keyboard. Deliver directly in this process instead, sharing the
-        # daemon's idempotency store; GC keeps no transcript record of this send.
+        # its callback can never hand publish() an attachment, a format, a
+        # keyboard or silent. Deliver directly in this process instead, sharing
+        # the daemon's idempotency store; GC keeps no transcript record of this send.
         request = dict(conversation=bridge.conversation, idempotency_key=args.idempotency_key, text=text)
         if args.format == 'html':
             request['format'] = 'html'
+        if silent:
+            request['silent'] = True
         if keyboard is not None:
             request['keyboard'] = keyboard
         if args.attachment:

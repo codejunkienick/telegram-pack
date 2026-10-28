@@ -482,7 +482,8 @@ appended.
 ## Send and receive
 
 Use `gc telegram reply-current --body-file <path> --idempotency-key <stable-key>`.
-`--keyboard-file <path>` attaches an inline keyboard ("Mayor asks" above).
+`--keyboard-file <path>` attaches an inline keyboard ("Mayor asks" above);
+`--silent` notifies with no sound ("Silent messages" below).
 Optional `--conversation-id` must match the private configured chat. The native
 controller reminder omits the mandatory idempotency flag; add it. This pack
 command delegates to the same transport CLI and native GC outbound endpoint.
@@ -532,6 +533,31 @@ explicit opt-in; without it nothing changes for a caller or its ledger rows.
   CLI process itself through the same `publish()` and ledger the daemon uses,
   like an attachment send. GC keeps no transcript entry of it; a health check
   that counts replies must read the delivery ledger too.
+
+### Silent messages (`--silent`)
+
+`--silent` (on `send` and `reply-current`, so also `gc telegram
+reply-current`) delivers the message silently: Telegram's
+`disable_notification` ("Users will receive a notification with no sound"),
+so the message still shows in the user's notifications but makes no sound
+and does not ring the phone. It combines
+with `--format html`, `--attachment` and `--keyboard-file`; without it nothing
+changes for a caller or its ledger rows.
+
+- The request carries `silent: true`. Every Telegram request of that publish
+  carries `disable_notification: true`: the `sendMessage` body, the
+  `send<Media>` multipart field, the HTML parse-rejection re-send and the
+  attachment text fallback.
+- `publish()` accepts `silent` true or absent; false is the same as absent
+  and is dropped before the fingerprint, so a send without it keeps its exact
+  body and ledger fingerprint. Any other value refuses the send before
+  Telegram is contacted (`silent_must_be_boolean`).
+- Silent is part of the idempotency identity: the same key with and without
+  it is `idempotency_key_conflict`, like another body.
+- GC's outbound relay carries no silent field, so a silent send is delivered
+  by the CLI process itself through the same `publish()` and ledger, like an
+  HTML send. GC keeps no transcript entry of it.
+- Edits never notify, so city command edits and ask answers are unaffected.
 
 ### Outbound attachments
 

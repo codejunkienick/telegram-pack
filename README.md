@@ -21,6 +21,8 @@ itself.
   An English-only (`.en`) model requires `language = "en"`.
 - The mayor gets a delivery ledger that stops a retried send from posting
   twice and reports an unknown outcome instead of resending it.
+- The mayor sends an update that needs no action silently (`--silent`): it
+  still notifies, but with no sound, so only asks and problems ring.
 - The paired user gets a slash command menu, and a city adds commands
   through its own handler programs that answer with text and inline
   buttons and need no enable flag.
