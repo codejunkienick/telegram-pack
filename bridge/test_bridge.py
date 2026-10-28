@@ -1773,7 +1773,8 @@ class AskTests(BridgeTestCase):
         self.assertEqual(columns, [('ask_id', 'TEXT'), ('question', 'TEXT'), ('format', 'TEXT'),
                                    ('options', 'TEXT'), ('message_id', 'INTEGER'),
                                    ('answered', 'INTEGER'), ('answer', 'TEXT'),
-                                   ('update_id', 'INTEGER'), ('relayed', 'INTEGER'), ('kind', 'TEXT')])
+                                   ('update_id', 'INTEGER'), ('relayed', 'INTEGER'), ('kind', 'TEXT'),
+                                   ('decided', 'INTEGER')])
 
     def test_command_keyboard_on_a_photo_is_refused(self):
         self.bridge = b.Bridge(dict(self.config, commands=(dict(name='deploy', callback_prefix='deploy:'),)),

@@ -29,7 +29,9 @@ itself.
 - The paired user answers a mayor ask on a text message or on one photo
   message (the caption is the question) by tapping one of its inline
   buttons instead of typing: one tap reaches the mayor once as one
-  actionable message, and the ask message then shows the choice.
+  actionable message, and the ask message then shows the choice. When the
+  user answers some other way, the mayor closes the ask with the decision
+  made (`gc telegram ask-close`): its buttons go and it shows the decision.
 - Each city gets its own bot, settings file, bridge process and delivery
   ledger on one host, and cities share one copy of the code and one
   whisper.cpp build.
@@ -41,7 +43,7 @@ itself.
 
 | Path | What |
 | --- | --- |
-| `bridge/bridge.py` | the bridge: `run`, `probe`, `send`, `reply-current`, `set-commands`, `render-unit`, `check-install` |
+| `bridge/bridge.py` | the bridge: `run`, `probe`, `send`, `reply-current`, `ask-close`, `set-commands`, `render-unit`, `check-install` |
 | `bridge/OPERATIONS.md` | the operations guide: settings, launch, delivery recovery, transcription |
 | `bridge/test_*.py` | `sh scripts/test.sh` (fake Telegram, GC and whisper-cli; no network). Set `TEST_PORT_RANGE=LOW-HIGH` to bind test servers inside that range. Pick a range that excludes ports the host's own services use. |
 | `settings.example.toml` | every settings key, with example values |
@@ -49,6 +51,7 @@ itself.
 | `systemd/telegram-bridge.service.in` | the Linux unit template; on macOS the agent is rendered by `bridge.py render-unit` |
 | `transcriber/` | `voice_transcribe.py` (whisper.cpp, configured language), `adapter.py` (the bridge's contract), `models.sha256` |
 | `commands/reply-current/` | `gc telegram reply-current`: reply in the paired chat, optionally with an inline keyboard (`--keyboard-file`) |
+| `commands/ask-close/` | `gc telegram ask-close`: close an open ask with the decision made (`--message-id` or `--ask-key`, `--decision`) |
 | `skills/` | the shared skills: `telegram-formatting`, `telegram-attachments`, `telegram-voice-transcripts` |
 
 ## Add-ons

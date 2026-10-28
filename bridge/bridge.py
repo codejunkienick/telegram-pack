@@ -430,7 +430,13 @@ class Store:
                        'format TEXT NOT NULL, options TEXT NOT NULL, message_id INTEGER, '
                        'answered INTEGER NOT NULL DEFAULT 0, answer TEXT, '
                        'update_id INTEGER, relayed INTEGER NOT NULL DEFAULT 0, '
-                       "kind TEXT NOT NULL DEFAULT 'text')")
+                       "kind TEXT NOT NULL DEFAULT 'text', decided INTEGER NOT NULL DEFAULT 0)")
+            # CREATE TABLE IF NOT EXISTS never adds a column to an existing
+            # ledger: add decided once, so every recorded ask reads
+            # decided=0 and keeps its meaning. The INSERT above holds the
+            # write lock, so a second process opening the ledger waits here.
+            if 'decided' not in [row[1] for row in db.execute('PRAGMA table_info(asks)')]:
+                db.execute('ALTER TABLE asks ADD COLUMN decided INTEGER NOT NULL DEFAULT 0')
 
     @contextlib.contextmanager
     def connect(self):
@@ -485,14 +491,20 @@ class Store:
 
     def get_ask(self, ask_id):
         with self.connect() as db:
-            row = db.execute('SELECT question, format, options, message_id, answered, answer, update_id, relayed, kind'
-                             ' FROM asks WHERE ask_id=?', (ask_id,)).fetchone()
+            row = db.execute('SELECT question, format, options, message_id, answered, answer, update_id, relayed, kind,'
+                             ' decided FROM asks WHERE ask_id=?', (ask_id,)).fetchone()
         if row is None:
             return None
-        question, fmt, options, message_id, answered, answer, update_id, relayed, kind = row
+        question, fmt, options, message_id, answered, answer, update_id, relayed, kind, decided = row
         return dict(ask_id=ask_id, question=question, format=fmt, options=json.loads(options),
                     message_id=message_id, answered=bool(answered), answer=answer,
-                    update_id=update_id, relayed=bool(relayed), kind=kind or 'text')
+                    update_id=update_id, relayed=bool(relayed), kind=kind or 'text', decided=bool(decided))
+
+    def get_ask_by_message(self, message_id):
+        """The ask whose send confirmed this message id, or None."""
+        with self.connect() as db:
+            row = db.execute('SELECT ask_id FROM asks WHERE message_id=?', (message_id,)).fetchone()
+        return None if row is None else self.get_ask(row[0])
 
     def set_ask_message(self, ask_ids, message_id):
         with self.connect() as db:
@@ -500,10 +512,23 @@ class Store:
                            [(message_id, ask_id) for ask_id in ask_ids])
 
     def mark_ask_answered(self, ask_id, answer, update_id):
-        """In one ledger write mark the ask answered with the choice and update id."""
+        """In one ledger write mark the ask answered with the choice and update
+        id; True when this write won, False when the ask was already answered
+        (a close from the CLI process won after the tap read the ask)."""
         with self.connect() as db:
-            db.execute('UPDATE asks SET answered=1, answer=?, update_id=? WHERE ask_id=?',
-                       (answer, update_id, ask_id))
+            return db.execute('UPDATE asks SET answered=1, answer=?, update_id=? WHERE ask_id=? AND answered=0',
+                              (answer, update_id, ask_id)).rowcount == 1
+
+    def close_ask(self, ask_id, decision):
+        """In one ledger write mark the ask answered and decided with the
+        decision, and relayed (nothing goes to GC: the mayor made it); True
+        when this write won, False when a tap or another close came first.
+        The guard is the only serialisation of a tap (the daemon) against a
+        close (the CLI): they are separate processes."""
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            return db.execute('UPDATE asks SET answered=1, answer=?, decided=1, relayed=1'
+                              ' WHERE ask_id=? AND answered=0', (decision, ask_id)).rowcount == 1
 
     def mark_ask_relayed(self, ask_id):
         """Record the ask as relayed once GC confirms the answer entry."""
@@ -1596,6 +1621,8 @@ class Bridge:
     # may equal or overlap it; no handler output may use it.
     ASK_CALLBACK_PREFIX = 'ask:'
     ASK_ALREADY_ANSWERED = 'Already answered'
+    # The line a close (ask-close) appends to the ask's text or caption.
+    ASK_DECIDED_PREFIX = '\n✓ Decided: '
     _COMMAND_ACTION_KEYS = {
         'send': ({'type', 'text'}, {'format', 'keyboard'}),
         'edit': ({'type', 'message_id', 'text'}, {'format', 'keyboard'}),
@@ -2124,7 +2151,14 @@ class Bridge:
             self._answer_callback(update_id, query['id'], key=answer_key)
             return
         self._answer_callback(update_id, query['id'], key=answer_key)
-        self.store.mark_ask_answered(ask_id, label, update_id)
+        if not self.store.mark_ask_answered(ask_id, label, update_id):
+            # A6: a close (ask-close, the CLI process) won after the read
+            # above; taps are serialised in this one poller, so only a close
+            # can. Its row is decided and relayed: nothing relays, and the
+            # edit step shows the decision (a saved receipt when the close's
+            # edit already ran). This callback was answered empty above.
+            self._edit_ask(ask_id, self.store.get_ask(ask_id), mid, update_id)
+            return
         ask = self.store.get_ask(ask_id)
         self._relay_ask_answer(ask_id, ask, mid, update_id)
 
@@ -2151,23 +2185,27 @@ class Bridge:
         self.store.mark_ask_relayed(ask_id)
         self._edit_ask(ask_id, ask, mid, update_id)
 
-    def _edit_ask(self, ask_id, ask, mid, update_id):
-        """Run one answered ask's edit step once: append "\\n✓ <label>" to
-        the text or caption and remove the buttons, under the per-ask key
-        ask:<ask-id>:edit (editMessageText for a text ask,
-        editMessageCaption for a photo ask). A press whose edit key already
+    def _edit_ask(self, ask_id, ask, mid, update_id=None):
+        """Run one answered ask's edit step once: append "\\n✓ <label>" (a
+        tap) or "\\n✓ Decided: <decision>" (a close) to the text or caption
+        and remove the buttons, under the per-ask key ask:<ask-id>:edit
+        (editMessageText for a text ask, editMessageCaption for a photo ask).
+        The suffix and identity come from the row, so a close's edit and a
+        later tap's edit are one request. A press whose edit key already
         holds a receipt (confirmed, rejected or pending) never edits again;
         the edit outcome never holds the offset, un-answers or relays again.
-        Both edits carry an empty inline keyboard."""
+        Both edits carry an empty inline keyboard. Returns the edit receipt;
+        a tap (update_id set) logs an unconfirmed edit."""
         question, fmt = ask['question'], ask['format']
         label = ask['answer']
         kind = ask.get('kind') or 'text'
+        prefix = self.ASK_DECIDED_PREFIX if ask.get('decided') else '\n✓ '
         if fmt == 'html':
             visible, _ = html_visible_text(question)
-            edit_text = question + '\n✓ ' + html_text(label)
-            plain_edit = visible + '\n✓ ' + label
+            edit_text = question + prefix + html_text(label)
+            plain_edit = visible + prefix + label
         else:
-            edit_text, plain_edit = question + '\n✓ ' + label, None
+            edit_text, plain_edit = question + prefix + label, None
         if kind == 'photo':
             edit = self._reserve_and_deliver(f'ask:{ask_id}:edit',
                                              dict(type='edit', message_id=mid, text=edit_text, format=fmt),
@@ -2181,8 +2219,60 @@ class Bridge:
                                                  method='editMessageText',
                                                  extra={'message_id': mid,
                                                         'reply_markup': {'inline_keyboard': []}}))
-        if edit.get('delivered') is not True:
+        if update_id is not None and edit.get('delivered') is not True:
             self._log(f'ask edit not confirmed (update {update_id})')
+        return edit
+
+    # The refusals of close_ask before its ledger write; any other reason it
+    # returns is the edit's, after the ask was closed.
+    ASK_CLOSE_REFUSALS = ('ask_not_found', 'ask_message_unknown', 'ask_already_answered', 'ask_already_decided',
+                          'decision_required', 'decision_breaks_line', 'decision_exceeds_room')
+
+    def close_ask(self, decision, message_id=None, ask_key=None):
+        """A6: close one open ask with the decision the mayor made, selected
+        by its sent message id or by its send's idempotency key (exactly
+        one). One guarded ledger write marks it answered, decided and
+        relayed (nothing goes to GC), then the edit step removes the buttons
+        and appends "\\n✓ Decided: <decision>". A later tap gets only the
+        already-answered answer. The same decision again is the idempotent
+        repeat (the saved edit receipt; a not-sent edit sends again).
+        Returns the edit receipt, or a refusal receipt before any write."""
+        if (message_id is None) == (ask_key is None):
+            raise ValueError('close_ask takes exactly one of message_id and ask_key')
+        if message_id is not None:
+            ask = self.store.get_ask_by_message(message_id)
+        else:
+            ask = self.store.get_ask(self._ask_id_for_key(ask_key))
+        if ask is None:
+            return self.receipt(reason='ask_not_found')
+        if ask['message_id'] is None:
+            # The ask's send never confirmed a message: nothing to edit.
+            return self.receipt(reason='ask_message_unknown')
+        if ask['answered']:
+            return self._closed_ask(ask, decision)
+        if not isinstance(decision, str) or not decision.strip():
+            return self.receipt(reason='decision_required')
+        if self._ask_text_breaks_answer_line(decision):
+            return self.receipt(reason='decision_breaks_line')
+        visible = html_visible_text(ask['question'])[0] if ask['format'] == 'html' else ask['question']
+        limit = 1024 if ask.get('kind') == 'photo' else 4096
+        if utf16_units(visible + self.ASK_DECIDED_PREFIX + decision) > limit:
+            return self.receipt(reason='decision_exceeds_room')
+        if not self.store.close_ask(ask['ask_id'], decision):
+            # A tap (or another close) won between the read and the write.
+            return self._closed_ask(self.store.get_ask(ask['ask_id']), decision)
+        ask = self.store.get_ask(ask['ask_id'])
+        return self._edit_ask(ask['ask_id'], ask, ask['message_id'])
+
+    def _closed_ask(self, ask, decision):
+        """close_ask on an ask already answered: a tap's choice refuses, another
+        decision refuses, the same decision runs the edit step again (a
+        saved receipt, never a second edit)."""
+        if not ask['decided']:
+            return self.receipt(reason='ask_already_answered', answer=ask['answer'])
+        if ask['answer'] != decision:
+            return self.receipt(reason='ask_already_decided', answer=ask['answer'])
+        return self._edit_ask(ask['ask_id'], ask, ask['message_id'])
 
     def _deliver_caption_edit(self, caption, pending, plain=None, message_id=None):
         """Edit a photo ask caption; mirrors _deliver_text with editMessageCaption.
@@ -2716,6 +2806,12 @@ def _conflict_exit_status(value):
     return status
 
 
+def _positive_message_id(value):
+    if not (value.isascii() and value.isdecimal()) or not 1 <= int(value) <= 2 ** 63 - 1:
+        raise argparse.ArgumentTypeError('--message-id must be a positive integer')
+    return int(value)
+
+
 def _build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--settings', type=Path,
@@ -2724,7 +2820,7 @@ def _build_parser():
     parser.add_argument('--city-root', type=Path, default=_default_city_root(),
                         help='only used to find the default settings file')
     parser.add_argument('--port', type=int, help='overrides the settings\' port')
-    parser.add_argument('command', choices=('run', 'probe', 'send', 'reply-current', 'set-commands',
+    parser.add_argument('command', choices=('run', 'probe', 'send', 'reply-current', 'ask-close', 'set-commands',
                                             'render-unit', 'check-install'))
     parser.add_argument('--body-file', type=Path,
                         help='file holding the message text (send, reply-current)')
@@ -2746,6 +2842,12 @@ def _build_parser():
     parser.add_argument('--silent', action='store_true',
                         help='send, reply-current: notify with no sound '
                              '(publishes directly in this process, never through GC)')
+    parser.add_argument('--message-id', type=_positive_message_id,
+                        help='ask-close: the message ID the ask was sent as')
+    parser.add_argument('--ask-key',
+                        help="ask-close: the ask send's --idempotency-key, instead of --message-id")
+    parser.add_argument('--decision',
+                        help='ask-close: the decision made, one line, shown under the ask in place of its buttons')
     parser.add_argument('--gpu-probe', action='store_true',
                         help='check-install: also transcribe a clip on the GPU inside the bridge unit\'s sandbox')
     parser.add_argument('--clip', type=Path,
@@ -2766,6 +2868,15 @@ def _validate_attachment_flags(parser, args):
         parser.error('--clip requires --gpu-probe')
     if getattr(args, 'conflict_exit_status_given', False) and args.command != 'run':
         parser.error('--conflict-exit-status is a run flag')
+    selectors = [flag for flag, value in (('--message-id', args.message_id), ('--ask-key', args.ask_key))
+                 if value is not None]
+    if args.command != 'ask-close':
+        if selectors or args.decision is not None:
+            parser.error('--message-id, --ask-key and --decision are ask-close flags')
+    elif len(selectors) != 1:
+        parser.error('ask-close requires exactly one of --message-id and --ask-key')
+    elif args.decision is None:
+        parser.error('ask-close requires --decision')
 
 
 def _launchd_label(unit):
@@ -3813,6 +3924,21 @@ def main():
             raise TransportError('conversation ID is not the paired private recipient')
         message_id = _dispatch_outbound(bridge, args, args.body_file.read_text())
         print('Telegram delivery confirmed; message ID ' + str(message_id))
+    elif args.command == 'ask-close':
+        # Directly in this process through the shared ledger; GC is never called.
+        receipt = bridge.close_ask(args.decision, message_id=args.message_id, ask_key=args.ask_key)
+        if receipt.get('delivered') is not True:
+            reason = (receipt.get('metadata') or {}).get('reason') or 'delivery not confirmed'
+            _print_gc_receipt(False, receipt.get('failure_kind', 'permanent'), reason)
+            if reason in ('ask_already_answered', 'ask_already_decided'):
+                raise TransportError(f'ask not closed: {reason} (recorded: {receipt.get("answer")})')
+            if reason in Bridge.ASK_CLOSE_REFUSALS:
+                raise TransportError(f'ask not closed: {reason}')
+            if reason == NOT_SENT_REASON:
+                raise TransportError(f'ask closed; Telegram edit not confirmed: {reason}: '
+                                     'run the same command again to send the edit')
+            raise TransportError(f'ask closed; Telegram edit not confirmed: {reason}')
+        print('Telegram ask closed; message ID ' + str(receipt['message_id']))
     else:
         # Token-wide lock survives alternate state directories; never unlink while locked.
         with (settings.lock_dir / ('telegram-bot-' + str(settings.config['bot_id']) + '.lock')).open('a') as lock:

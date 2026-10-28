@@ -393,7 +393,7 @@ drop-and-answer-empty behaviour and never reaches the mayor.
 
 A2 On the first valid press, in order: (1) answer the callback once (key
 `ask:<update_id>:answer`); (2) in one ledger write mark the ask answered with
-the choice and the update id; (3) relay exactly one durable inbound entry
+the choice and the update id, only while it is unanswered (A6); (3) relay exactly one durable inbound entry
 with provider message id `ask-<ask-id>` and the text
 `[ask answer | choice: <label> | message: <id>]`, then a newline and
 `question: ` followed by the visible question verbatim as the last field,
@@ -466,7 +466,7 @@ no room left for the appended choice refuses the send (`invalid_keyboard`),
 since no tap could complete it. The bridge records each
 ask in the ledger before the send is confirmed (ask id, question text or
 caption, ordered options, sent message id, answered flag, kind text or
-photo). A `[[command]]` `callback_prefix` equal to or overlapping `ask:`
+photo, decided flag). A `[[command]]` `callback_prefix` equal to or overlapping `ask:`
 refuses at load, and handler output using `ask:` data is a
 `foreign_callback_data` failure: no press, handler output or settings value
 can send a second copy of an answer.
@@ -478,6 +478,64 @@ without `parse_mode` under the same key and keeps the keyboard (the photo
 once without `parse_mode`, keeping the keyboard, for a photo ask); an ask
 edit rejected the same way falls back to the plain question with the choice
 appended.
+
+A6 Closing with a decision. When the paired user answers an open ask by
+typing, or decides something other than its options, the mayor closes it
+with the decision made: `gc telegram ask-close --message-id <id> --decision
+"<text>"` (the pack command runs `bridge.py ask-close`). `<id>` is the
+message ID the ask send printed; `--ask-key <key>`, the ask send's
+idempotency key, selects it instead when only the key is known (exactly one
+of the two). The close runs in the CLI process through the shared ledger,
+needs no `--session` and never calls GC: nothing is relayed, since the mayor
+made the decision. In order:
+
+(1) Refusals before any ledger write, each a receipt reason:
+`ask_not_found` (no ask was sent as that message id, which covers an unknown
+id and a message that is not an ask, or no ask has that key's derived id),
+`ask_message_unknown` (the ask's send never confirmed a message id; it is
+reconciled by hand), `ask_already_answered` (a tap answered it; the message
+names the recorded choice), `ask_already_decided` (another decision is
+recorded; the same decision again is the idempotent repeat),
+`decision_required` (empty or whitespace only), `decision_breaks_line` (a
+line break or control character, the A5 label rule) and
+`decision_exceeds_room` (the visible question plus `\n✓ Decided: <decision>`
+over 4096 UTF-16 units of text, or 1024 units of caption for a photo ask).
+
+(2) One guarded ledger write marks the ask answered, decided and relayed,
+with the decision as its answer, only while it is unanswered. When a tap won
+in the meantime the close refuses `ask_already_answered`.
+
+(3) The A2 step 4 edit, under the same per-ask key `ask:<ask-id>:edit`: it
+appends `\n✓ Decided: <decision>` to the text or caption (the decision
+escaped for an HTML ask, with the plain fallback) and removes the buttons,
+editMessageText for a text ask and editMessageCaption for a photo ask, with
+an empty inline keyboard. The edit's identity comes from the ledger row, so
+the close's edit and any later press's A4 edit are one request: a saved
+receipt, never a second edit.
+
+(4) A later press on a closed ask goes the A4 way: the edit step (a no-op),
+then the `Already answered` answer; nothing is relayed.
+
+(5) Output: `Telegram ask closed; message ID <id>` (exit 0), the same line on
+an idempotent repeat. A refusal, or an edit that is not confirmed (rejected,
+ambiguous or not sent), prints the `GC_RECEIPT` line with its reason on
+stderr and exits 1. After the write the ask stays closed and the message
+says so (`ask closed; Telegram edit not confirmed: <reason>`). A not-sent
+edit is sent by running the same command again; a rejected edit (the user
+deleted the message, say) stays rejected, and an ambiguous one is reconciled
+by hand.
+
+(6) The ledger's asks table carries `decided` (0 or 1, default 0) as its
+last column. An existing ledger opens unchanged and gains the column once
+when the bridge opens it, so every recorded ask reads decided=0 and keeps its
+meaning. No settings key is involved.
+
+The CLI and the daemon are separate processes; the guarded writes (a tap's
+mark and a close's write each change the row only while it is unanswered)
+are their only serialisation. When a close wins between a tap's read and its
+mark, that tap's callback was already answered empty (A2 step 1), so its
+toast is empty rather than `Already answered`; the tap relays nothing and
+runs the edit step, which shows the decision, so the edit happens once.
 
 ## Send and receive
 

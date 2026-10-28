@@ -126,5 +126,23 @@ gc telegram reply-current --conversation-id <configured-chat-id> --body-file <qu
 - After the tap you receive
   `[ask answer | choice: <label> | message: <id>]` on the first line,
   then `question: ` with the visible question verbatim.
+- When the user answers an open ask by typing, or decides something
+  other than its options, your next step is to close it with the
+  decision made, in one line:
+
+  ```sh
+  gc telegram ask-close --message-id <id> --decision "<the decision, one line>"
+  ```
+
+  `<id>` comes from the ask send's `message ID <id>` line; pass
+  `--ask-key <key>` (the ask send's idempotency key) instead when only
+  the key is known. The buttons go and the ask shows
+  `✓ Decided: <decision>`; a later tap is then refused with "Already
+  answered" and never reaches you. The decision holds no line break or
+  control character, and the question plus `\n✓ Decided: <decision>`
+  fits within 4096 UTF-16 units, 1024 for a photo ask. A refusal prints
+  a `GC_RECEIPT` line: `ask_already_answered` means a tap came first,
+  so act on that answer instead. Running the same command again is
+  safe: it never edits twice.
 
 The source file and symbol behind each claim in this skill are in `citations.md`, next to this file; open it only when you need them.

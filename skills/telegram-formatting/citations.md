@@ -23,6 +23,16 @@ The rows live only here; SKILL.md holds none.
 | pack | bridge/OPERATIONS.md | a keyboard may go with no attachment or with exactly one photo | text or one photo only |
 | pack | bridge/OPERATIONS.md | A keyboard on a photo holds only ask buttons | photo keyboard ask-only |
 | pack | bridge/bridge.py | f'[ask answer \| choice: {label} \| message: {mid}]\nquestion: {visible}' | relayed answer shape |
+| pack | bridge/OPERATIONS.md | A6 Closing with a decision | closing an ask follows this section |
+| pack | commands/ask-close/command.toml | Close an open ask with the decision made | ask-close command |
+| pack | bridge/bridge.py | print('Telegram delivery confirmed; message ID ' + str(message_id)) | the ask's message id |
+| pack | bridge/OPERATIONS.md | selects it instead when only the key is known | --ask-key instead of --message-id |
+| pack | bridge/bridge.py | ASK_DECIDED_PREFIX = '\n✓ Decided: ' | decided line under the ask |
+| pack | bridge/OPERATIONS.md | then the `Already answered` answer; nothing is relayed. | a later tap is refused |
+| pack | bridge/bridge.py | reason='decision_breaks_line' | one-line decision |
+| pack | bridge/bridge.py | utf16_units(visible + self.ASK_DECIDED_PREFIX + decision) > limit | room for the decision |
+| pack | bridge/bridge.py | reason='ask_already_answered' | a tap came first |
+| pack | bridge/OPERATIONS.md | never a second edit | a repeat never edits twice |
 | pack | commands/reply-current/command.toml | requires --body-file and --idempotency-key | reply command |
 | pack | bridge/OPERATIONS.md | controller reminder omits the mandatory idempotency flag | always add the key |
 | pack | bridge/bridge.py | idempotency key reused for a different request | same key, same body |

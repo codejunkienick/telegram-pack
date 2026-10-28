@@ -1,0 +1,1 @@
+description = "Close an open ask with the decision made: --message-id <id> (or --ask-key <key>) and --decision <text>; removes its buttons and shows the decision, so a later tap is already answered"
