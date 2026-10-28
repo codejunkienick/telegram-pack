@@ -34,6 +34,8 @@ itself.
 - The paired user sees a reaction on a message once the mayor has it
   (`seen`, when the city turns it on) and another when the work it asked
   for is done (`gc telegram react --reaction done`).
+- The paired user sees "typing..." after a message the mayor has, until
+  the mayor's next send, when the city turns it on (`[typing]`).
 - The paired user answers a mayor ask on a text message or on one photo
   message (the caption is the question) by tapping one of its inline
   buttons instead of typing: one tap reaches the mayor once as one

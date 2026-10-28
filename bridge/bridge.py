@@ -67,6 +67,15 @@ NOT_SENT_REASON = 'transport_unavailable_not_sent'
 REACTIONS_KEYS = {'on_accept', 'seen', 'done'}
 REACTIONS_DEFAULTS = dict(on_accept=False, seen='\U0001F440', done='\U0001F44C')
 REACTION_MAX_CHARS = 16
+# The typing indicator ([typing]): none unless seconds > 0. Telegram shows a
+# chat action for at most 5 s, so the worker repeats it every 4 s; it looks
+# at the ledger every second for the send that ends the window.
+TYPING_KEYS = {'seconds'}
+TYPING_DEFAULTS = dict(seconds=0)
+TYPING_MAX_SECONDS = 900
+TYPING_INTERVAL = 4
+TYPING_TICK = 1
+TYPING_TIMEOUT = 5
 
 
 def valid_reaction_emoji(value):
@@ -613,6 +622,21 @@ class Store:
             db.execute('UPDATE pins SET ' + ', '.join(f'{name}=?' for name in fields) + ' WHERE slot=?',
                        (*fields.values(), slot))
 
+    def deliveries_mark(self):
+        """The highest rowid of the deliveries table, 0 when it is empty: rows
+        are never deleted, so every new key gets a higher one."""
+        with self.connect() as db:
+            return db.execute('SELECT coalesce(max(rowid), 0) FROM deliveries').fetchone()[0]
+
+    def sent_since(self, mark):
+        """True once the deliveries table holds a key newer than `mark` other
+        than an accept reaction: a send, edit, ask, pin, album or reaction from
+        the daemon or a CLI process, which share this ledger."""
+        with self.connect() as db:
+            row = db.execute("SELECT 1 FROM deliveries WHERE rowid > ? AND key NOT GLOB 'reaction:[0-9]*:accept'"
+                             ' LIMIT 1', (mark,)).fetchone()
+        return row is not None
+
 
 def check_bridge_config(config, *, settings=False):
     """The one validation of a bridge config's identity: the bot, user and
@@ -754,7 +778,7 @@ class Bridge:
 
     def __init__(self, config, store, token, callback_secret, port=8930, request=http_json,
                  request_multipart=http_multipart, request_download=None, state_dir=None, transcribe=None,
-                 sleep=None, monotonic=None, request_media_group=http_multipart_files):
+                 sleep=None, monotonic=None, request_media_group=http_multipart_files, typing_wait=None):
         self.config, self.store, self.token = config, store, token
         # The send retry's wait and clock (tests inject both, so none sleeps).
         self.sleep, self.monotonic = sleep or time.sleep, monotonic or time.monotonic
@@ -767,6 +791,15 @@ class Bridge:
         self.reaction_queue = queue.Queue()
         self.reaction_worker = None
         self.reaction_worker_lock = threading.Lock()
+        # The typing window ([typing]): None, or dict(end, mark, due, failed)
+        # under typing_lock; the worker waits on typing_wake between ticks
+        # (tests inject typing_wait, so none sleeps).
+        self.typing_seconds = dict(TYPING_DEFAULTS, **(config.get('typing') or {}))['seconds']
+        self.typing_window = None
+        self.typing_lock = threading.Lock()
+        self.typing_wake = threading.Event()
+        self.typing_wait = typing_wait or self.typing_wake.wait
+        self.typing_worker = None
         self.secret, self.port, self.request = callback_secret, port, request
         self.request_multipart = request_multipart
         self.request_media_group = request_media_group
@@ -1703,8 +1736,9 @@ class Bridge:
     def _accepted(self, mid):
         """The accept point: GC durably accepted message `mid` from the paired
         user. Record it as the last accepted message and, with on_accept,
-        queue the seen reaction for the worker. Never raises: the inbound
-        cursor never waits on, or is retained by, a reaction."""
+        queue the seen reaction for the worker, and with [typing] open or
+        extend the typing window. Never raises: the inbound cursor never
+        waits on, or is retained by, a reaction or a chat action."""
         try:
             self.store.record_accepted(mid, datetime.datetime.now(datetime.timezone.utc).isoformat())
         except Exception:  # noqa: BLE001 - the relay already succeeded
@@ -1714,6 +1748,8 @@ class Bridge:
                 self._enqueue_reaction(mid)
             except Exception:  # noqa: BLE001 - e.g. no thread could start; the relay already succeeded
                 self._log(f'reaction not set (msg {mid}): reaction_worker_unavailable')
+        if self.typing_seconds:
+            self._open_typing()
 
     def _enqueue_reaction(self, mid):
         with self.reaction_worker_lock:
@@ -1775,6 +1811,113 @@ class Bridge:
             if once and self.store.agent_reacted(message_id):
                 return None
             return self._reserve_and_deliver(key, body, deliver)
+
+    # ---- typing ([typing]) -----------------------------------------------------
+    # sendChatAction delivers nothing to the chat history, so it is the one
+    # Telegram call outside the ledger: no key, no row, one attempt, never
+    # retried. One worker (started by run) sends it; the poll loop only opens
+    # the window, and nothing here takes publish_lock.
+
+    def _open_typing(self):
+        """Open the typing window for an accepted message, or extend the open
+        one to `seconds` from now. A window remembers the ledger's newest
+        delivery row when it began; one that already ended, at its end time
+        or by a send, before the worker looked, begins again with a new mark
+        and its own failure log. Never raises."""
+        with self.typing_lock:
+            window = self.typing_window
+        now = self.monotonic()
+        try:
+            if window is not None and now < window['end'] and not self.store.sent_since(window['mark']):
+                mark, failed = window['mark'], window['failed']
+            else:
+                mark, failed = self.store.deliveries_mark(), False
+        except Exception:  # noqa: BLE001 - the relay already succeeded
+            self._log('typing not shown: ledger_unavailable')
+            return
+        with self.typing_lock:
+            self.typing_window = dict(end=now + self.typing_seconds, mark=mark, due=now, failed=failed)
+        self.typing_wake.set()
+
+    def _start_typing(self):
+        """Start the typing worker; one that cannot start only logs."""
+        try:
+            worker = threading.Thread(target=self._typing_loop, daemon=True, name='typing')
+            worker.start()
+            self.typing_worker = worker
+        except Exception:  # noqa: BLE001 - typing is cosmetic; the bridge runs without it
+            self._log('typing not shown: typing_worker_unavailable')
+
+    def _typing_loop(self):
+        """The typing worker: a tick at least every TYPING_TICK seconds, and at
+        once when a message is accepted, until bridge.stop ends the window."""
+        while not self.stop.is_set():
+            self.typing_wake.clear()
+            try:
+                self._typing_tick()
+            except Exception:  # noqa: BLE001 - the worker must outlive any single tick
+                with self.typing_lock:
+                    window = self.typing_window
+                if window is not None:
+                    self._end_typing(window, 'typing_failed')
+            self.typing_wait(TYPING_TICK)
+        with self.typing_lock:
+            self.typing_window = None
+
+    def _typing_tick(self):
+        """One look at the typing window: end it at its end time or once the
+        ledger holds a send newer than its mark, else send the chat action
+        when one is due."""
+        with self.typing_lock:
+            window = self.typing_window
+        if window is None:
+            return
+        now = self.monotonic()
+        if now >= window['end']:
+            return self._end_typing(window)
+        try:
+            sent = self.store.sent_since(window['mark'])
+        except Exception:  # noqa: BLE001 - a send it cannot see must not leave typing on
+            return self._end_typing(window, 'ledger_unavailable')
+        if sent:
+            return self._end_typing(window)
+        with self.typing_lock:
+            due = now >= window['due']
+            if due:
+                window['due'] = now + TYPING_INTERVAL
+        if due:
+            self._send_typing(window)
+
+    def _send_typing(self, window):
+        """One sendChatAction typing to the paired chat, a single attempt of at
+        most TYPING_TIMEOUT seconds. A definite rejection ends the window (the
+        next would be refused alike); any other failure leaves it to the next
+        due time."""
+        body = dict(chat_id=self.config['chat_id'], action='typing')
+        try:
+            status, data = self.telegram('sendChatAction', body, timeout=TYPING_TIMEOUT)
+        except TransportError:
+            return self._typing_failed(window, 'transport_unavailable')
+        if status == 200 and data.get('ok') is True and data.get('result') is True:
+            return
+        code = data.get('error_code')
+        if data.get('ok') is False and type(code) is int and 400 <= code < 500:
+            return self._end_typing(window, f'telegram_rejected_{code}')
+        self._typing_failed(window, 'telegram_unconfirmed')
+
+    def _typing_failed(self, window, reason):
+        """Log a failure once per window: its reason, never text."""
+        with self.typing_lock:
+            logged, window['failed'] = window['failed'], True
+        if not logged:
+            self._log(f'typing not shown: {reason}')
+
+    def _end_typing(self, window, reason=None):
+        if reason is not None:
+            self._typing_failed(window, reason)
+        with self.typing_lock:
+            if self.typing_window is window:
+                self.typing_window = None
 
     # ---- city commands ([[command]]) -----------------------------------------
     # A registered slash command or a button press under a registered
@@ -3214,6 +3357,8 @@ class Bridge:
             self.register()
             registered = True
             print('Telegram bridge ready; private allowlist enforced', flush=True)
+            if self.typing_seconds:
+                self._start_typing()
             last_registration, failures = time.monotonic(), 0
             while not self.stop.is_set():
                 try:
@@ -3533,7 +3678,7 @@ _MODEL_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,79}')
 SETTINGS_KEYS = {'city', 'state_dir', 'port', 'python', 'token_file', 'callback_secret_file', 'lock_dir', 'unit',
                  'user_display_name', 'timezone', 'gc_base_url', 'gc_api_token_file', 'health_file',
                  'pairing_update_id', 'bot', 'menu', 'transcribe', 'agent', 'command',
-                 'handler_write_paths', 'reactions'}
+                 'handler_write_paths', 'reactions', 'typing'}
 BOT_KEYS = {'bot_id', 'user_id', 'chat_id', 'account_id'}
 COMMAND_KEYS = {'name', 'description', 'handler', 'url', 'menu', 'callback_prefix', 'timeout'}
 # Commands the bridge itself owns: /start is never relayed.
@@ -3832,6 +3977,10 @@ def load_settings(path, home=None):
                 raise SettingsError(f'settings: reactions.{name} must be one emoji: at most '
                                     f'{REACTION_MAX_CHARS} characters, no space, letter or digit')
         config['reactions'] = reactions
+    if 'typing' in data:
+        typing = dict(TYPING_DEFAULTS, **_table(data, 'typing', TYPING_KEYS))
+        _int_setting(typing['seconds'], 'typing.seconds', 0, TYPING_MAX_SECONDS)
+        config['typing'] = typing
     optional = (('gc_api_token_path', data.get('gc_api_token_file'), 'gc_api_token_file'),
                 ('health_file', data.get('health_file'), 'health_file'))
     for key, value, what in optional:

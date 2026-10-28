@@ -51,6 +51,11 @@ description = "Show the agent's status"
 # seen = "👀"                               # default 👀
 # done = "👌"                               # `gc telegram react --reaction done`; default 👌 (✅ is not an allowed reaction)
 
+# "typing..." in the chat after each message GC accepts, until the agent's next
+# send (OPERATIONS.md, "Typing").
+# [typing]
+# seconds = 300                             # the longest it shows after the latest accepted message, 0-900; default 0: never
+
 [transcribe]
 enabled = true                              # voice and audio notes get a transcript in the configured language
 # whisper_cli and models_dir default to ~/work/whisper.cpp, the build every city on the host shares; set both to place it elsewhere.

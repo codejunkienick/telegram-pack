@@ -72,6 +72,7 @@ city.
 | `handler_write_paths` | no | directories the unit lets command handlers write, besides the bridge's own |
 | `[transcribe]` | no | voice transcription (below); off by default |
 | `[reactions]` | no | `on_accept`, `seen`, `done`: the `seen` reaction on each accepted message and the emoji `react` sets ("Reactions" below); no reaction ever without `on_accept = true` or a `react` call |
+| `[typing]` | no | `seconds` (0-900, default 0): "typing..." in the chat after each accepted message until the next send, at most this long ("Typing" below); no chat action ever with 0 |
 
 The health report at `health_file` is a JSON object with `observed_at`
 (ISO-8601 with zone, at most 10 minutes old) and `sessions`, a list of
@@ -903,6 +904,57 @@ of "Send and receive", each with the `GC_RECEIPT` line on stderr. The pack
 command honours `TELEGRAM_BRIDGE_SETTINGS` like `reply-current`. Reaction
 updates from the user are not polled.
 
+## Typing
+
+The bridge can show "typing..." in the paired chat while the mayor works on
+a message, so the user knows it arrived: Telegram's `sendChatAction` with
+`typing`, which shows for at most 5 seconds and clears when a message from
+the bot arrives.
+
+| `[typing]` key | default | meaning |
+| --- | --- | --- |
+| `seconds` | `0` | the longest "typing..." shows after the latest accepted message, an integer from 0 to 900; 0 never sends a chat action |
+
+A value outside 0-900, a value that is not an integer, and an unknown key in
+the table refuse at load naming the key. A file without the table loads
+exactly as before.
+
+With `seconds` above 0, each accepted message ("Reactions", the accept
+point: never a city command, an ask answer, another button press or a
+transcript follow-up) opens a typing window, or extends the open one, to end
+`seconds` after it. The window remembers the ledger's newest delivery row
+when it began, and ends at its end time, when the bridge stops, or as soon as
+the ledger holds a newer row whose key is not an accept reaction
+(`reaction:<message_id>:accept`): any send, edit, ask, pin, album or `react`
+reaction, from the daemon or a CLI process (they share the ledger), the
+quota-exhausted notice included. One worker thread, started when the daemon
+runs, sends the action at once and then every 4 seconds while the window is
+open, and looks at the ledger every second; it never runs in the poll loop,
+never holds `publish_lock`, and never retains, delays or advances the inbound
+cursor. Only the daemon shows typing; the CLI commands never send a chat
+action.
+
+Each chat action is one attempt with a 5-second limit, never retried. The
+first failure in a window logs one line, `typing not shown: <reason>`, never
+text:
+
+- `transport_unavailable`: the request failed or its answer was unreadable;
+  the window stays open for the next action.
+- `telegram_unconfirmed`: Telegram answered without confirming (HTTP 5xx, or
+  an answer that is not `ok`); the window stays open for the next action.
+- `telegram_rejected_<code>`: Telegram refused it (HTTP 4xx); the window
+  ends, since the next action would be refused alike.
+- `ledger_unavailable`: the ledger could not be read, so a send would go
+  unseen; the window ends (at the accept point, no window opens).
+- `typing_failed`: a worker tick failed unexpectedly; the window ends and
+  the worker goes on with the next accepted message.
+- `typing_worker_unavailable`: the worker thread could not start when the
+  daemon began; the bridge runs without typing until it restarts.
+
+A message accepted after its window ended begins a new window, which logs its
+own first failure. A send seen late can leave "typing..." up to 5 seconds
+after the reply, until Telegram clears it.
+
 ## Voice-note transcription
 
 With `[transcribe] enabled = true`, a `voice` (or `audio`) message is
@@ -1247,6 +1299,10 @@ may happen after delivery. Such a receipt is `permanent` with
 `ambiguous_delivery_requires_manual_reconciliation`; it is never automatically
 resent. Check the private chat before using any new key and record the outcome.
 A crash before the actual send is conservatively ambiguous too.
+
+A chat action ("Typing") delivers nothing to the chat history: it is no
+send, so it is the one Telegram call outside the ledger, with no key, no row
+and one attempt.
 
 **Not sent.** One send (a message, a file, a press answer, and separately its
 HTML or attachment text fallback) is tried up to 3 times inside its
