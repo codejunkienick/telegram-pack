@@ -6,6 +6,8 @@ itself.
 
 (Terms such as the mayor, the paired chat and the ledger: `bridge/OPERATIONS.md`, "Terms".)
 
+Release history: `CHANGELOG.md`.
+
 ## What it does
 
 - The paired user gets a private chat with the mayor for text in both
