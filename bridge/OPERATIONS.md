@@ -928,7 +928,9 @@ in a topic, the line after the topic line:
 | --- | --- | --- |
 | a `[[topic]]` with a ledger row | the topic's conversation | `[topic: <name>]` |
 | the same, when GC routes it nowhere | the paired chat's conversation | `[topic: <name> \| not bound: reply lands in the main chat]` |
-| no `[[topic]]`, or one with no ledger row | the paired chat's conversation | `[topic: thread <id> \| not configured: reply lands in the main chat]` |
+| with `[auto_topics]` on, a thread no `topics` row holds: a topic the user created ("Topics the user creates") | the topic's conversation, bound first | `[topic: <display name>]` |
+| the same, when no binding is confirmed | the paired chat's conversation | `[topic: <display name> \| not bound: reply lands in the main chat]` |
+| a ledger row whose name left the settings; with `[auto_topics]` off or absent, any other thread | the paired chat's conversation | `[topic: thread <id> \| not configured: reply lands in the main chat]` |
 
 - On a topic's conversation the inbound cursor moves only when GC confirms a
   durable entry on that conversation routed to the topic's `agent`, as for
@@ -952,7 +954,8 @@ in a topic, the line after the topic line:
   other message keeps it.
 - The service messages `forum_topic_created`, `forum_topic_edited`,
   `forum_topic_closed` and `forum_topic_reopened` carry no text and relay
-  nothing; the cursor moves past them.
+  nothing; the cursor moves past them. With `[auto_topics]` on, the first
+  two name a topic the user created ("Topics the user creates").
 - A voice or audio note in a topic records its thread in its pending file
   (`thread_id`, "Durable transcript queue"). Its transcript resolves the
   thread when it relays, by the rules above, so a topic recorded or bound
@@ -1030,6 +1033,103 @@ a ForumTopic with its `message_thread_id`. sendMessage, sendPhoto,
 sendVideo, sendDocument, sendVoice, sendVideoNote and sendMediaGroup take
 `message_thread_id` for "private chats of bots with forum topic mode
 enabled" (9.3).
+
+### Topics the user creates
+
+With `[auto_topics]` `enabled = true`, and BotFather's setting that lets
+users create topics on, every topic the paired user creates is served with no
+step per topic: the bridge records it, binds its conversation to the agent
+through GC's API, and relays its messages on it, under its name. With the
+table off or absent none of this happens: such a thread relays as not
+configured, exactly as before, and the bridge makes no bind call.
+
+**Detection.** A thread is a topic the user created when a message is in it
+by the rule of "Inbound", the update passes the paired chat and sender
+checks, and no `topics` row holds the thread (a settings topic, or a row
+whose name left the settings, stays as above). The first such update, a
+message, a city command, a service message or one the bridge skips, records
+its `auto_topics` row for the settings' `agent`; only `forum_topic_edited`
+records none. The row keeps that agent, and its binding and relays name it.
+
+**Naming**, from Telegram's service data only; whether Telegram sends the
+first two in a private chat with a bot is not documented, and every path
+works without them:
+
+- `forum_topic_created` in the thread records the row with its `name` and
+  `is_name_implicit` (absent: false), binds it (below) and relays nothing.
+- A message whose `reply_to_message` carries `forum_topic_created` names a
+  row that has no name yet.
+- Any other first message records the row with no name, shown as
+  `thread <id>`.
+- `forum_topic_edited` with a `name`, in a served thread, replaces the name
+  and clears implicit, so the next relay carries the new name. An edit of the
+  icon alone changes nothing, and neither does an edit in a settings topic,
+  a leftover row's thread or a thread with no row.
+
+**Binding.** When the row has no `bound_at`, the bridge binds the topic
+before it relays a message of it, and on any other update in it but an edit
+(its `forum_topic_created`, a city command before it runs, one it skips). It
+calls GC with the same base URL, bearer token and `X-GC-Request` header as
+its other GC calls:
+
+```text
+POST <gc_base_url>/v0/city/<city>/extmsg/bind
+{"conversation": <the topic's six-field conversation>, "agent_name": <agent>}
+```
+
+never with `replace` or metadata, so a conversation bound to another target
+stays that target's. GC v1.5.0: the input is
+`internal/api/huma_types_extmsg.go:58-72`; the handler
+(`internal/api/huma_handlers_extmsg.go:211-286`) wants `agent_name` to name a
+configured named-session agent (228-242) and answers a conflict with 409
+(253-262); a bind to the agent already bound is an idempotent rebind
+(`internal/extmsg/binding_service.go:154-156`); the reply is a
+SessionBindingRecord with PascalCase fields (`internal/extmsg/types.go:90-96,
+111-123`). The bind is confirmed only by HTTP 2xx with `AgentName` the agent,
+`SessionID` empty or absent and `Status` `active`; the row's `bound_at` is
+then set. Anything else is not bound for this pass and logs
+`auto topic thread <id> not bound (<category>)`:
+
+| category | GC's answer |
+| --- | --- |
+| `gc_conflict` | HTTP 409: the conversation is bound to another target |
+| `gc_rejected_<status>` | any other answer outside 2xx (400 for an agent that is no named session) |
+| `gc_unconfirmed` | a 2xx that names another agent, a session or another status, or is no record; a request that may have reached GC unanswered |
+| `gc_unreachable` | no request byte left the host |
+
+The next update in the thread binds again; a city command runs either way.
+A bind failure never retains the cursor, and a crash between a confirmed
+bind and `bound_at` costs one idempotent rebind. A bind is no Telegram call and does not go through the
+ledger's deliveries. The bridge never unbinds: with `[auto_topics]` off the
+bindings stay, unused.
+
+**Relay.** A bound topic's message relays on its conversation under
+`[topic: <display name>]` and moves the cursor only when GC confirms a
+durable entry on it routed to the row's agent, as for a settings topic.
+When GC routes it nowhere (its binding was removed), the bridge clears
+`bound_at`, binds once more and, when that is confirmed, relays once more on
+the topic's conversation. When no bind is confirmed, before the relay or
+after, or GC still routes it nowhere, the message relays on the paired
+chat's conversation under
+`[topic: <display name> | not bound: reply lands in the main chat]`, logs
+`topic thread <id> not bound (msg <id>); relayed to the main conversation`,
+and the cursor moves once GC confirms that relay; nothing is lost. Every
+relay of one message carries its provider id and reply id. Every other
+answer on the topic's conversation (routed to another agent, an entry still
+pending, a mismatched entry, a GC error) retains the cursor, as for a
+settings topic. Voice transcripts, ask answers and city commands in such a
+topic follow "Inbound" with no rule of their own beyond the binding above;
+an ask answer recorded on its conversation relays there under its topic
+line.
+
+At daemon start with `[auto_topics]` on, when the start probe's getMe
+reports `allows_users_to_create_topics` or `has_topics_enabled` not true,
+the bridge logs this line once and starts as usual, with no Telegram call of
+its own:
+
+```text
+auto topics on, but users may not create topics (BotFather setting)
+```
 
 ## Inbound media relay
 

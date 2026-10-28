@@ -744,11 +744,13 @@ class Store:
                                 (thread_id, agent, datetime.datetime.now(datetime.timezone.utc).isoformat()))
         return cursor.rowcount == 1
 
-    def set_auto_topic_name(self, thread_id, name, implicit):
-        """Set an auto topic's Telegram name and is_name_implicit; False
-        when the thread has no row."""
+    def set_auto_topic_name(self, thread_id, name, implicit, unnamed_only=False):
+        """Set an auto topic's Telegram name and is_name_implicit, with
+        unnamed_only only on a row that has no name yet; False when no row
+        was changed."""
         with self.connect() as db:
-            cursor = db.execute('UPDATE auto_topics SET name=?, name_implicit=? WHERE thread_id=?',
+            cursor = db.execute('UPDATE auto_topics SET name=?, name_implicit=? WHERE thread_id=?'
+                                + (' AND name IS NULL' if unnamed_only else ''),
                                 (name, int(bool(implicit)), thread_id))
         return cursor.rowcount == 1
 
@@ -977,6 +979,8 @@ class Bridge:
         self.publish_lock = threading.Lock()
         self.stop = threading.Event()
         self.last_heartbeat = None
+        # The bot as the start probe's getMe described it; None until then.
+        self.me = None
 
     def telegram(self, method, body, timeout=20):
         status, data = self.request('https://api.telegram.org/bot' + self.token + '/' + method, body, timeout)
@@ -1039,13 +1043,17 @@ class Bridge:
         self._log(f'telegram {method} attempt {attempt}/{SEND_ATTEMPTS} {outcome}: '
                   f"curl exit {'-' if code is None else code}, phase {phase}, {ms} ms")
 
-    def gc(self, path, body, method='POST', timeout=20):
+    def gc_request(self, path, body, method='POST', timeout=20):
+        """One GC extmsg API call: (HTTP status, parsed body)."""
         headers = {'X-GC-Request': '1'}
         token_path = self.config.get('gc_api_token_path')
         if token_path:
             headers['Authorization'] = 'Bearer ' + private_text(token_path)
-        status, result = self.request(self.base + '/v0/city/' + quote(self.city, safe='') + '/extmsg/' + path,
-                                      body, timeout, headers=headers, method=method)
+        return self.request(self.base + '/v0/city/' + quote(self.city, safe='') + '/extmsg/' + path,
+                            body, timeout, headers=headers, method=method)
+
+    def gc(self, path, body, method='POST', timeout=20):
+        status, result = self.gc_request(path, body, method, timeout)
         if not 200 <= status < 300 or not isinstance(result, dict):
             raise TransportError('GC request rejected or unconfirmed')
         return result
@@ -1057,6 +1065,7 @@ class Bridge:
             raise ProbeRejected('Telegram bot identity mismatch or probe failed')
         if status != 200 or data.get('ok') is not True:
             raise TransportError('Telegram bot identity mismatch or probe failed')
+        self.me = bot
         status, data = self.telegram('getWebhookInfo', {})
         if status != 200 or data.get('ok') is not True or not isinstance(data.get('result'), dict):
             raise TransportError('Telegram webhook probe failed')
@@ -1800,13 +1809,17 @@ class Bridge:
         conversation under a `[topic: <name>]` line; when GC routes it
         nowhere, once more on the paired chat's, labelled not bound. A thread
         no topic is configured or recorded for relays on the paired chat's,
-        labelled not configured. Any other failure raises and retains the
-        cursor. Returns the conversation GC accepted the message on."""
+        labelled not configured, unless [auto_topics] serves it (_relay_auto).
+        Any other failure raises and retains the cursor. Returns the
+        conversation GC accepted the message on."""
         if thread_id is None:
             self._relay_to_gc(provider_message_id, text, reply)
             return self.conversation
         topic = self.topic_by_thread(thread_id)
         if topic is None:
+            auto = self._auto_topic(thread_id)
+            if auto is not None:
+                return self._relay_auto(mid, provider_message_id, text, reply, auto)
             self._relay_to_gc(provider_message_id,
                               f'[topic: thread {thread_id} | not configured: reply lands in the main chat]\n{text}',
                               reply)
@@ -1821,6 +1834,103 @@ class Bridge:
                               f"[topic: {topic['name']} | not bound: reply lands in the main chat]\n{text}", reply)
             self._log(f'topic thread {thread_id} not bound (msg {mid}); relayed to the main conversation')
             return self.conversation
+
+    def _relay_auto(self, mid, provider_message_id, text, reply, topic):
+        """Relay one message of a topic the paired user created on its own
+        conversation under `[topic: <display name>]`, binding it first when
+        its row has no bound_at. When GC routes it nowhere, bound_at is
+        cleared and one more bind and relay are tried; when no bind is
+        confirmed, it relays on the paired chat's conversation, labelled not
+        bound. Any other failure raises and retains the cursor."""
+        thread_id, conversation = topic['thread_id'], topic['conversation']
+        bound = topic['bound_at'] is not None or self._bind_auto_topic(topic)
+        for retry in (False, True):
+            if not bound:
+                break
+            try:
+                self._relay_to_gc(provider_message_id, f"[topic: {topic['display_name']}]\n{text}", reply,
+                                  conversation, topic['agent'])
+                return conversation
+            except self._TopicNotBound:
+                # The binding is gone (removed by hand): bind once more.
+                self.store.set_auto_topic_bound(thread_id, False)
+                bound = not retry and self._bind_auto_topic(topic)
+        self._relay_to_gc(provider_message_id,
+                          f"[topic: {topic['display_name']} | not bound: reply lands in the main chat]\n{text}", reply)
+        self._log(f'topic thread {thread_id} not bound (msg {mid}); relayed to the main conversation')
+        return self.conversation
+
+    def _bind_auto_topic(self, topic):
+        """Bind an auto topic's conversation to its agent through GC
+        (OPERATIONS.md, "Topics the user creates"): never with replace, so a
+        conversation bound to anyone else stays theirs. True, with bound_at
+        set, only when GC confirmed an active binding to that agent; else
+        logs the category and returns False. Never raises for GC."""
+        thread_id, agent = topic['thread_id'], topic['agent']
+        try:
+            status, result = self.gc_request('bind', dict(conversation=topic['conversation'], agent_name=agent))
+        except RequestNotSent:
+            category = 'gc_unreachable'
+        except TransportError:
+            category = 'gc_unconfirmed'
+        else:
+            if status == 409:
+                category = 'gc_conflict'
+            elif not 200 <= status < 300:
+                category = f'gc_rejected_{status}'
+            elif (isinstance(result, dict) and result.get('AgentName') == agent
+                  and result.get('SessionID', '') == '' and result.get('Status') == 'active'):
+                self.store.set_auto_topic_bound(thread_id, True)
+                return True
+            else:
+                category = 'gc_unconfirmed'
+        self._log(f'auto topic thread {thread_id} not bound ({category})')
+        return False
+
+    @staticmethod
+    def _service_topic_name(service):
+        """(name, is_name_implicit) of a forum_topic_created or
+        forum_topic_edited that carries a string name, else None."""
+        if isinstance(service, dict) and isinstance(service.get('name'), str):
+            return service['name'], service.get('is_name_implicit') is True
+        return None
+
+    def _observe_auto_topic(self, thread_id, message):
+        """Name an auto topic from Telegram's service data, with [auto_topics]
+        on, for a message in topic thread `thread_id`: forum_topic_created
+        records the thread with its name (_record_auto_topic binds it); a
+        reply_to_message
+        carrying it names a row without a name; forum_topic_edited with a
+        name renames a served row. Relays nothing; a settings topic or a
+        thread a topics row holds is never touched."""
+        created = message.get('forum_topic_created')
+        edited = message.get('forum_topic_edited')
+        root = message.get('reply_to_message')
+        if isinstance(created, dict):
+            named = self._service_topic_name(created)
+            if named is not None and self._auto_topic(thread_id) is not None:
+                self.store.set_auto_topic_name(thread_id, *named, unnamed_only=True)
+        elif isinstance(edited, dict):
+            named = self._service_topic_name(edited)
+            if named is not None and self._auto_topic(thread_id, create=False) is not None:
+                self.store.set_auto_topic_name(thread_id, named[0], False)
+        elif isinstance(root, dict) and isinstance(root.get('forum_topic_created'), dict):
+            named = self._service_topic_name(root['forum_topic_created'])
+            if named is not None and self._auto_topic(thread_id) is not None:
+                self.store.set_auto_topic_name(thread_id, *named, unnamed_only=True)
+
+    def _record_auto_topic(self, thread_id, message):
+        """With [auto_topics] on, for an update in topic thread `thread_id`
+        that relays nothing (a service message, a city command, a message the
+        bridge skips): record the thread's auto row, as for its first update,
+        and bind it when the row has no bound_at, so the topic is served
+        before any relay. An edit records nothing (_observe_auto_topic); a
+        relayed message binds in _relay_auto."""
+        if thread_id is None or isinstance(message.get('forum_topic_edited'), dict):
+            return
+        topic = self._auto_topic(thread_id)
+        if topic is not None and topic['bound_at'] is None:
+            self._bind_auto_topic(topic)
 
     @staticmethod
     def _update_id(update):
@@ -1869,11 +1979,14 @@ class Bridge:
         text = message.get('text')
         caption = message.get('caption')
         thread_id = self._topic_thread(message)
+        if thread_id is not None and self.auto_topics:
+            self._observe_auto_topic(thread_id, message)
         found = self._match_command(text) if forward is None and attachment is None and isinstance(text, str) else None
         if found is not None:
             # A city command goes to its handler, never to GC.
             command, args = found
             uid, mid = self._update_id(update), self._message_id(message)
+            self._record_auto_topic(thread_id, message)
             self.run_command(command, uid, dict(
                 kind='command', command=command['name'], args=args, update_id=uid, message_id=mid,
                 callback_data=None, callback_message_id=None, received_at=self._received_at(),
@@ -1881,6 +1994,7 @@ class Bridge:
             return
         if attachment is None and (not isinstance(text, str) or not text.strip()
                                    or (forward is None and text.startswith('/start'))):
+            self._record_auto_topic(thread_id, message)
             return
 
         mid = self._message_id(message)
@@ -3477,6 +3591,7 @@ class Bridge:
     _THREAD_ID_RE = re.compile(r'[1-9][0-9]{0,18}')
     TOPIC_USERS_WARNING = 'WARN users may create and delete topics in this chat (BotFather setting)'
     AUTO_TOPICS_USERS_LINE = 'users may create topics: the bridge serves each one (auto_topics)'
+    AUTO_TOPICS_USERS_OFF = 'auto topics on, but users may not create topics (BotFather setting)'
 
     def topic_conversation(self, thread_id):
         """The GC conversation of one topic: a thread whose parent is the
@@ -3503,6 +3618,17 @@ class Bridge:
     def topic_by_name(self, name):
         """The configured, recorded topic with this name, or None."""
         return next((topic for topic in self._recorded_topics() if topic['name'] == name), None)
+
+    def _auto_topic(self, thread_id, create=True):
+        """The served auto topic of this thread (served_auto_topics), or
+        None: always None with [auto_topics] off or for a thread a topics row
+        holds. With `create`, a thread with no row of either kind gets its
+        auto row first, for the settings' agent."""
+        if not self.auto_topics or self.store is None:
+            return None
+        if create and thread_id not in {row['thread_id'] for row in self.store.topic_rows()}:
+            self.store.add_auto_topic(thread_id, self.agent)
+        return next((topic for topic in self.served_auto_topics() if topic['thread_id'] == thread_id), None)
 
     def _unshadowed_auto_topics(self):
         """The ledger's auto topic rows whose thread no topics row holds (in
@@ -3874,6 +4000,9 @@ class Bridge:
     def run(self):
         if not self.probe_with_retry():
             return
+        if self.auto_topics and isinstance(self.me, dict) and not (
+                self.me.get('allows_users_to_create_topics') is True and self.me.get('has_topics_enabled') is True):
+            self._log(self.AUTO_TOPICS_USERS_OFF)
         server = http.server.ThreadingHTTPServer(('127.0.0.1', self.port), _callback_handler(self))
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
