@@ -6,10 +6,12 @@ import os
 import plistlib
 from unittest.mock import patch
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -195,6 +197,115 @@ class SettingsTests(unittest.TestCase):
         bridges = [b.Bridge(s.config, None, 'SECRET', None) for s in (first, second)]
         self.assertEqual([x.conversation['scope_id'] for x in bridges], ['test-city', 'other-city'])
         self.assertEqual([x.display_name for x in bridges], ['Pat', 'Sam'])
+
+
+class ExampleSettingsTests(unittest.TestCase):
+    """Pin settings.example.toml against load_settings: every key the
+    example sets, commented or not, is a key the loader accepts."""
+
+    EXPECTED = {
+        '': {'city', 'state_dir', 'port', 'token_file', 'callback_secret_file', 'lock_dir', 'unit', 'python',
+             'user_display_name', 'timezone', 'gc_base_url', 'gc_api_token_file', 'health_file',
+             'pairing_update_id', 'agent', 'handler_write_paths'},
+        'bot': {'bot_id', 'user_id', 'chat_id', 'account_id'},
+        'menu': {'command', 'description'},
+        'command': {'name', 'description', 'handler', 'menu', 'callback_prefix', 'timeout'},
+        'transcribe': {'enabled', 'whisper_cli', 'models_dir', 'model', 'language', 'vad_model', 'cpus',
+                       'threads', 'timeout', 'timeout_per_minute', 'method', 'gpu_check', 'gpu',
+                       'gpu_min_free_mb'},
+    }
+
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    @staticmethod
+    def _example_keys(text):
+        keys, section = {}, ''
+        for line in text.splitlines():
+            stripped = line.strip()
+            content = stripped.lstrip('#').strip() if stripped.startswith('#') else stripped
+            header = re.fullmatch(r'\[\[(menu|command)\]\]|\[(bot|transcribe)\]', content)
+            if header:
+                section = header.group(1) or header.group(2)
+                keys.setdefault(section, set())
+                continue
+            key = re.match(r'([a-z_]+)\s*=', content)
+            if key:
+                keys.setdefault(section, set()).add(key.group(1))
+        return keys
+
+    def _write_example(self, command='handler', transcribe='method'):
+        private = self.root / 'private'
+        private.mkdir(mode=0o700, exist_ok=True)
+        for name, mode in (('telegram-bot-token', 0o600), ('telegram-callback-secret', 0o600),
+                           ('telegram-deploy', 0o700), ('gpu-check', 0o700)):
+            path = private / name
+            path.write_text('TEST\n' if mode == 0o600 else '#!/bin/sh\n')
+            path.chmod(mode)
+        text = (PACK / 'settings.example.toml').read_text()
+        for old, new in sorted({
+                '/home/alex/example-city/telegram-state': str(self.root / 'state'),
+                '~/.config/example-city/telegram-bot-token': str(private / 'telegram-bot-token'),
+                '~/.config/example-city/telegram-callback-secret': str(private / 'telegram-callback-secret'),
+                '~/.config/example-city/gc-api-token': str(private / 'gc-api-token'),
+                '~/.config/example-city': str(private),
+                '/home/alex/example-city/health.json': str(self.root / 'health.json'),
+                '/home/alex/example-city/var/deploy': str(self.root / 'deploy'),
+                '/home/alex/example-city/bin/telegram-deploy': str(private / 'telegram-deploy'),
+                '/home/alex/example-city/bin/gpu-check': str(private / 'gpu-check'),
+                '~/work/whisper.cpp/build/bin/whisper-cli': str(self.root / 'whisper-cli'),
+                '~/work/whisper.cpp/models': str(self.root / 'models')}.items(), key=lambda item: -len(item[0])):
+            text = text.replace(old, new)
+        lines, section = [], ''
+        for line in text.splitlines():
+            stripped = line.strip()
+            commented = stripped.startswith('#')
+            content = stripped.lstrip('#').strip() if commented else stripped
+            header = re.fullmatch(r'\[\[(menu|command)\]\]|\[(bot|transcribe)\]', content)
+            if header:
+                section = header.group(1) or header.group(2)
+                lines.append(content)
+                continue
+            key = re.match(r'([a-z_]+)\s*=', content) if commented else None
+            if key is None:
+                lines.append(line)
+            elif section == 'command' and key.group(1) == 'handler' and command == 'url':
+                lines.append('url = "http://127.0.0.1:8095/deploy"')
+            elif section == 'transcribe' and transcribe == 'method' and key.group(1) == 'gpu':
+                lines.append(line)
+            elif section == 'transcribe' and transcribe == 'method' and key.group(1) == 'method':
+                lines.append('method = "auto"')  # gpu_check is only valid with method = "auto"
+            elif section == 'transcribe' and transcribe == 'legacy' and key.group(1) in ('method', 'gpu_check'):
+                lines.append(line)
+            else:
+                lines.append(content)
+        path = self.root / f'example-{command}-{transcribe}.toml'
+        path.write_text('\n'.join(lines) + '\n')
+        path.chmod(0o600)
+        return path
+
+    def test_example_keys_load_and_an_unknown_key_refuses(self):
+        self.assertEqual(self._example_keys((PACK / 'settings.example.toml').read_text()), self.EXPECTED)
+        loaded = {section: set() for section in self.EXPECTED}
+        for command, transcribe in (('handler', 'method'), ('url', 'legacy')):
+            with self.subTest(command=command, transcribe=transcribe):
+                path = self._write_example(command, transcribe)
+                settings = b.load_settings(path)
+                self.assertEqual(settings.city, 'example-city')
+                self.assertEqual(settings.config['commands'][0]['name'], 'deploy')
+                self.assertIn('url' if command == 'url' else 'handler', settings.config['commands'][0])
+                self.assertIsNotNone(settings.transcribe)
+                data = tomllib.loads(path.read_text())
+                loaded[''] |= set(data) - {'bot', 'menu', 'command', 'transcribe'}
+                loaded['bot'] |= set(data['bot'])
+                loaded['menu'] |= set(data['menu'][0])
+                loaded['command'] |= set(data['command'][0])
+                loaded['transcribe'] |= set(data['transcribe'])
+        self.assertEqual(loaded, dict(self.EXPECTED, command=self.EXPECTED['command'] | {'url'}))
+        path = self._write_example()
+        path.write_text('unknown_example_key = 1\n' + path.read_text())
+        with self.assertRaisesRegex(b.SettingsError, 'unknown key unknown_example_key'):
+            b.load_settings(path)
 
 
 class TranscribeSettingsTests(unittest.TestCase):
