@@ -78,6 +78,7 @@ Separate repositories that build on this pack:
 
 - [telegram-quota](https://github.com/codejunkienick/telegram-quota): a `/quota` command that shows how much of each AI subscription's usage windows is spent.
 - [telegram-secret-drop](https://github.com/codejunkienick/telegram-secret-drop): a one-time form on the local network for handing a secret to an agent without it passing through the chat.
+- [telegram-waiting](https://github.com/codejunkienick/telegram-waiting): a `/waiting` command that shows the list of what waits on the paired user, from a snapshot the user's own job writes.
 
 ## Prerequisites
 
@@ -322,10 +323,13 @@ table (and a `handler_write_paths` entry if it writes), then run
 `launchctl bootout gui/$(id -u)/<label> 2>/dev/null; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<label>.plist`, and run
 `set-commands`. Remove one: delete the table, delete the handler program if nothing else uses it, drop its `handler_write_paths` entry if no other handler writes there, run `install.sh` again, restart the service the same way, then run `set-commands`. The menu loses the command only then.
 The handler protocol is in `bridge/OPERATIONS.md`, "City commands".
-Two ready add-ons are
+Three ready add-ons are
 [telegram-quota](https://github.com/codejunkienick/telegram-quota), which adds
 a `/quota` command that shows how much of each AI subscription's usage
-windows is spent, with the time left until each reset, and
+windows is spent, with the time left until each reset,
+[telegram-secret-drop](https://github.com/codejunkienick/telegram-secret-drop),
+which adds a one-time form on the local network for handing a secret to
+an agent without it passing through the chat, and
 [telegram-waiting](https://github.com/codejunkienick/telegram-waiting),
 which adds a `/waiting` command that shows the list of what waits on the
 paired user.

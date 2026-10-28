@@ -24,8 +24,8 @@ sees and does, not how the code is organised.
   and removes it with `--unpin`. No setting is needed.
 - Typing: with typing turned on, the chat shows "typing..." after a
   message that has been accepted, until the configured limit runs out
-  or the bridge next sends or changes anything in the chat — a send,
-  edit, ask, pin, album or reaction — whichever comes first.
+  or the bridge next sends or changes anything in the chat (a send,
+  edit, ask, pin, album or reaction), whichever comes first.
 - Topics set up in settings: one `[[topic]]` table per subject gives
   the paired chat topics beside General, each on its own conversation.
   The `topics` command creates each listed topic once and prints the
