@@ -441,6 +441,21 @@ def html_visible_text(text):
     return ''.join(visible), None
 
 
+# One lettered option line: optional whitespace and a bullet (•, -, *), one
+# capital A-D, then ':', ')' or a spaced dash. Detection runs on the visible
+# text, so '<b>A:</b>' and '• B)' count and a mid-line 'Plan A' never does.
+_OPTION_LINE_RE = re.compile(r'^\s*(?:[•\-*]\s*)?([A-D])(?::|\)|\s+[-—])')
+
+
+def text_offers_lettered_options(visible):
+    """True when the visible text offers a choice as lettered text lines:
+    at least two option lines carrying consecutive letters from A (A and B,
+    or A, B, C). One 'A:' line alone, a recap, never offers a choice."""
+    letters = {match.group(1) for line in visible.splitlines()
+               if (match := _OPTION_LINE_RE.match(line))}
+    return 'A' in letters and 'B' in letters
+
+
 def resendable(receipt):
     """A saved receipt that is not final: every attempt of that send failed
     before any request byte left this host. Only the bridge writes it (no
@@ -572,6 +587,13 @@ class Store:
         with self.connect() as db:
             row = db.execute('SELECT receipt FROM deliveries WHERE key=?', (key,)).fetchone()
         return None if row is None else json.loads(row[0])
+
+    def saved_delivery(self, key):
+        """(fingerprint, receipt) saved under key, or None when the key was
+        never reserved."""
+        with self.connect() as db:
+            row = db.execute('SELECT fingerprint, receipt FROM deliveries WHERE key=?', (key,)).fetchone()
+        return None if row is None else (row[0], json.loads(row[1]))
 
     def finish(self, key, receipt):
         with self.connect() as db:
@@ -3286,6 +3308,12 @@ class Bridge:
             request = {k: v for k, v in request.items() if k != 'silent'}
         elif silent is not True:
             return self.receipt(reason='silent_must_be_boolean')
+        # Text-options likewise joins the fingerprint only when true.
+        text_options = request.get('text_options', False)
+        if text_options is False:
+            request = {k: v for k, v in request.items() if k != 'text_options'}
+        elif text_options is not True:
+            return self.receipt(reason='text_options_must_be_boolean')
         if not isinstance(text, str):
             return self.receipt(reason='text_required_maximum_4096_utf16_units')
         plain = None
@@ -3309,6 +3337,17 @@ class Bridge:
         # and refused whole when over, never cut inside a tag.
         if (not visible.strip() and not captionless and attachments is None) or utf16_units(visible) > 4096:
             return self.receipt(reason='text_required_maximum_4096_utf16_units')
+        # A choice offered as lettered text lines needs its tap buttons:
+        # refused before anything is reserved or sent, so nothing enters
+        # the ledger and the same key retries with the keyboard. A final
+        # receipt already saved for this exact request (a send confirmed
+        # before this refusal existed) still replays below instead.
+        if 'keyboard' not in request and text_options is not True \
+                and text_offers_lettered_options(visible):
+            saved = self.store.saved_delivery(key)
+            fingerprint = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
+            if saved is None or saved[0] != fingerprint or resendable(saved[1]):
+                return self.receipt(reason='options_need_keyboard')
         reply = request.get('reply_to_message_id', '')
         if reply and (not isinstance(reply, str) or not reply.isdecimal() or int(reply) <= 0):
             return self.receipt(reason='invalid_reply_message_id')
@@ -3405,6 +3444,8 @@ class Bridge:
                 receipt = self._deliver_text(text, reply, pending, plain, extra=extra or None)
             if rows is not None and receipt.get('delivered') and receipt.get('message_id'):
                 self.store.set_ask_message(ask_ids, int(receipt['message_id']))
+            if text_options and receipt.get('delivered'):
+                receipt = dict(receipt, text_options=True)
             return receipt
         return self._reserve_and_deliver(key, request, deliver)
 
@@ -4135,6 +4176,9 @@ def _build_parser():
     parser.add_argument('--silent', action='store_true',
                         help='send, reply-current: notify with no sound '
                              '(publishes directly in this process, never through GC)')
+    parser.add_argument('--text-options', action='store_true',
+                        help='send, reply-current: allow a body offering lettered options as text '
+                             'lines without --keyboard-file (recorded in the receipt)')
     parser.add_argument('--message-id', type=_message_id_arg,
                         help='ask-close: the message ID the ask was sent as; react: the message to '
                              'react to (default: the last accepted message)')
@@ -4275,6 +4319,9 @@ def _print_gc_receipt(delivered, failure_kind, reason):
 
 NOT_SENT_MESSAGE = ('Telegram could not be reached; nothing was sent '
                     f'({NOT_SENT_REASON}): send again with the same key and body')
+OPTIONS_NEED_KEYBOARD_MESSAGE = ('options_need_keyboard: this message offers lettered options without buttons; '
+                                 'resend with --keyboard-file (see "Asks with buttons" in the telegram-formatting '
+                                 'skill) or add --text-options for a deliberate text-only list')
 UNRESOLVED_CONVERSATION = 'conversation ID is not the paired private chat or a configured topic'
 
 
@@ -4319,7 +4366,19 @@ def _dispatch_outbound(bridge, args, text, conversation=None):
             # through to GC's text-only relay and reporting buttons sent.
             raise TransportError('keyboard file must hold JSON rows')
     silent = getattr(args, 'silent', False)
-    if args.attachment or args.format == 'html' or keyboard is not None or silent:
+    text_options = getattr(args, 'text_options', False)
+    if keyboard is None and not text_options:
+        # Refused here too, so a plain send never reaches GC's relay only to
+        # be refused by the daemon's publish() without this guidance. A send
+        # already confirmed under this key replays its saved receipt below
+        # instead of refusing.
+        visible = text if getattr(args, 'format', 'plain') != 'html' else html_visible_text(text)[0]
+        if visible is not None and text_offers_lettered_options(visible):
+            saved = bridge.store.saved_receipt(args.idempotency_key)
+            if saved is None or resendable(saved):
+                _print_gc_receipt(False, 'permanent', 'options_need_keyboard')
+                raise TransportError(OPTIONS_NEED_KEYBOARD_MESSAGE)
+    if args.attachment or args.format == 'html' or keyboard is not None or silent or text_options:
         # GC's outbound relay accepts only session, conversation, text, key and
         # reply (HTTP 422 for any other property, e.g. 'body.attachment'), so
         # its callback can never hand publish() an attachment, a format, a
@@ -4330,6 +4389,8 @@ def _dispatch_outbound(bridge, args, text, conversation=None):
             request['format'] = 'html'
         if silent:
             request['silent'] = True
+        if text_options:
+            request['text_options'] = True
         if keyboard is not None:
             request['keyboard'] = keyboard
         if args.attachment:
@@ -4358,6 +4419,8 @@ def _dispatch_outbound(bridge, args, text, conversation=None):
         direct = False
     if not delivered:
         _print_gc_receipt(False, failure_kind, reason)
+        if reason == 'options_need_keyboard':
+            raise TransportError(OPTIONS_NEED_KEYBOARD_MESSAGE)
         if reason == NOT_SENT_REASON:
             raise TransportError(NOT_SENT_MESSAGE)
         if direct:

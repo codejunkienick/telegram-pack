@@ -23,6 +23,10 @@ The rows live only here; SKILL.md holds none.
 | pack | bridge/OPERATIONS.md | the `[topic: <name>]` line comes before the `[ask answer \| ...]` | a topic ask's answer keeps its line |
 | pack | commands/reply-current/command.toml | --topic <name> sends into a configured topic | reply command flag |
 | pack | bridge/OPERATIONS.md | "Mayor asks" | asks with buttons follow this section |
+| pack | bridge/bridge.py | text_offers_lettered_options | lettered text lines offering a choice |
+| pack | bridge/bridge.py | reason='options_need_keyboard' | text options without buttons refused |
+| pack | bridge/bridge.py | parser.add_argument('--text-options', action='store_true', | deliberate text-only list flag |
+| pack | bridge/OPERATIONS.md | options_need_keyboard | the refusal and its override |
 | pack | bridge/OPERATIONS.md | each question of a multi-question ask goes out as its own message with its own key and keyboard | one message per question |
 | pack | bridge/OPERATIONS.md | --keyboard-file <path> holding the rows as JSON | keyboard file rows |
 | pack | bridge/bridge.py | _ask_id_for_key | first 16 hex of the SHA-256 of the key |

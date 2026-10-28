@@ -388,6 +388,26 @@ An ask sent in a topic records that topic's conversation, and its answer
 relays there under the topic's line; any other ask's answer relays on the
 paired chat's conversation with no topic line ("Topics").
 
+**Lettered options need buttons.** A `send` or `reply-current` whose
+visible text (tags removed, entities decoded) offers a choice as lettered
+text lines without `--keyboard-file` is refused before anything is sent
+or recorded, with the receipt reason `options_need_keyboard` and a
+one-line message naming `--keyboard-file` and "Asks with buttons". An
+option line's first visible characters, after optional whitespace and a
+bullet (`•`, `-`, `*`), are one capital A-D followed by `:`, `)` or a
+spaced dash (`A -`, `A —`); the refusal needs two such lines carrying
+consecutive letters from A (A and B, or A, B, C), so one `A:` recap line
+or a mid-line `Plan A` never refuses. The same key with the same body
+refuses again, and stays free for the buttoned resend; a send already
+confirmed under that key and body replays its saved receipt instead
+("Delivery recovery"). With
+`--keyboard-file` the check is skipped (the keyboard rules above apply).
+The override is `--text-options` (`text_options: true` on `publish()`):
+a deliberate text-only list goes out, the delivered receipt records
+`text_options: true`, and the flag joins the idempotency fingerprint
+only when true; any other value refuses as
+`text_options_must_be_boolean`.
+
 A mayor ask may be one photo whose caption is the question, with the same
 buttons; a tap answers it exactly as a text ask is answered, and the caption
 then shows the choice.

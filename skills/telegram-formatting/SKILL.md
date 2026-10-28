@@ -1,6 +1,6 @@
 ---
 name: telegram-formatting
-description: Send a message to the paired private Telegram chat through the city's bridge - the reply-current command, answering in a topic (--conversation-id as the notice names it, --topic <name>), idempotency keys and retries, the 4096-unit limit, silent sends (--silent) for updates that need no action, reactions (gc telegram react), and Telegram HTML (--format html) with its tag allowlist, escaping, message shape and the one plain fallback. Use before writing or sending any Telegram message or reply.
+description: Send a message to the paired private Telegram chat through the city's bridge - the reply-current command, answering in a topic (--conversation-id as the notice names it, --topic <name>), idempotency keys and retries, the 4096-unit limit, silent sends (--silent) for updates that need no action, asks with tap buttons (--keyboard-file) for any choice, reactions (gc telegram react), and Telegram HTML (--format html) with its tag allowlist, escaping, message shape and the one plain fallback. Use before writing or sending any Telegram message or reply.
 ---
 
 # Telegram messages and formatting
@@ -9,6 +9,13 @@ The bridge delivers to one private chat: the user paired in this city's
 settings. Its operations guide is `bridge/OPERATIONS.md` in this pack.
 
 ## Send
+
+Any message offering a choice goes out with buttons (`--keyboard-file`,
+"Asks with buttons" below): a body whose visible text offers lettered
+options (`A:` / `B:` lines, bulleted or in HTML) without a keyboard is
+refused as `options_need_keyboard` before anything is sent. Pass
+`--text-options` only for a deliberate text-only list; the receipt
+records it.
 
 Write the body to a file, then:
 
