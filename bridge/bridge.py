@@ -463,6 +463,8 @@ class Store:
             # the target of `react` without --message-id.
             db.execute('CREATE TABLE IF NOT EXISTS accepted (id INTEGER PRIMARY KEY CHECK (id = 1), '
                        'message_id INTEGER NOT NULL, accepted_at TEXT NOT NULL)')
+            db.execute('CREATE TABLE IF NOT EXISTS pins (slot TEXT PRIMARY KEY, generation INTEGER NOT NULL DEFAULT 1, '
+                       'message_id INTEGER, revision INTEGER NOT NULL DEFAULT 0, fingerprint TEXT)')
 
     @contextlib.contextmanager
     def connect(self):
@@ -482,10 +484,13 @@ class Store:
         with self.connect() as db:
             db.execute('UPDATE cursor SET offset=max(offset, ?) WHERE id=1', (offset,))
 
-    def reserve(self, key, fingerprint, pending):
+    def reserve(self, key, fingerprint, pending, retry_undelivered=False):
         """None when the caller now holds the key and may send (a new key, or
         one whose saved receipt is the not-final not-sent one); else the saved
-        receipt. One transaction, so two callers never both get None."""
+        receipt. One transaction, so two callers never both get None.
+        retry_undelivered also retakes a saved receipt that is not delivered
+        (rejected or ambiguous): only for a request that is idempotent in
+        effect (a pin or an unpin), made under its slot lock."""
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             existing = db.execute('SELECT fingerprint, receipt FROM deliveries WHERE key=?', (key,)).fetchone()
@@ -493,12 +498,18 @@ class Store:
                 if existing[0] != fingerprint:
                     raise TransportError('idempotency key reused for a different request')
                 saved = json.loads(existing[1])
-                if not resendable(saved):
+                if not resendable(saved) and not (retry_undelivered and saved.get('delivered') is not True):
                     return saved
                 db.execute('UPDATE deliveries SET receipt=? WHERE key=?', (json.dumps(pending), key))
                 return None
             db.execute('INSERT INTO deliveries VALUES (?, ?, ?)', (key, fingerprint, json.dumps(pending)))
         return None
+
+    def saved_receipt(self, key):
+        """The receipt saved under key, or None when the key was never reserved."""
+        with self.connect() as db:
+            row = db.execute('SELECT receipt FROM deliveries WHERE key=?', (key,)).fetchone()
+        return None if row is None else json.loads(row[0])
 
     def finish(self, key, receipt):
         with self.connect() as db:
@@ -583,6 +594,24 @@ class Store:
             row = db.execute('SELECT 1 FROM deliveries WHERE substr(key, 1, ?) = ? AND key != ? LIMIT 1',
                              (len(prefix), prefix, prefix + 'accept')).fetchone()
         return row is not None
+
+    PIN_FIELDS =('generation', 'message_id', 'revision', 'fingerprint')
+
+    def pin_state(self, slot):
+        """One pinned-message slot: its generation (from 1), live message id
+        (None when there is none), revision and the fingerprint of the last
+        applied body and format (None when unknown)."""
+        with self.connect() as db:
+            db.execute('INSERT OR IGNORE INTO pins(slot) VALUES (?)', (slot,))
+            row = db.execute('SELECT ' + ', '.join(self.PIN_FIELDS) + ' FROM pins WHERE slot=?', (slot,)).fetchone()
+        return dict(zip(self.PIN_FIELDS, row), slot=slot)
+
+    def set_pin(self, slot, **fields):
+        if not fields or set(fields) - set(self.PIN_FIELDS):
+            raise ValueError('unknown pin field')
+        with self.connect() as db:
+            db.execute('UPDATE pins SET ' + ', '.join(f'{name}=?' for name in fields) + ' WHERE slot=?',
+                       (*fields.values(), slot))
 
 
 def check_bridge_config(config, *, settings=False):
@@ -2087,16 +2116,16 @@ class Bridge:
             actions.append(parsed)
         return actions
 
-    def _reserve_and_deliver(self, key, identity, deliver_fn):
+    def _reserve_and_deliver(self, key, identity, deliver_fn, retry_undelivered=False):
         """The one ledger reservation path for every send: reserve the key
         durably under publish_lock before Telegram is contacted, return a
         saved receipt instead of sending again, and finish with the result
-        of deliver_fn(pending)."""
+        of deliver_fn(pending). retry_undelivered: see Store.reserve."""
         fingerprint = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
         with self.publish_lock:
             pending = self.receipt(reason='ambiguous_delivery_requires_manual_reconciliation')
             try:
-                cached = self.store.reserve(key, fingerprint, pending)
+                cached = self.store.reserve(key, fingerprint, pending, retry_undelivered)
             except TransportError:
                 return self.receipt(reason='idempotency_key_conflict')
             if cached:
@@ -2128,22 +2157,29 @@ class Bridge:
         if alert:
             body['show_alert'] = True
         key = key or f'command:{update_id}:answer'
+        return self._reserve_and_deliver(key, body, lambda pending: self._deliver_true_call(
+            'answerCallbackQuery', body, pending))
 
-        def deliver(pending):
-            receipt = pending
-            try:
-                status, data = self._send('answerCallbackQuery',
-                                          lambda timeout: self.telegram('answerCallbackQuery', body, timeout))
-                if status == 200 and data.get('ok') is True and data.get('result') is True:
-                    receipt = self.receipt(True)
-                elif data.get('ok') is False and 400 <= data.get('error_code', 0) < 500:
-                    receipt = self.receipt(reason='telegram_rejected_not_sent_' + str(data['error_code']))
-            except RequestNotSent:
-                receipt = self.not_sent()
-            except TransportError:
-                pass
-            return receipt
-        return self._reserve_and_deliver(key, body, deliver)
+    def _deliver_true_call(self, method, body, pending, not_found=None):
+        """One Telegram call whose success answers `"result": true` (a
+        callback answer, a pin, an unpin): delivered on that, rejected on a
+        4xx, not sent when no byte left, else the pending receipt.
+        `not_found` = (description fragment, reason) names one 400."""
+        receipt = pending
+        try:
+            status, data = self._send(method, lambda timeout: self.telegram(method, body, timeout))
+            if status == 200 and data.get('ok') is True and data.get('result') is True:
+                receipt = self.receipt(True)
+            elif (not_found and data.get('ok') is False and data.get('error_code') == 400
+                  and not_found[0] in str(data.get('description', '')).lower()):
+                receipt = self.receipt(reason=not_found[1])
+            elif data.get('ok') is False and 400 <= data.get('error_code', 0) < 500:
+                receipt = self.receipt(reason='telegram_rejected_not_sent_' + str(data['error_code']))
+        except RequestNotSent:
+            receipt = self.not_sent()
+        except TransportError:
+            pass
+        return receipt
 
     @staticmethod
     def _log(line):
@@ -2825,6 +2861,201 @@ class Bridge:
             return receipt
         return self._reserve_and_deliver(key, request, deliver)
 
+    # ---- pinned messages: one bot message per slot, edited in place ----
+    PIN_SLOT_RE = re.compile(r'[a-z0-9_-]{1,32}')
+
+    @contextlib.contextmanager
+    def _pin_lock(self, slot):
+        """Hold <state_dir>/telegram-pin-<slot>.lock (owner-only, never the bot
+        lock) for one whole update, so two callers never both send. The
+        ledger lives in the state directory, so its parent is that."""
+        fd = os.open(Path(self.store.path).parent / f'telegram-pin-{slot}.lock', os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)  # closing releases the lock; the file is never unlinked
+
+    def _pin_call(self, key, identity, deliver_fn, retry_undelivered=False):
+        """_reserve_and_deliver, plus whether Telegram was contacted (False
+        for a saved receipt)."""
+        called = []
+
+        def deliver(pending):
+            called.append(True)
+            return deliver_fn(pending)
+        return self._reserve_and_deliver(key, identity, deliver, retry_undelivered), bool(called)
+
+    def pin(self, slot, text, fmt='plain'):
+        """Show `text` in the slot's one pinned message (OPERATIONS.md "Pinned
+        messages"). With no live message, a new generation: send the body
+        silently, exactly once under pin:<slot>:g<generation>:message, record
+        its id, then pin it under pin:<slot>:g<generation>:pin. A pin not yet
+        delivered (or since undone by an --unpin call whose answer was lost)
+        is attempted again before anything else. The same body and
+        format as last applied makes no call; another body edits the live
+        message under pin:<slot>:g<generation>:r<revision>, a new revision
+        each time. "message is not modified" counts as applied; "message to
+        edit not found" (the user deleted it) ends the generation, and the
+        next one sends and pins in this same run; so does a pin's 400
+        "message to pin not found".
+
+        Returns a receipt: delivered with message_id, revision and changed
+        (False when nothing was sent), else the failing step's receipt with
+        its reason and step (send, pin or edit)."""
+        if not isinstance(slot, str) or not self.PIN_SLOT_RE.fullmatch(slot):
+            return self.receipt(reason='pin_slot_invalid')
+        if fmt not in ('plain', 'html'):
+            return self.receipt(reason='format_unsupported')
+        if not isinstance(text, str):
+            return self.receipt(reason='text_required_maximum_4096_utf16_units')
+        plain = None
+        if fmt == 'html':
+            plain, error = html_visible_text(text)
+            if error:
+                return self.receipt(reason=error)
+        visible = text if plain is None else plain
+        if not visible.strip() or utf16_units(visible) > 4096:
+            return self.receipt(reason='text_required_maximum_4096_utf16_units')
+        applied = hashlib.sha256(json.dumps(dict(text=text, format=fmt), sort_keys=True).encode()).hexdigest()
+        changed = False
+        ended = None  # (receipt, step) of the last deleted-message answer
+        with self._pin_lock(slot):
+            for _ in range(2):  # a deleted message ends at most one generation per run
+                state = self.store.pin_state(slot)
+                generation, mid = state['generation'], state['message_id']
+                prefix = f'pin:{slot}:g{generation}'
+                if mid is None:
+                    # The identity is the slot's generation, not the body: a
+                    # rerun after a crash finds this generation's saved
+                    # receipt whatever it now shows, so one generation never
+                    # sends a second message. An ambiguous send stays so.
+                    sent, fresh = self._pin_call(
+                        prefix + ':message', dict(type='pin_message', slot=slot, generation=generation),
+                        lambda pending: self._deliver_text(text, None, pending, plain,
+                                                           extra={'disable_notification': True}))
+                    if sent.get('delivered') is not True:
+                        if (sent.get('metadata') or {}).get('reason', '').startswith('telegram_rejected_not_sent_'):
+                            # Definitely not sent: the next update starts afresh.
+                            self.store.set_pin(slot, generation=generation + 1)
+                        return dict(sent, step='send')
+                    mid = int(sent['message_id'])
+                    # A saved receipt's body is unknown here: the edit below
+                    # then brings the message to this body.
+                    self.store.set_pin(slot, message_id=mid, revision=0, fingerprint=applied if fresh else None)
+                    state = self.store.pin_state(slot)
+                    changed = changed or fresh
+                pinned, called = self._pin_call(
+                    prefix + ':pin', dict(type='pin', message_id=mid),
+                    lambda pending: self._deliver_pin_toggle(
+                        prefix + ':unpin', 'pinChatMessage',
+                        dict(chat_id=self.config['chat_id'], message_id=mid, disable_notification=True), pending,
+                        not_found=('message to pin not found', 'telegram_message_to_pin_not_found')),
+                    retry_undelivered=True)
+                changed = changed or called
+                if (pinned.get('metadata') or {}).get('reason') == 'telegram_message_to_pin_not_found':
+                    # The user deleted the message before its pin landed.
+                    self.store.set_pin(slot, generation=generation + 1, message_id=None, revision=0,
+                                       fingerprint=None)
+                    ended = pinned, 'pin'
+                    continue
+                if pinned.get('delivered') is not True:
+                    return dict(pinned, step='pin', message_id=str(mid))
+                if state['fingerprint'] == applied:
+                    return self.receipt(True, message_id=str(mid), revision=state['revision'], changed=changed)
+                revision = state['revision'] + 1
+                # Recorded before the edit and unknown until it applies, so a
+                # crash or an unconfirmed edit is edited again next time.
+                self.store.set_pin(slot, revision=revision, fingerprint=None)
+                edit, _ = self._pin_call(prefix + f':r{revision}',
+                                         dict(type='edit', message_id=mid, text=text, format=fmt),
+                                         lambda pending: self._deliver_pin_edit(text, plain, mid, pending))
+                if edit.get('delivered') is True:
+                    self.store.set_pin(slot, fingerprint=applied)
+                    return self.receipt(True, message_id=str(mid), revision=revision, changed=True)
+                if (edit.get('metadata') or {}).get('reason') != 'telegram_message_to_edit_not_found':
+                    return dict(edit, step='edit', message_id=str(mid))
+                self.store.set_pin(slot, generation=generation + 1, message_id=None, revision=0, fingerprint=None)
+                ended = edit, 'edit'
+                changed = True
+        # Two generations' messages went missing within this one run.
+        return dict(ended[0], step=ended[1])
+
+    def unpin(self, slot):
+        """Unpin the slot's live message under pin:<slot>:g<generation>:unpin;
+        the slot then has no live message and the next update is a new
+        generation. With no live message, a generation whose send never
+        confirmed (ambiguous, or not sent) is ended instead, so the next
+        update sends a new message: the operator's reconciliation once the
+        chat was checked. Returns a delivered receipt (message_id None when
+        nothing was pinned, ended_generation when one was ended) or the
+        unpin's receipt."""
+        if not isinstance(slot, str) or not self.PIN_SLOT_RE.fullmatch(slot):
+            return self.receipt(reason='pin_slot_invalid')
+        with self._pin_lock(slot):
+            state = self.store.pin_state(slot)
+            generation, mid = state['generation'], state['message_id']
+            if mid is None:
+                sent = self.store.saved_receipt(f'pin:{slot}:g{generation}:message')
+                if sent is not None and sent.get('delivered') is not True:
+                    self.store.set_pin(slot, generation=generation + 1, revision=0, fingerprint=None)
+                    return self.receipt(True, message_id=None, ended_generation=generation)
+                return self.receipt(True, message_id=None)
+            prefix = f'pin:{slot}:g{generation}'
+            unpinned, _ = self._pin_call(
+                prefix + ':unpin', dict(type='unpin', message_id=mid),
+                lambda pending: self._deliver_pin_toggle(
+                    prefix + ':pin', 'unpinChatMessage',
+                    dict(chat_id=self.config['chat_id'], message_id=mid), pending),
+                retry_undelivered=True)
+            if unpinned.get('delivered') is not True:
+                return dict(unpinned, step='unpin', message_id=str(mid))
+            self.store.set_pin(slot, generation=generation + 1, message_id=None, revision=0, fingerprint=None)
+            return self.receipt(True, message_id=str(mid))
+
+    def _deliver_pin_toggle(self, opposite_key, method, body, pending, not_found=None):
+        """A pin or an unpin of the live message. Before the call the
+        generation's opposite row (the unpin's for a pin, the pin's for an
+        unpin) is marked not applied: its effect is no longer known once this
+        call may land, so that row is attempted again by its next request (a
+        pin update re-pins after an unpin whose answer was lost, and an
+        unpin after a re-pin unpins again)."""
+        superseded = 'superseded_by_pin' if method == 'pinChatMessage' else 'superseded_by_unpin'
+        self.store.finish(opposite_key, self.receipt(reason=superseded))
+        return self._deliver_true_call(method, body, pending, not_found=not_found)
+
+    def _deliver_pin_edit(self, text, plain, message_id, pending):
+        """Edit a pinned message; mirrors _deliver_text with editMessageText,
+        and reads Telegram's two 400s an in-place edit expects: "message is
+        not modified" is applied, "message to edit not found" ends the
+        slot's generation. `plain` is the HTML fallback body."""
+        body = dict(chat_id=self.config['chat_id'], message_id=message_id, text=text,
+                    link_preview_options={'is_disabled': True})
+        if plain is not None:
+            body['parse_mode'] = 'HTML'
+        try:
+            status, data = self._send('editMessageText', lambda timeout: self.telegram('editMessageText', body, timeout))
+            if self._confirmed(status, data):
+                return self.receipt(True, message_id=str(data['result']['message_id']))
+            description = str(data.get('description', '')).lower()
+            if data.get('ok') is False and data.get('error_code') == 400:
+                if 'message is not modified' in description:
+                    return self.receipt(True, message_id=str(message_id), not_modified=True)
+                if 'message to edit not found' in description:
+                    return self.receipt(reason='telegram_message_to_edit_not_found')
+            if plain is not None and self._html_rejected(data):
+                receipt = self._deliver_pin_edit(plain, None, message_id, pending)
+                if receipt is not pending:
+                    receipt['format_fallback_reason'] = 'telegram_html_parse_rejected_400'
+                return receipt
+            if data.get('ok') is False and 400 <= data.get('error_code', 0) < 500:
+                return self.receipt(reason='telegram_rejected_not_sent_' + str(data['error_code']))
+            return pending
+        except RequestNotSent:
+            return self.not_sent()
+        except TransportError:
+            return pending
+
     # Poll heartbeat for a city's health check: proof that getUpdates is
     # still succeeding, written at most once a minute. It judges health
     # by its age and pid, so a failed write only costs one stderr line.
@@ -3047,7 +3278,7 @@ def _build_parser():
     parser.add_argument('--city-root', type=Path, default=_default_city_root(),
                         help='only used to find the default settings file')
     parser.add_argument('--port', type=int, help='overrides the settings\' port')
-    parser.add_argument('command', choices=('run', 'probe', 'send', 'reply-current', 'ask-close', 'react',
+    parser.add_argument('command', choices=('run', 'probe', 'send', 'reply-current', 'ask-close', 'react', 'pin',
                                             'set-commands', 'render-unit', 'check-install'))
     parser.add_argument('--body-file', type=Path,
                         help='file holding the message text (send, reply-current)')
@@ -3079,6 +3310,10 @@ def _build_parser():
                         help='ask-close: the decision made, one line, shown under the ask in place of its buttons')
     parser.add_argument('--reaction',
                         help='react: seen or done (the settings\' emoji), none to clear, or one emoji')
+    parser.add_argument('--slot',
+                        help='pin: the pinned message slot, [a-z0-9_-]{1,32}, updated to the text of --body-file')
+    parser.add_argument('--unpin', action='store_true',
+                        help="pin: unpin the slot's message instead of updating it")
     parser.add_argument('--gpu-probe', action='store_true',
                         help='check-install: also transcribe a clip on the GPU inside the bridge unit\'s sandbox')
     parser.add_argument('--clip', type=Path,
@@ -3112,6 +3347,15 @@ def _validate_attachment_flags(parser, args):
         parser.error('ask-close requires exactly one of --message-id and --ask-key')
     elif args.decision is None:
         parser.error('ask-close requires --decision')
+    if args.command != 'pin':
+        if args.slot is not None or args.unpin:
+            parser.error('--slot and --unpin are pin flags')
+    elif args.slot is None or not Bridge.PIN_SLOT_RE.fullmatch(args.slot):
+        parser.error('pin requires --slot matching [a-z0-9_-]{1,32}')
+    elif args.unpin == (args.body_file is not None):
+        parser.error('pin requires exactly one of --body-file and --unpin')
+    elif args.unpin and args.format != 'plain':
+        parser.error('--format is a --body-file flag')
 
 
 def _launchd_label(unit):
@@ -4218,6 +4462,31 @@ def main():
         if args.reaction is None:
             parser.error('react requires --reaction seen|done|none|<emoji>')
         print('Telegram reaction set; message ID ' + str(_react(bridge, args)))
+    elif args.command == 'pin':
+        # Directly in this process through the shared ledger; GC is never called.
+        slot = args.slot
+        receipt = bridge.unpin(slot) if args.unpin else bridge.pin(slot, args.body_file.read_text(), args.format)
+        if receipt.get('delivered') is not True:
+            reason = (receipt.get('metadata') or {}).get('reason') or 'delivery not confirmed'
+            _print_gc_receipt(False, receipt.get('failure_kind', 'permanent'), reason)
+            step = receipt.get('step')
+            message = f'pin {slot} not updated: {reason}' if step is None else \
+                f'pin {slot}: Telegram {step} not confirmed: {reason}'
+            if receipt.get('message_id'):
+                message += f' (message ID {receipt["message_id"]})'
+            if reason == NOT_SENT_REASON:
+                message += ': run the same command again'
+            raise TransportError(message)
+        if args.unpin and receipt.get('ended_generation') is not None:
+            print(f'pin {slot} not pinned; unconfirmed send of generation {receipt["ended_generation"]} ended, '
+                  'the next update sends a new message')
+        elif args.unpin:
+            print(f'pin {slot} not pinned' if receipt['message_id'] is None
+                  else f'unpinned message ID {receipt["message_id"]} (slot {slot})')
+        elif not receipt['changed']:
+            print(f'pin {slot} unchanged; message ID {receipt["message_id"]}')
+        else:
+            print(f'pinned message ID {receipt["message_id"]} (slot {slot}, revision {receipt["revision"]})')
     else:
         # Token-wide lock survives alternate state directories; never unlink while locked.
         with (settings.lock_dir / ('telegram-bot-' + str(settings.config['bot_id']) + '.lock')).open('a') as lock:

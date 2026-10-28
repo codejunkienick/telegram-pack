@@ -543,6 +543,7 @@ runs the edit step, which shows the decision, so the edit happens once.
 Use `gc telegram reply-current --body-file <path> --idempotency-key <stable-key>`.
 `--keyboard-file <path>` attaches an inline keyboard ("Mayor asks" above);
 `--silent` notifies with no sound ("Silent messages" below).
+`gc telegram pin` keeps one pinned message per slot ("Pinned messages" below).
 Optional `--conversation-id` must match the private configured chat. The native
 controller reminder omits the mandatory idempotency flag; add it. This pack
 command delegates to the same transport CLI and native GC outbound endpoint.
@@ -700,6 +701,89 @@ cursor begins after the pairing message. A failed GC call retains the cursor,
 even for a permanent rejection or an entry routed to any other agent, so an
 operator can fix the binding without losing an authorized message. Diagnose
 repeated transport failures instead of erasing state.
+
+## Pinned messages
+
+`gc telegram pin --slot <name> --body-file <path> [--format html]` (the
+pack command runs `bridge.py pin`) keeps one pinned bot message per slot in
+the paired chat, edited in place: a city keeps a list at the top of the chat
+(say, what waits on the user) by running it whenever the list changes. The
+pack ships the mechanism only; what a slot says, and when it changes, is the
+city's. `--unpin` removes the slot's message from the pins. A slot matches
+`[a-z0-9_-]{1,32}`; anything else is refused before the body is read or
+Telegram is contacted. The body follows the `sendMessage` rules: 4096 visible
+UTF-16 units, `--format html` with its allowlist and its one plain fallback,
+refused whole when over. No setting is involved, and GC is never called: the
+CLI process works through the shared ledger.
+
+The ledger's `pins` table holds per slot its generation (from 1), the live
+message id (none when nothing is pinned), the revision and the fingerprint of
+the last applied body and format. One update holds
+`<state_dir>/telegram-pin-<slot>.lock` (created owner-only, never the bot
+lock) for its whole run, so two callers of one slot never both send. In
+order:
+
+- No live message: a new generation. The body is sent with
+  `disable_notification: true` under `pin:<slot>:g<generation>:message`, its
+  confirmed message id recorded, then pinned with pinChatMessage
+  `{"chat_id", "message_id", "disable_notification": true}` under
+  `pin:<slot>:g<generation>:pin`. The send's identity is the slot's
+  generation, not the body, so one generation never sends a second message:
+  a rerun after a crash finds the saved receipt (and edits it to the current
+  body). An ambiguous first send exits 1 with its reason and stays ambiguous:
+  every later update returns that receipt and sends nothing, until the
+  operator reconciles it with `--unpin` (below); a not-sent one is sent by
+  the next update; a rejected one exits 1 and the next update starts a new
+  generation (nothing was sent).
+- A live message whose pin is not yet delivered (a pin that failed after a
+  confirmed send) is pinned again before anything else. A pin's 400
+  "message to pin not found" (the user deleted the message before its pin
+  landed) ends that generation like an edit's below: the next generation
+  sends and pins a new message in the same run.
+- The same body and format as last applied: no Telegram call; the command
+  prints `pin <slot> unchanged; message ID <id>`.
+- Another body: the revision goes up by one and the live message is edited
+  with editMessageText under `pin:<slot>:g<generation>:r<revision>`, so A,
+  then B, then A again edits every time. Telegram's 400 "message is not
+  modified" counts as applied. Its 400 "message to edit not found" (the user
+  deleted the message) ends that generation, and the next generation sends
+  and pins a new message in the same run.
+- `--unpin`: unpinChatMessage `{"chat_id", "message_id"}` for the live
+  message under `pin:<slot>:g<generation>:unpin`; the slot then has no live
+  message and keeps its generation counter, so the next update is a new
+  generation. With no live message it prints `pin <slot> not pinned` and
+  exits 0; otherwise `unpinned message ID <id> (slot <slot>)`.
+- Reconciling an unconfirmed first send: check the chat for that message
+  (delete it if it arrived, or the slot gains a stray unpinned copy), then
+  run `--unpin`. With no live message and a generation whose send never
+  confirmed (ambiguous or not sent), `--unpin` ends that generation with no
+  Telegram call and prints `pin <slot> not pinned; unconfirmed send of
+  generation <g> ended, the next update sends a new message`; the next
+  update then sends and pins under the next generation. This is the slot's
+  form of the "Delivery recovery" rule: check the chat before a new send.
+
+An edit, a pin and an unpin are idempotent in effect, so one that is not
+delivered (rejected or unconfirmed) is attempted again by the next update:
+an edit under the next revision (an unconfirmed edit leaves the applied body
+unknown, so even the last applied body edits again), a pin or an unpin under
+its own key. Only a generation's first `sendMessage` is exactly-once.
+A pin and an unpin of one generation each mark the other's row not applied
+just before their call, since that call may undo it: an update after an
+unconfirmed unpin pins the message again before it can report the slot
+unchanged, and an `--unpin` after such a re-pin unpins again.
+
+Success prints `pinned message ID <id> (slot <slot>, revision <r>)` (revision
+0 for a new generation). A failure prints the `GC_RECEIPT` line with its
+reason on stderr and exits 1, naming the step (send, pin, edit or unpin) and
+the message id when there is one.
+
+Telegram Bot API (read 2026-10-27, Bot API 10.3): pinChatMessage says "In
+private chats and channel direct messages chats, all non-service messages can
+be pinned" and "Notifications are always disabled in channels and private
+chats", so a pin never rings. editMessageText's 48-hour limit applies only to
+business messages not sent by the bot, so the bot's own pinned message stays
+editable. Each new pin (a new generation) adds Telegram's one "pinned"
+service line to the chat; an edit adds nothing and never notifies.
 
 ## Inbound media relay
 

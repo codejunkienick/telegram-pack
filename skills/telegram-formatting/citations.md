@@ -68,5 +68,19 @@ The rows live only here; SKILL.md holds none.
 | pack | bridge/OPERATIONS.md | The direct form works before pack reload | direct form before reload |
 | pack | README.md | TELEGRAM_BRIDGE_SETTINGS | second bridge settings in the environment |
 | pack | bridge/bridge.py | agent = config.get('agent', 'mayor') | sender label is the served agent, default mayor |
+| pack | bridge/OPERATIONS.md | ## Pinned messages | pinned slots follow this section |
+| pack | commands/pin/command.toml | Keep one pinned message per slot, edited in place | pin command |
+| pack | bridge/bridge.py | PIN_SLOT_RE = re.compile(r'[a-z0-9_-]{1,32}') | slot names |
+| pack | bridge/OPERATIONS.md | The body follows the `sendMessage` rules | body follows the send rules |
+| pack | bridge/bridge.py | print(f'pin {slot} unchanged; message ID {receipt["message_id"]}') | same text changes nothing |
+| pack | bridge/OPERATIONS.md | Another body: the revision goes up by one and the live message is edited | new text edits in place |
+| pack | bridge/bridge.py | extra={'disable_notification': True} | the first update sends silently |
+| pack | bridge/OPERATIONS.md | Each new pin (a new generation) adds Telegram's one "pinned" | one pinned line per new pin |
+| pack | bridge/OPERATIONS.md | an edit adds nothing and never notifies | edits never notify |
+| pack | bridge/OPERATIONS.md | is attempted again by the next update | rerun after a failure |
+| pack | bridge/OPERATIONS.md | one generation never sends a second message | no second message per slot |
+| pack | bridge/OPERATIONS.md | Reconciling an unconfirmed first send: check the chat for that message | unpin after checking the chat |
+| pack | bridge/bridge.py | ended_generation=generation | unpin ends an unconfirmed send |
+| pack | bridge/OPERATIONS.md | "message to pin not found" (the user deleted the message before its pin | a deleted message is replaced |
 <!-- /citations -->
 ```

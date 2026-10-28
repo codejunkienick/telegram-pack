@@ -1,0 +1,1 @@
+description = "Keep one pinned message per slot, edited in place: --slot <name> with --body-file <path> [--format html], or --unpin; the first update sends it silently and pins it"

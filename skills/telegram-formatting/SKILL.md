@@ -164,4 +164,30 @@ gc telegram reply-current --conversation-id <configured-chat-id> --body-file <qu
   so act on that answer instead. Running the same command again is
   safe: it never edits twice.
 
+## Pinned messages
+
+A pinned message slot is one bot message kept at the top of the chat and
+edited in place, such as the list of what waits on the user. Update it
+with the whole current text each time:
+
+```sh
+gc telegram pin --slot waiting --format html --body-file <list-file>
+```
+
+- A slot name is `[a-z0-9_-]{1,32}`; one pinned message per slot.
+- The body follows the send rules above (4096 visible units, `--format
+  html` optional). It needs no idempotency key: the same text again
+  changes nothing (`pin <slot> unchanged`), new text edits the message.
+- The first update sends the message silently and pins it; edits never
+  notify. Each new pin adds one "pinned" line to the chat, so keep the
+  slot pinned with an empty-state text rather than unpinning it when
+  nothing is left; `--unpin` removes it.
+- On a failure (a `GC_RECEIPT` line, exit 1) run the same command again
+  later: an edit or a pin is attempted again, and a message the user
+  deleted is replaced by a new pinned one. One slot never sends a second
+  message for an unconfirmed first send (`Telegram send not confirmed:
+  ambiguous_...`): rerunning keeps failing until the chat is checked. Ask
+  the user whether the message arrived (delete it if so), then run
+  `gc telegram pin --slot <slot> --unpin`, and the next update sends anew.
+
 The source file and symbol behind each claim in this skill are in `citations.md`, next to this file; open it only when you need them.
